@@ -499,6 +499,12 @@ class Actions {
   // 挖若干块某种方块
   async mine (blockName, count = 1, maxDist = 32) {
     await this.ensureChunks()
+    // 挖地表资源（原木）时如果在地下，先上去
+    if (/_log$/.test(blockName) && this.isUnderground()) {
+      this.log('[mine] 在地下挖不到原木，先回地面')
+      await this.getToSurface()
+      await this.ensureChunks(3000)
+    }
     // 关键：数的是掉落物，不是方块名
     const itemName = dropOf(blockName)
     const startCount = this.countOf(itemName)
@@ -566,15 +572,36 @@ class Actions {
       'mangrove_log', 'cherry_log', 'pale_oak_log']
     let trees = 0
     let wanderTry = 0
+    const tried = []      // 记录试过但砍不动的树坐标，别重复试
+
+    // 在地下找不到树很正常 —— 先爬回地面
+    if (this.isUnderground()) {
+      this.log('[chop] 在地下，先回地面')
+      const ok = await this.getToSurface()
+      if (!ok) throw new Error('在地下爬不出去，砍不了树')
+      await this.ensureChunks(3000)
+    }
 
     // 关键：先在最大半径内找一遍，别急着走
     await sleep(300)
     while (trees < count) {
       this.check()
       let found = null
-      // 由近到远找
+      // 由近到远找（跳过已经试过砍不动的）
       for (const dist of [16, 32, 64]) {
-        found = this.findAny(logs, dist)
+        for (const l of logs) {
+          const def = mcData.blocksByName[l]
+          if (!def) continue
+          // 找所有这个种类的树，跳过试过的
+          const candidates = this.bot.findBlocks({ matching: def.id, maxDistance: dist, count: 20 })
+          for (const pos of candidates) {
+            const key = `${pos.x},${pos.y},${pos.z}`
+            if (tried.includes(key)) continue
+            found = this.bot.blockAt(pos)
+            if (found) break
+          }
+          if (found) break
+        }
         if (found) break
       }
       // 实在没有：长途去找（树经常在几十格之外）
@@ -600,8 +627,10 @@ class Actions {
         // 每棵树砍完立刻捡，别等全部砍完（不然前面的掉落物早跑出范围了）
         try { await this.pickupNearby(8) } catch (e) {}
       } else {
-        // 这棵砍不动，换一棵
-        this.log('[chop] 这棵砍不动，换一棵')
+        // 这棵砍不动，记下来别再试
+        tried.push(`${base.x},${base.y},${base.z}`)
+        this.log(`[chop] 这棵砍不动（差 ${found.position.distanceTo(this.pos()).toFixed(0)} 格），换一棵`)
+        if (tried.length >= 5) throw new Error('试了 5 棵树都砍不动')
       }
       await sleep(200)
     }
@@ -666,9 +695,9 @@ class Actions {
     if (!spot) return null
 
     await this.bot.equip(item, 'hand')
-    // 试几个位置，别死磕一个
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const sp = attempt === 0 ? spot : this.findPlaceSpot(10)
+    // 试几个位置，别死磕一个（每次都重新找，会挑分数更高的）
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const sp = attempt === 0 ? spot : this.findPlaceSpot(8 + attempt * 2)
       if (!sp) break
       try {
         await this.bot.lookAt(sp.base.position.offset(0.5, 0.5, 0.5), true)
@@ -678,7 +707,14 @@ class Actions {
         const placed = this.bot.blockAt(new Vec3(sp.x, sp.y, sp.z))
         if (placed && placed.name === blockName) return placed
       } catch (e) {
-        this.log('placeNearby try' + attempt + ': ' + e.message)
+        const msg = String(e && e.message || '')
+        // blockUpdate 超时说明服务端没回包（网络或卡顿），不是位置问题
+        if (/blockUpdate|did not answer/i.test(msg)) {
+          this.log(`[place] 服务端没回包（第${attempt + 1}次），等一下重试`)
+          await sleep(600)
+          continue
+        }
+        this.log('placeNearby try' + attempt + ': ' + msg)
       }
     }
     return this.findBlock(blockName, 10)
@@ -951,6 +987,78 @@ class Actions {
     return null
   }
 
+  /** 我现在是不是在地下（头顶有厚实方块） */
+  isUnderground () {
+    const p = this.pos()
+    let solidCount = 0
+    for (let dy = 2; dy <= 10; dy++) {
+      const b = this.bot.blockAt(p.offset(0, dy, 0))
+      if (b && b.boundingBox === 'block') solidCount++
+    }
+    return solidCount >= 4     // 头顶 10 格里有 4 格以上实心 -> 在地下
+  }
+
+  /**
+   * 挖一条台阶回到地面。
+   * 这是真人在洞里最常干的事：往上挖个楼梯出来。
+   */
+  async getToSurface (maxSteps = 30) {
+    const bot = this.bot
+    if (!this.isUnderground()) return true
+    this.log('[surface] 在地下，往上挖个楼梯出去')
+
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+    const [dx, dz] = dirs[Math.floor(Math.random() * 4)]
+
+    for (let step = 0; step < maxSteps; step++) {
+      this.check()
+      const p = this.pos()
+
+      // 到了地面就停
+      if (!this.isUnderground()) {
+        this.log('[surface] 出来了，y=' + Math.round(this.pos().y))
+        return true
+      }
+
+      // 挖身体和头顶两格
+      const body = bot.blockAt(p.offset(dx, 1, dz * 0 + 0).offset(0, 0, 0))
+      const headUp = bot.blockAt(p.offset(dx, 2, 0))
+      const feetAhead = bot.blockAt(p.offset(dx, 0, 0))
+
+      // 先挖面前的（往前上方挖，形成楼梯）
+      for (const b of [headUp, feetAhead]) {
+        if (!b) continue
+        if (b.name === 'air' || b.name === 'cave_air') continue
+        if (/bedrock|lava|water/.test(b.name)) continue
+        try {
+          await this.bestToolFor(b)
+          await bot.dig(b, true)
+          await sleep(150)
+        } catch (e) {}
+      }
+
+      // 往上跳一格
+      try {
+        await bot.look(Math.atan2(-dx, dz), 0, true)
+        bot.setControlState('jump', true)
+        bot.setControlState('forward', true)
+        await sleep(450)
+        bot.setControlState('jump', false)
+        bot.setControlState('forward', false)
+      } catch (e) {}
+      await sleep(200)
+
+      // 检查有没有真的上升
+      const p2 = this.pos()
+      if (p2.y <= p.y + 0.3) {
+        // 没上去，换个方向
+        const [nx, nz] = dirs[Math.floor(Math.random() * 4)]
+        if (nx !== dx || nz !== dz) { /* 下轮用新方向 */ }
+      }
+    }
+    return !this.isUnderground()
+  }
+
   /** 把脚边挖平，腾出一块能放东西的地方 */
   async flattenSpot () {
     const bot = this.bot
@@ -977,6 +1085,13 @@ class Actions {
   }
 
   // 找一块能放东西的空地（周围有实体地面）
+  /**
+   * 找一块能放东西的地方。
+   *
+   * 踩过的坑：在 coal_ore（矿石）上面放东西，服务端会拒绝
+   * （"the block is still air"）。石头、泥土上就没问题。
+   * 所以这里给底座方块打分，优先选稳定的。
+   */
   findPlaceSpot (radius = 6) {
     const p = this.pos()
     const solid = (n) => {
@@ -984,29 +1099,54 @@ class Actions {
       if (/water|lava/.test(n)) return false
       return true
     }
+
+    // 底座方块好不好放东西（分数越高越优先）
+    const baseScore = (name) => {
+      if (!name) return -1
+      if (/^(stone|cobblestone|deepslate|cobbled_deepslate|andesite|diorite|granite|tuff)$/.test(name)) return 10
+      if (/^(dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium)$/.test(name)) return 9
+      if (/^(sand|red_sand|gravel|clay)$/.test(name)) return 7
+      if (/_planks$|_log$/.test(name)) return 8
+      if (/_ore$|^raw_/.test(name)) return 2      // 矿石上不好放
+      if (/leaves|glass|ice|magma|soul_sand/.test(name)) return 0
+      return 5
+    }
+
+    const cands = []
     for (let r = 1; r <= radius; r++) {
       for (let dx = -r; dx <= r; dx++) {
         for (let dz = -r; dz <= r; dz++) {
-          if (Math.abs(dx) !== r && Math.abs(dz) !== r) continue
+          // 只走外圈（内圈上轮扫过了）
+          if (r > 1 && Math.abs(dx) !== r && Math.abs(dz) !== r) continue
           for (let dy = -2; dy <= 2; dy++) {
             const base = this.bot.blockAt(p.offset(dx, dy - 1, dz))
             const at = this.bot.blockAt(p.offset(dx, dy, dz))
             const up = this.bot.blockAt(p.offset(dx, dy + 1, dz))
             if (!base || !at || !up) continue
-            // 放宽：当前格是 air 就行；头顶允许树叶/草/雪/藤蔓这类非固体
+            if (!solid(base.name)) continue
             const atFree = at.name === 'air' || at.name === 'cave_air' || at.boundingBox === 'empty'
-            const upOk = up.boundingBox !== 'block'     // 不挡人就能放
-            if (solid(base.name) && atFree && upOk) {
-              return { x: Math.floor(p.x + dx), y: Math.floor(p.y + dy), z: Math.floor(p.z + dz), base }
-            }
+            const upOk = up.boundingBox !== 'block'
+            if (!atFree || !upOk) continue
+
+            const score = baseScore(base.name) - r * 0.5 - Math.abs(dy) * 0.3
+            cands.push({
+              x: Math.floor(p.x + dx),
+              y: Math.floor(p.y + dy),
+              z: Math.floor(p.z + dz),
+              base,
+              score
+            })
           }
         }
       }
     }
-    return null
+
+    if (!cands.length) return null
+    // 挑分数最高的
+    cands.sort((a, b) => b.score - a.score)
+    return cands[0]
   }
 
-  // 手上哪种木板最多
   bestPlank () {
     const planks = ['oak_planks', 'birch_planks', 'spruce_planks', 'jungle_planks',
       'acacia_planks', 'dark_oak_planks', 'cherry_planks', 'mangrove_planks', 'pale_oak_planks']
@@ -1381,8 +1521,7 @@ class Actions {
       this.item('oak_planks') || this.item('oak_log'))
     if (!fuel) throw new Error('没有燃料')
 
-    await this.goto(furnace.position.x, furnace.position.y, furnace.position.z, 2)
-    const f = await this.bot.openFurnace(furnace)
+    const f = await this.openSafely(furnace)
     try {
       await f.putInput(input.type, null, Math.min(count, input.count))
       const need = Math.max(1, Math.ceil(Math.min(count, input.count) / 8))
@@ -1851,11 +1990,80 @@ class Actions {
 
   // ---------------- 箱子 ----------------
 
+  /**
+   * 安全地打开容器。
+   *
+   * mineflayer 默认等 20 秒才超时，而且一超时整个流程就崩。
+   * 实测正常打开只要 300ms 左右，所以：
+   *   - 5 秒超时（不是 20 秒）
+   *   - 失败重试 3 次，每次先走到跟前、面朝方块
+   *   - 每次失败后等一会儿（网络抖动）
+   */
+  async openSafely (block) {
+    const bot = this.bot
+    if (!block) throw new Error('没有可打开的方块')
+
+    const kind = /chest|barrel|shulker/.test(block.name) ? 'container'
+      : block.name === 'furnace' ? 'furnace'
+      : block.name === 'crafting_table' ? 'crafting'
+      : 'block'
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      this.check()
+
+      // 1. 确认方块还在
+      const live = bot.blockAt(block.position)
+      if (!live || live.name !== block.name) {
+        throw new Error(`方块没了（${block.name}）`)
+      }
+
+      // 2. 停寻路、站定
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+      for (const k of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+        try { bot.setControlState(k, false) } catch (e) {}
+      }
+      await sleep(200)
+
+      // 3. 走到跟前（2 格内）
+      const d = live.position.distanceTo(this.pos())
+      if (d > 3) {
+        try {
+          await this.goto(live.position.x, live.position.y, live.position.z, 2, 12000)
+        } catch (e) {}
+        await sleep(200)
+      }
+
+      // 4. 面朝它
+      try {
+        await bot.lookAt(live.position.offset(0.5, 0.5, 0.5), true)
+        await sleep(150)
+      } catch (e) {}
+
+      // 5. 5 秒超时打开（不是 20 秒）
+      try {
+        const win = await Promise.race([
+          kind === 'furnace' ? bot.openFurnace(live) : bot.openContainer(live),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('打开超时(5s)')), 5000))
+        ])
+        return win
+      } catch (e) {
+        const msg = String(e && e.message || '')
+        this.log(`[open] 第${attempt + 1}次失败：${msg}`)
+        // 超时的话，可能服务端还在处理，等久一点
+        await sleep(800 + attempt * 700)
+        // 换个位置再试
+        if (attempt === 1) {
+          try { await this.wander(3) } catch (e2) {}
+        }
+      }
+    }
+    throw new Error(`打不开 ${block.name}（试了3次）`)
+  }
+
   async openChest (x, y, z) {
     const b = this.bot.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)))
     if (!b || !/chest|barrel|shulker/.test(b.name)) throw new Error('那里没有箱子')
-    await this.goto(b.position.x, b.position.y, b.position.z, 2)
-    return this.bot.openContainer(b)
+    return this.openSafely(b)
   }
 
   async depositAll (x, y, z, except = []) {
