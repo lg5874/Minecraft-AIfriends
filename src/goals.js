@@ -277,6 +277,7 @@ class Goals {
     this.cfg = Object.assign({
       stallMs: 45 * 60 * 1000,       // 这么久没有任何进展 -> 放弃
       maxFails: 6,                    // 同一阶段试这么多次都失败 -> 放弃
+      maxIdleWins: 5,                 // 连续这么多趟"说成了但进度没动" -> 放弃
       cooldownMs: 2 * 60 * 60 * 1000, // 放弃后这段时间不再选它
       doneCooldownMs: 12 * 60 * 60 * 1000, // 做完了的目标这段时间不重复
       maxCustomStages: 5
@@ -644,7 +645,33 @@ ${list}
       // 他自己的动作算"这一步往前推了一点"
       if (s.kind === 'do' || s.kind === 'build') this.addWork(progress || 1)
       s.fails = 0
-      this.goal.lastProgressAt = this.now()
+
+      // ===== 防空转：说"成了"但进度一点没动 =====
+      //
+      // 实测：目标「开一小块地」第 2 步要 6 个种子，他手上只有 1 个。
+      // will 给的任务是「找点种子」，模型每次都答"身上已有 1 个小麦种子"，
+      // judgeOutcome 判成功 -> 这里 s.fails 归零 -> 阶段永远推不动。
+      // 结果：40 秒内同一个任务跑了 37 次，什么都没干。
+      //
+      // 现在：成功率对得上进度才算数。连续这么多轮"成功但没进展"，
+      // 就当这一阶段没戏，换条路 —— 跟真人一样，
+      // "我已经有了"重复几十遍之后，他自己也会觉得不对劲。
+      const before = s.best || 0
+      if (status) {
+        const p0 = stageProgress(s, status)
+        if (p0.ratio <= before + 1e-9) {
+          s.idleWins = (s.idleWins || 0) + 1
+          if (s.idleWins >= (this.cfg.maxIdleWins || 5)) {
+            this.abandon(`「${s.title}」干了 ${s.idleWins} 趟都说成了，进度一点没动，八成是弄不到`)
+            return { advanced: false, abandoned: true }
+          }
+        } else {
+          s.idleWins = 0
+          this.goal.lastProgressAt = this.now()
+        }
+      } else {
+        this.goal.lastProgressAt = this.now()
+      }
     } else {
       s.fails = (s.fails || 0) + 1
       this.goal.fails++
