@@ -674,8 +674,10 @@ class Bot {
     })
 
     try {
+      const ctxText = this.contextForTask()
+      this.log(`[ctx] 上下文 ${ctxText.length} 字符${/剖面/.test(ctxText) ? '（含视觉地形图）' : '（⚠️ 没有视觉）'}`)
       const result = await Promise.race([
-        this.coder.writeAndRun(want.text, this.contextForTask()),
+        this.coder.writeAndRun(want.text, ctxText),
         timeoutPromise
       ])
       const secs = Math.round((Date.now() - t0) / 1000)
@@ -840,13 +842,28 @@ class Bot {
   }
 
   contextForTask () {
-    // 用感知层生成"你现在看到什么"，而不是一堆方块计数
+    // ===== 视觉：让他真的看见地形，不是我替他总结 =====
+    // 地形剖面图比文字描述有用得多：一眼能看出前方通不通、头顶有没有石头
     let world = ''
     try {
-      world = this.perceive ? this.perceive.snapshot({ radius: 22 }) : ''
+      world = this.actions.lookAround3D(6)
     } catch (e) {
-      this.log('[perceive] ' + e.message)
+      this.log('[vision] ' + e.message)
+      // 视觉失败就退回文字感知
+      try {
+        world = this.perceive ? this.perceive.snapshot({ radius: 16 }) : ''
+      } catch (e2) {}
     }
+
+    // 四个方向能不能走（直接给出结论，省得他看图算）
+    try {
+      const dirs = [['东', 1, 0], ['西', -1, 0], ['南', 0, 1], ['北', 0, -1]]
+      const walks = dirs.map(([n, dx, dz]) => {
+        const r = this.actions.canWalkTo(dx, dz)
+        return `${n}${r.walkable ? '能走' + (r.needDig ? '（要挖' + r.needDig + '格）' : '') : '走不通（' + r.reason + '）'}`
+      })
+      world += '\n【四个方向】' + walks.join('，')
+    } catch (e) {}
 
     const s = this.actions.status()
     const recalled = this.mem.remember(s.pos.x + ',' + s.pos.z, { limit: 4 })
