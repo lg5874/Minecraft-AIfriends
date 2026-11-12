@@ -581,9 +581,8 @@ class Bot {
         const chats = evs.filter(e => e.type === 'chat_me')
         if (chats.length && this.talk && !this.busy) {
           const last = chats[chats.length - 1]
-          // 别重复回同一条
-          if (this.talk.lastReplyTo !== last.data.who || this.talk.lastRepliedMsg !== last.data.message) {
-            this.talk.lastRepliedMsg = last.data.message
+          // 用统一的查重（talk.reply 内部也会再查一次）
+          if (!this.talk.hasReplied(last.data.who, last.data.message)) {
             this.talk.reply(last.data.who, last.data.message).catch(() => {})
           }
         }

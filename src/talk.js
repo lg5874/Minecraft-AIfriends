@@ -37,6 +37,7 @@ class Talk {
     this.recentSaid = []      // 最近说过的话，用于语气疲劳判断
     this.botChain = []        // 检测 bot 之间的对话链
     this.deferred = []        // 忙的时候没回/说要等会儿的，得回头接
+    this.repliedMsgIds = new Map()  // 哪条消息已经回过了（防止多条路径重复回）
     this.lastReplyTo = null   // 上一条是回给谁的
   }
 
@@ -304,6 +305,25 @@ ${this.fatigueHint()}`
     await this.reply(username, message)
   }
 
+  /** 给一条消息生成唯一 id */
+  msgId (who, msg) { return who + '|' + msg }
+
+  /** 这条消息回过了吗 */
+  hasReplied (who, msg) {
+    const id = this.msgId(who, msg)
+    return this.repliedMsgIds.has(id)
+  }
+
+  /** 标记这条消息已回 */
+  markReplied (who, msg) {
+    this.repliedMsgIds.set(this.msgId(who, msg), Date.now())
+    // 只留最近 50 条
+    if (this.repliedMsgIds.size > 50) {
+      const first = this.repliedMsgIds.keys().next().value
+      this.repliedMsgIds.delete(first)
+    }
+  }
+
   /** 记下一条"等会儿再回"的话 */
   defer (who, msg) {
     // 同一人同一句不重复记
@@ -369,6 +389,7 @@ ${item.who} 刚才说的是：${item.msg}
     this.history.push({ who: item.who, msg: item.msg })
     this.history.push({ who: '我', msg: out })
     await this.say(out)
+    this.markReplied(username, message)   // 标记这条回过了，防止其他路径重复
     return true
   }
 
@@ -404,6 +425,11 @@ ${item.who} 刚才说的是：${item.msg}
 
   /** 回一句话 */
   async reply (username, message, opts = {}) {
+    // 防重复：同一句话只回一次（延迟回复 + 回头接话 + 正常回复可能同时触发）
+    if (this.hasReplied(username, message)) {
+      this.ctx.log(`[chat] 这条已经回过了，跳过：${message.slice(0, 20)}`)
+      return
+    }
     const busyReply = !!opts.busy
     const doing = this.describeDoing()
     let world = ''

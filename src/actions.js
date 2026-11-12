@@ -603,6 +603,11 @@ class Actions {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.bot.dig(block, true)
+        // 挖完必须捡！东西会掉在地上，不走过去捡就等于白挖
+        try {
+          await sleep(150)
+          await this.pickupNearby(4)
+        } catch (e2) {}
         return true
       } catch (e) {
         const msg = String(e && e.message || e)
@@ -1432,6 +1437,32 @@ class Actions {
       return b ? b.name : 'null'
     }
 
+    /**
+     * 捡起身边的掉落物（挖完不捡，背包永远是空的）。
+     * 别用 goto 走远路 —— 挖台阶时掉落物就在脚边。
+     */
+    const grabDrops = async (radius = 3) => {
+      try {
+        const p = this.pos()
+        const drops = Object.values(bot.entities).filter(e =>
+          e && e.name === 'item' && e.position.distanceTo(p) < radius)
+        if (!drops.length) return
+        for (const d of drops) {
+          try {
+            bot.pathfinder.setGoal(new goals.GoalBlock(
+              Math.floor(d.position.x), Math.floor(d.position.y), Math.floor(d.position.z)))
+            for (let i = 0; i < 6; i++) {
+              await sleep(120)
+              const e2 = bot.entities[d.id]
+              if (!e2) break
+            }
+          } catch (e) {}
+        }
+        try { bot.pathfinder.setGoal(null) } catch (e) {}
+        await sleep(150)
+      } catch (e) {}
+    }
+
     // 挖掉一格。返回 true 表示这一格现在是空的（本来就空也算成功）
     const digOne = async (v) => {
       const b = bot.blockAt(v)
@@ -1445,7 +1476,11 @@ class Actions {
       } catch (e) {
         // 挖一半被打断很常见，看最终结果说话
       }
-      return isFree(v)
+      // 关键：挖完要捡。不捡的话"挖了半天背包还是空的"，
+      // 后面想垫台阶/搭柱子就没有料了。
+      if (!isFree(v)) return false
+      await grabDrops(3)
+      return true
     }
 
     /**
@@ -1560,11 +1595,25 @@ class Actions {
      */
     const tryPillar = async () => {
       if (!towerOk) return false
-      const fill = filler()
-      if (!fill) return false                      // 没有垫脚方块就顶不上去
 
       const p = this.pos()
       const F = Math.floor(p.y)
+
+      // 没有垫脚方块就自己造：先挖头顶的石头/泥土，捡起来当料。
+      // 之前这里直接 return false，背包一空就彻底爬不动了
+      // （实测：dirt x3 垫完 3 格就卡死在 y=53）。
+      let fill = filler()
+      if (!fill) {
+        const fs0 = firstSolidAbove(p, 6)
+        if (fs0 > 0) {
+          for (let dy = fs0; dy <= fs0 + 1; dy++) {
+            if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+          }
+          await grabDrops(4)
+          fill = filler()
+        }
+      }
+      if (!fill) return false                      // 实在没料，交给挖台阶分支
 
       // 头顶 10 格内有水/岩浆就别直着上（会淹死/烧死）
       for (let dy = 2; dy <= 10; dy++) {
@@ -1635,9 +1684,13 @@ class Actions {
         const F = Math.floor(p.y)
         const here = `${Math.floor(p.x)},${F},${Math.floor(p.z)}`
 
-        // 先给自己留出跳跃空间：2 格高的通道里跳只抬 0.5 格，够不到 1 格台阶
-        for (const dy of [2, 3]) {
-          if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+        // 先给自己留出跳跃空间：2 格高的通道里跳只抬 0.5 格，够不到 1 格台阶。
+        // 用「找第一个实心块」而不是写死 dy —— 头顶可能是 2 格空，也可能是 9 格空。
+        const fsHere = firstSolidAbove(p, 6)
+        if (fsHere > 0) {
+          for (let dy = fsHere; dy <= fsHere + 1; dy++) {
+            if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+          }
         }
 
         // 挑方向：必须真能形成「一格台阶」
@@ -1677,8 +1730,16 @@ class Actions {
             if (moved) break
           }
           if (!moved) {
-            this.log('[surface] 挪不动了，把头顶一路挖开')
-            for (const dy of [2, 3, 4, 5]) await digOne(p.offset(0, dy, 0))
+            // 真走不动了：把头顶第一个实心块挖开，再往上多挖两格
+            const fs2 = firstSolidAbove(p, 8)
+            if (fs2 > 0) {
+              this.log(`[surface] 挪不动了，挖开头顶 +${fs2} 往上顶`)
+              for (let dy = fs2; dy <= fs2 + 2; dy++) {
+                if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+              }
+            } else {
+              this.log('[surface] 挪不动了，头顶也是空的')
+            }
           }
           await sleep(200)
           continue
@@ -1748,6 +1809,142 @@ class Actions {
     const climbed = this.pos().y - startY
     this.log(`[surface] 挖了 ${maxSteps} 步，上升 ${Math.round(climbed)} 格，还没出去`)
     return !this.isUnderground()
+  }
+
+  // ============================================================
+  // 身体动作：跳、潜行、搭柱子
+  // 这些是最基础的"用手"，之前完全没给他
+  // ============================================================
+
+  /** 跳一下 */
+  async jump (ms = 300) {
+    try {
+      this.bot.setControlState('jump', true)
+      await sleep(ms)
+      this.bot.setControlState('jump', false)
+      return true
+    } catch (e) { return false }
+  }
+
+  /** 潜行（防止从边缘掉下去） */
+  async sneak (on = true) {
+    try { this.bot.setControlState('sneak', !!on); return true } catch (e) { return false }
+  }
+
+  /**
+   * 搭柱子：跳起来往脚下放方块，一格一格往上。
+   *
+   * 这是 Minecraft 最基础的操作之一。真人都会。
+   * 步骤：跳 → 在空中低头看脚下 → 往脚下那块的顶面放 → 落在新方块上。
+   *
+   * @param {number} count 搭几格
+   * @param {string} [blockName] 用什么方块（不给就自动挑）
+   * @returns {Promise<number>} 实际搭了几格
+   */
+  async pillarUp (count = 1, blockName = null) {
+    const bot = this.bot
+
+    // 挑方块
+    let filler = null
+    if (blockName) {
+      filler = this.item(blockName)
+    } else {
+      for (const n of ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite', 'cobbled_deepslate']) {
+        const it = this.item(n)
+        if (it && it.count > 0) { filler = it; break }
+      }
+    }
+    if (!filler) {
+      this.log('[pillar] 没有可以垫的方块')
+      return 0
+    }
+
+    let built = 0
+    for (let i = 0; i < count; i++) {
+      this.check()
+
+      const p0 = this.pos()
+
+      // ===== 1. 找脚下那块"真正的实心方块" =====
+      // 踩过的坑：站在 short_grass/tall_grass 上时，脚下那格 bbox 是 empty，
+      // 往它顶面放方块会被服务端拒绝（"the block is still air"）。
+      // 所以必须往下找第一个实心方块。
+      let groundY = null
+      for (let dy = 1; dy <= 3; dy++) {
+        const b = bot.blockAt(p0.offset(0, -dy, 0))
+        if (b && b.boundingBox === 'block') {
+          groundY = -dy
+          break
+        }
+      }
+      if (groundY === null) {
+        this.log('[pillar] 脚下 3 格内没有实心方块，搭不了')
+        break
+      }
+
+      // 站在格子中心（不然身体探进目标格，服务端拒绝放置）
+      const cx = Math.floor(p0.x) + 0.5 - p0.x
+      const cz = Math.floor(p0.z) + 0.5 - p0.z
+      if (Math.hypot(cx, cz) > 0.15) {
+        try {
+          await bot.look(Math.atan2(-cx, -cz), 0, true)
+          bot.setControlState('forward', true)
+          await sleep(120)
+          bot.setControlState('forward', false)
+          await sleep(200)
+        } catch (e) {}
+      }
+
+      // ===== 2. 挖开头顶 =====
+      for (let dy = 1; dy <= 4; dy++) {
+        const b = bot.blockAt(p0.offset(0, dy, 0))
+        if (b && b.boundingBox === 'block' && !/bedrock|lava|water/.test(b.name)) {
+          try {
+            await this.bestToolFor(b)
+            await bot.dig(b, true)
+            await sleep(110)
+          } catch (e) {}
+        }
+      }
+
+      // ===== 3. 跳 =====
+      try {
+        bot.setControlState('jump', true)
+        await sleep(140)
+      } catch (e) { break }
+
+      // ===== 4. 空中低头，往"脚下实心方块的顶面"放 =====
+      let placed = false
+      try {
+        await bot.look(bot.entity.yaw, Math.PI / 2, true)
+        await sleep(70)
+        await bot.equip(filler, 'hand')
+        const ground = bot.blockAt(bot.entity.position.offset(0, groundY, 0))
+        if (ground && ground.boundingBox === 'block') {
+          await bot.placeBlock(ground, new Vec3(0, 1, 0))
+          placed = true
+          built++
+        }
+      } catch (e) {
+        // 站位偏了或者跳跃时机不对，下一次再试
+      }
+
+      try { bot.setControlState('jump', false) } catch (e) {}
+      await sleep(400)
+
+      // ===== 5. 检查有没有上升 =====
+      const p1 = this.pos()
+      if (p1.y < p0.y + 0.4) {
+        if (!placed) {
+          // 这次没放上，重试一次（不消耗 count）
+          i--
+          await sleep(200)
+        }
+      }
+    }
+
+    this.log(`[pillar] 搭了 ${built} 格，现在 y=${Math.round(this.pos().y)}`)
+    return built
   }
 
   /** 把脚边挖平，腾出一块能放东西的地方 */
