@@ -1,25 +1,26 @@
-# dependencies
+# 依赖
 node_modules/
 npm-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# 运行时数据（记忆、技能库、日志、模型生成的动作代码）
+# 运行时数据（记忆、品味、心情、技能库、生成的代码、日志）
 data/runtime/
 data/memory/
-*.log
 logs/
+*.log
 
 # 配置里带 API key，不要提交
 config.json
 config.local.json
 config.test.json
+config.*.json
+!config.example.json
 
 # 构建产物
 dist/
 build/
 *.jar
-!plugins/*/build/*.jar
 
 # 编辑器 / 系统
 .vscode/
@@ -31,4 +32,3 @@ Thumbs.db
 # 临时
 tmp/
 .cache/
-node_modules/
