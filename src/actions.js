@@ -199,13 +199,17 @@ class Actions {
       // 2. 走不动：自己挖
       this.bot.pathfinder.setGoal(null)
       if (up) {
-        // 往上挖台阶：挖头顶，然后跳上去
+        // 往上挖台阶：必须先挖身体位置(y+1)，再挖头顶(y+2)
+        // 只挖头顶的话，身体那格还是实心，跳了也上不去
+        const body = bot.blockAt(p.offset(0, 1, 0))
         const head = bot.blockAt(p.offset(0, 2, 0))
-        const above = bot.blockAt(p.offset(0, 1, 0))
-        if (head && head.name !== 'air' && head.name !== 'cave_air' && !/bedrock/.test(head.name)) {
+        for (const blk of [body, head]) {
+          if (!blk) continue
+          if (blk.name === 'air' || blk.name === 'cave_air') continue
+          if (/bedrock/.test(blk.name)) continue
           try {
-            await this.bestToolFor(head)
-            await bot.dig(head, true)
+            await this.bestToolFor(blk)
+            await bot.dig(blk, true)
             await sleep(200)
           } catch (e) {}
         }
@@ -318,13 +322,19 @@ class Actions {
       try { this.bot.setControlState(k, false) } catch (e) {}
     }
     await sleep(120)
-    // 别挖到自己脚下
+    // 挖脚下要小心：如果下面 3 格内有岩浆/水/虚空，就不挖
     const p0 = this.pos()
-    if (Math.floor(p0.x) === block.position.x &&
-        Math.floor(p0.z) === block.position.z &&
-        Math.floor(p0.y) - block.position.y <= 1) {
-      // 脚下那块不挖
-      return false
+    const isUnderfoot = Math.floor(p0.x) === block.position.x &&
+      Math.floor(p0.z) === block.position.z &&
+      Math.floor(p0.y) - block.position.y <= 1
+    if (isUnderfoot) {
+      for (let dy = 1; dy <= 3; dy++) {
+        const below = this.bot.blockAt(block.position.offset(0, -dy, 0))
+        if (!below) return false
+        if (/lava|water/.test(below.name)) return false
+        if (below.name === 'bedrock') return false
+      }
+      // 检查通过，允许挖脚下（digStone 靠这个往下走）
     }
     // 目标旁边是岩浆就不挖（挖开会流过来）
     for (const d of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]) {
@@ -389,6 +399,7 @@ class Actions {
   // 挖若干块某种方块
   async mine (blockName, count = 1, maxDist = 32) {
     await this.ensureChunks()
+    const startCount = this.countOf(blockName)   // 挖之前的数量
     let got = 0
     let emptyTries = 0
     let guard = 0
@@ -415,14 +426,19 @@ class Actions {
           b = this.findBlock(blockName, maxDist)
         }
         if (!b) {
-          if (got === 0) throw new Error('附近找不到 ' + blockName)
+          if (got === 0) {
+            throw new Error(`附近 ${maxDist} 格内找不到 ${blockName}` +
+              `（现在在 y=${Math.round(this.pos().y)}，背包有 ${this.countOf(blockName)} 个）`)
+          }
           break
         }
       }
       const ok = await this.digAt(b)
-      if (ok) got++
-      else {
-        // 挖失败：可能方块没了，重新找
+      if (ok) {
+        got++
+        // 挖完必须捡，否则物品全留在地上（这是"挖到0块"的根因）
+        try { await this.pickupNearby(4) } catch (e) {}
+      } else {
         emptyTries = (emptyTries || 0) + 1
         if (emptyTries > 5) break
       }
@@ -464,15 +480,24 @@ class Actions {
         this.complain('nothingFound', '走了一圈没树')
         throw new Error('走了很远也没找到树')
       }
-      // 砍这一棵：从下往上
+      // 砍这一棵：从下往上，检查每块是否真的挖掉了
       const base = found.position
+      let chopped = 0
       for (let dy = 0; dy < 8; dy++) {
         const b = this.bot.blockAt(base.offset(0, dy, 0))
-        if (b && logs.includes(b.name)) {
-          await this.digAt(b)
-        } else break
+        if (!b || !logs.includes(b.name)) break
+        const ok = await this.digAt(b)
+        if (ok) chopped++
+        else break          // 挖不动就别硬挖（比如太高够不到）
       }
-      trees++
+      if (chopped > 0) {
+        trees++
+        // 每棵树砍完立刻捡，别等全部砍完（不然前面的掉落物早跑出范围了）
+        try { await this.pickupNearby(8) } catch (e) {}
+      } else {
+        // 这棵砍不动，换一棵
+        this.log('[chop] 这棵砍不动，换一棵')
+      }
       await sleep(200)
     }
     // 砍完捡起来
@@ -678,10 +703,16 @@ class Actions {
     if (pick.r.requiresTable && !table) throw new Error('需要工作台但放不下')
     const times = Math.ceil(need / pick.r.result.count)
 
-    // 走到工作台旁边再重新取配方（背包可能刚变）
+    // 走到工作台旁边再确认配方
     if (table) await this.goto(table.position.x, table.position.y, table.position.z, 3, 15000)
     const usable = this.bot.recipesFor(id, null, Math.max(1, count - this.countOf(name)), table || null)
-    const recipe = (usable && usable.length) ? usable[0] : pick.r
+    // 关键：优先用补料时选的那个配方，别让 usable[0] 换成别的变体
+    // （补的是 oak_planks，结果用了需要 birch_planks 的配方 -> missing ingredient）
+    let recipe = pick.r
+    if (usable && usable.length) {
+      const same = usable.find(r => r.result.id === pick.r.result.id)
+      recipe = same || usable[0]
+    }
     await this.safeCraft(recipe, times, table || null)
     return true
   }
@@ -743,10 +774,18 @@ class Actions {
     const near = this.findBlock('crafting_table', 10)
     if (near) return near
 
-    // 2. 手上有，放下去
+    // 2. 手上有，放下去（放不下就走几步再试，别直接放弃）
     if (this.countOf('crafting_table') > 0) {
-      const placed = await this.placeNearby('crafting_table')
-      if (placed) return placed
+      for (let i = 0; i < 3; i++) {
+        const placed = await this.placeNearby('crafting_table')
+        if (placed) return placed
+        try { await this.wander(5) } catch (e) {}
+        await sleep(400)
+      }
+      // 还放不下：先挖平脚边一块地
+      try { await this.flattenSpot() } catch (e) {}
+      const placed2 = await this.placeNearby('crafting_table')
+      if (placed2) return placed2
     }
 
     // 3. 造一个：只要 4 块木板，不需要工作台
@@ -807,6 +846,31 @@ class Actions {
     return null
   }
 
+  /** 把脚边挖平，腾出一块能放东西的地方 */
+  async flattenSpot () {
+    const bot = this.bot
+    const p = this.pos()
+    // 挖掉脚边和头顶的方块
+    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]) {
+      for (const dy of [0, 1]) {
+        const b = bot.blockAt(p.offset(dx, dy, dz))
+        if (!b) continue
+        if (b.name === 'air' || b.name === 'cave_air') continue
+        if (/bedrock|water|lava/.test(b.name)) continue
+        try {
+          await this.bestToolFor(b)
+          await bot.dig(b, true)
+          await sleep(150)
+        } catch (e) {}
+      }
+      // 检查这个位置现在能不能放
+      const base = bot.blockAt(p.offset(dx, 0, dz))
+      const up = bot.blockAt(p.offset(dx, 1, dz))
+      if (base && this.solidBlock(base) && up && up.name === 'air') return true
+    }
+    return false
+  }
+
   // 找一块能放东西的空地（周围有实体地面）
   findPlaceSpot (radius = 6) {
     const p = this.pos()
@@ -823,7 +887,11 @@ class Actions {
             const base = this.bot.blockAt(p.offset(dx, dy - 1, dz))
             const at = this.bot.blockAt(p.offset(dx, dy, dz))
             const up = this.bot.blockAt(p.offset(dx, dy + 1, dz))
-            if (solid(base.name) && at.name === 'air' && up.name === 'air') {
+            if (!base || !at || !up) continue
+            // 放宽：当前格是 air 就行；头顶允许树叶/草/雪/藤蔓这类非固体
+            const atFree = at.name === 'air' || at.name === 'cave_air' || at.boundingBox === 'empty'
+            const upOk = up.boundingBox !== 'block'     // 不挡人就能放
+            if (solid(base.name) && atFree && upOk) {
               return { x: Math.floor(p.x + dx), y: Math.floor(p.y + dy), z: Math.floor(p.z + dz), base }
             }
           }
@@ -1214,16 +1282,19 @@ class Actions {
       await f.putInput(input.type, null, Math.min(count, input.count))
       const need = Math.max(1, Math.ceil(Math.min(count, input.count) / 8))
       await f.putFuel(fuel.type, null, Math.min(need, fuel.count))
-      // 等烧
+      // 等烧：烤好一个就取一个，别等凑满（凑满容易超时）
       const t0 = Date.now()
-      while (Date.now() - t0 < 90000) {
+      let taken = 0
+      const want = Math.min(count, input.count)
+      while (Date.now() - t0 < 90000 && taken < want) {
         await sleep(1000)
         const out = f.outputItem()
-        if (out && out.count >= Math.min(count, input.count)) break
+        if (out && out.count > 0) {
+          taken += out.count
+          try { await f.takeOutput() } catch (e) {}
+        }
       }
-      const out = f.outputItem()
-      if (out) await f.takeOutput()
-      return !!out
+      return taken > 0
     } finally {
       try { f.close() } catch (e) {}
     }
