@@ -1,0 +1,40 @@
+{
+  "account": "HOMEE2A1LW",
+  "at": "2026-11-12T21:31:11.527Z",
+  "home": {
+    "x": 64,
+    "y": 70,
+    "z": -10,
+    "dim": "overworld",
+    "rank": 9,
+    "anchor": "chest",
+    "reason": "测试设的家",
+    "at": 1794519003009
+  },
+  "spawn": {
+    "x": 63.5,
+    "y": 70,
+    "z": -10.5
+  },
+  "away": {
+    "x": 91.4318528874141,
+    "y": 64.44045513047197,
+    "z": 17.494937595572605,
+    "dist": 39.5,
+    "walkSecs": 33.2
+  },
+  "goHome": {
+    "ok": true,
+    "seconds": 35.3,
+    "finalDist": 3.5,
+    "legs": [
+      {
+        "name": "direct",
+        "ok": true,
+        "seconds": 35.3,
+        "dist": 3.371907426712441
+      }
+    ]
+  },
+  "trailAfter": 0
+}

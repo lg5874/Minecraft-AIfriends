@@ -941,8 +941,10 @@ class Actions {
     const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log',
       'mangrove_log', 'cherry_log', 'pale_oak_log']
     let trees = 0
-    let wanderTry = 0
-    const tried = []      // 记录试过但砍不动的树坐标，别重复试
+    const tried = new Set()
+    const t0 = Date.now()
+    // 别把测试的 180s 全烧光：留出捡东西和收尾的时间
+    const DEADLINE = Math.min(150000, 45000 + count * 40000)
 
     // 在地下找不到树很正常 —— 先爬回地面
     if (this.isUnderground()) {
@@ -952,77 +954,162 @@ class Actions {
       await this.ensureChunks(3000)
     }
 
-    // 关键：先在最大半径内找一遍，别急着走
-    await sleep(300)
-    while (trees < count) {
-      this.check()
-      let found = null
-      // 由近到远找（跳过已经试过砍不动的）
-      for (const dist of [16, 32, 64]) {
-        for (const l of logs) {
-          const def = mcData.blocksByName[l]
-          if (!def) continue
-          // 找所有这个种类的树，跳过试过的
-          const candidates = this.bot.findBlocks({ matching: def.id, maxDistance: dist, count: 20 })
-          for (const pos of candidates) {
-            const key = `${pos.x},${pos.y},${pos.z}`
-            if (tried.includes(key)) continue
-            const cand = this.bot.blockAt(pos)
-            if (!cand) continue
-            // 可达性预筛：周围要有站人的空位，不然走过去也砍不到
-            let hasStand = false
-            for (const [ox, oy, oz] of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[1,1,0],[-1,1,0],[0,1,1],[0,1,-1]]) {
-              const nb = this.bot.blockAt(cand.position.offset(ox, oy, oz))
-              if (nb && (nb.name === 'air' || nb.name === 'cave_air')) { hasStand = true; break }
-            }
-            if (!hasStand) continue
-            found = cand
-            break
-          }
-          if (found) break
+    /**
+     * 走到某个坐标附近。
+     *
+     * 不用 this.goto：goto 在 |dy|>2 时会先走 gotoVertical，
+     * 而树经常长在 5 格高的坡上，gotoVertical 直接返回"高度到不了"，
+     * 整个砍树流程就卡死在这一步（探针实测 44s 处就是这条）。
+     * 这里直接把目标交给 pathfinder，让它的爬坡/搭桥逻辑去处理。
+     */
+    const walkTo = async (x, y, z, range = 2, timeout = 25000) => {
+      try {
+        this.bot.pathfinder.setGoal(
+          new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range))
+      } catch (e) { return false }
+      const s = Date.now()
+      let last = this.pos().clone()
+      let still = 0
+      try {
+        while (Date.now() - s < timeout) {
+          this.check()
+          const p = this.pos()
+          const dxz = Math.hypot(p.x - x, p.z - z)
+          if (dxz <= range + 1 && Math.abs(p.y - y) <= 2) return true
+          if (p.distanceTo(last) < 0.12) still += 200
+          else still = 0
+          last = p.clone()
+          if (still > 5000) break        // 卡住了，别耗满超时
+          await sleep(200)
         }
-        if (found) break
+      } finally {
+        try { this.bot.pathfinder.setGoal(null) } catch (e) {}
       }
-      // 实在没有：长途去找（树经常在几十格之外）
-      if (!found) {
-        found = await this.travelToFind(() => this.findAny(logs, 64), 5, 45)
+      return false
+    }
+
+    /** 找到某根原木所在那棵树的"树干最底下一格"（从找到的位置往下走） */
+    const trunkBase = (pos) => {
+      // 注意：必须一直拿 Vec3 往下走。老写法 `base = below` 赋的是 Block 对象，
+      // 第二次循环 base.offset 就不存在了。
+      let base = pos.clone()
+      for (let i = 0; i < 12; i++) {
+        const below = this.bot.blockAt(base.offset(0, -1, 0))
+        if (!below || !logs.includes(below.name)) break
+        base = below.position.clone()
       }
-      if (!found) {
+      return base
+    }
+
+    /** 收集附近所有树的树干底格，按"好砍程度"排序 */
+    const candidates = (maxDist = 64) => {
+      const p = this.pos()
+      const out = []
+      const seen = new Set()
+      for (const l of logs) {
+        const def = mcData.blocksByName[l]
+        if (!def) continue
+        const ps = this.bot.findBlocks({ matching: def.id, maxDistance: maxDist, count: 64 })
+        for (const q of ps) {
+          const base = trunkBase(q)
+          const key = `${base.x},${base.y},${base.z}`
+          if (seen.has(key) || tried.has(key)) continue
+          seen.add(key)
+          const d = base.distanceTo(p)
+          const dy = Math.abs(base.y - p.y)
+          // 优先：水平近 + 高度差小（高度差大的树要爬坡，成功率低）
+          out.push({ base, name: l, d, dy, score: d + dy * 6 })
+        }
+      }
+      out.sort((a, b) => a.score - b.score)
+      return out
+    }
+
+    await sleep(300)
+
+    while (trees < count && Date.now() - t0 < DEADLINE) {
+      this.check()
+
+      let list = candidates(48)
+      if (!list.length) {
+        // 48 格内没有：走一段再找（不是随机乱走 40 格）
+        this.log('[chop] 48 格内没树，往外找')
+        try {
+          const a2 = Math.random() * Math.PI * 2
+          const p = this.pos()
+          await walkTo(p.x + Math.cos(a2) * 28, p.y, p.z + Math.sin(a2) * 28, 3, 30000)
+        } catch (e) {}
+        await this.ensureChunks(4000)
+        list = candidates(64)
+      }
+      if (!list.length) {
         this.complain('nothingFound', '走了一圈没树')
         throw new Error('走了很远也没找到树')
       }
-      // 砍这一棵：从下往上，检查每块是否真的挖掉了
-      const base = found.position
-      let chopped = 0
-      for (let dy = 0; dy < 8; dy++) {
-        const b = this.bot.blockAt(base.offset(0, dy, 0))
-        if (!b || !logs.includes(b.name)) break
-        const ok = await this.digAt(b)
-        if (ok) chopped++
-        else break          // 挖不动就别硬挖（比如太高够不到）
-      }
-      if (chopped > 0) {
-        trees++
-        // 每棵树砍完立刻捡，别等全部砍完（不然前面的掉落物早跑出范围了）
-        try { await this.pickupNearby(8) } catch (e) {}
-      } else {
-        // 这棵砍不动，记下来别再试
-        tried.push(`${base.x},${base.y},${base.z}`)
-        const dist = found.position.distanceTo(this.pos())
-        this.log(`[chop] 这棵砍不动（差 ${dist.toFixed(0)} 格），换一棵`)
-        // 如果连续几棵都很远，说明该换个地方了
-        if (tried.length >= 3) {
-          this.log('[chop] 附近几棵都够不到，走远点')
-          try { await this.wander(40) } catch (e) {}
-          await this.ensureChunks(4000)
-          tried.length = 0     // 换地方后重新计
+
+      // 逐个试，砍到一棵就收工（砍不动就换下一棵，不再盲目 wander）
+      let choppedThisRound = 0
+      for (const cand of list) {
+        if (Date.now() - t0 > DEADLINE) break
+        const base = cand.base
+        const key = `${base.x},${base.y},${base.z}`
+
+        // 走到树干跟前
+        let d = base.distanceTo(this.pos())
+        if (d > 4.0) {
+          const okWalk = await walkTo(base.x, base.y, base.z, 2, 25000)
+          d = base.distanceTo(this.pos())
+          if (!okWalk && d > 4.0) {
+            this.log(`[chop] 走不到这棵（差 ${d.toFixed(0)} 格），换下一棵`)
+            tried.add(key)
+            continue
+          }
         }
-        if (tried.length >= 5) throw new Error('试了 5 棵树都砍不动')
+        if (d > 4.2) {
+          this.log(`[chop] 还差 ${d.toFixed(1)} 格，够不到，换下一棵`)
+          tried.add(key)
+          continue
+        }
+
+        // 从下往上砍
+        let chopped = 0
+        for (let dy = 0; dy < 6; dy++) {
+          const b = this.bot.blockAt(base.offset(0, dy, 0))
+          if (!b || !logs.includes(b.name)) break
+          const ok = await this.digAt(b)
+          if (!ok) break
+          chopped++
+        }
+
+        if (chopped > 0) {
+          choppedThisRound = chopped
+          trees++
+          this.log(`[chop] 砍下 ${chopped} 块原木（${cand.name} @${base.x},${base.y},${base.z}）`)
+          // 立刻捡，别等（掉落物 5 分钟后消失，但走远就捡不到了）
+          try { await this.pickupNearby(8) } catch (e) {}
+          break
+        }
+        this.log(`[chop] 这棵砍不动（差 ${d.toFixed(1)} 格），换下一棵`)
+        tried.add(key)
       }
-      await sleep(200)
+
+      if (choppedThisRound === 0) {
+        // 整轮都没砍到：把这一圈标成"试过了"，往外挪一段再找
+        for (const c of list) tried.add(`${c.base.x},${c.base.y},${c.base.z}`)
+        this.log('[chop] 这一圈都砍不动，往外走')
+        const a2 = Math.random() * Math.PI * 2
+        const p = this.pos()
+        try { await walkTo(p.x + Math.cos(a2) * 25, p.y, p.z + Math.sin(a2) * 25, 3, 25000) } catch (e) {}
+        await this.ensureChunks(4000)
+      }
+      await sleep(150)
     }
-    // 砍完捡起来
-    try { await this.pickupNearby(12) } catch (e) {}
+
+    // 砍完再捡一轮（有些掉落物刚才离得远，现在走近了）
+    try { await this.pickupNearby(10) } catch (e) {}
+    if (trees < count) {
+      this.log(`[chop] 只砍到 ${trees}/${count} 棵，时间/可达性限制`)
+    }
     return trees
   }
 
@@ -1078,21 +1165,68 @@ class Actions {
     const item = this.item(blockName)
     if (!item) throw new Error('没有 ' + blockName)
 
-    const spot = this.findPlaceSpot(8)
-    if (!spot) return null
+    // 关键：放置距离必须 <= 4.5 格（跟挖掘一样）。
+    // 之前 findPlaceSpot(8) 会挑到 8 格甚至 16 格外的高分位置，
+    // 服务端直接丢弃 use_item_on，回一句 "the block is still air"，
+    // 5 次尝试全废。现在先只在伸手范围内找，找不到就走近点再找。
+    const REACH = 4.0
+    let spot = this.findPlaceSpot(8, REACH)
+    if (!spot) {
+      // 附近伸手范围内没有空地：走两步换位置再试
+      for (let i = 0; i < 3 && !spot; i++) {
+        try { await this.wander(4) } catch (e) {}
+        await sleep(300)
+        spot = this.findPlaceSpot(8, REACH)
+      }
+    }
+    if (!spot) {
+      // 还是没有：放宽到 6 格，走过去再放
+      spot = this.findPlaceSpot(10, 6)
+    }
+    if (!spot) {
+      this.log('[place] 附近找不到能放的格子')
+      return null
+    }
 
     await this.bot.equip(item, 'hand')
-    // 试几个位置，别死磕一个（每次都重新找，会挑分数更高的）
     for (let attempt = 0; attempt < 5; attempt++) {
-      const sp = attempt === 0 ? spot : this.findPlaceSpot(8 + attempt * 2)
+      // 每次重新挑，但必须仍然在伸手范围内
+      let sp = attempt === 0 ? spot : this.findPlaceSpot(8 + attempt * 2, REACH)
+      if (!sp) sp = this.findPlaceSpot(10, 6)
       if (!sp) break
+
+      // 站太远就先走过去（放置判定按眼睛到方块面的距离算）
+      const basePos = sp.base.position
+      const distToBase = basePos.distanceTo(this.pos())
+      if (distToBase > 4.2) {
+        const ok = await this.goto(basePos.x, basePos.y, basePos.z, 2, 12000)
+        if (!ok) {
+          this.log(`[place] 走不到放置点（差 ${distToBase.toFixed(1)} 格），换一个`)
+          continue
+        }
+      }
+
+      // 视线校验：隔着墙放不了
       try {
-        await this.bot.lookAt(sp.base.position.offset(0.5, 0.5, 0.5), true)
+        if (!this.bot.canSeeBlock(sp.base)) {
+          this.log('[place] 看不见底座，换一个')
+          continue
+        }
+      } catch (e) {}
+
+      try {
+        await this.bot.lookAt(basePos.offset(0.5, 0.5, 0.5), true)
         await sleep(120)
         await this.bot.placeBlock(sp.base, new Vec3(0, 1, 0))
         await sleep(250)
-        const placed = this.bot.blockAt(new Vec3(sp.x, sp.y, sp.z))
+        // 落点 = base 正上方，也就是 sp.x/sp.y/sp.z
+        const expect = basePos.offset(0, 1, 0)
+        let placed = this.bot.blockAt(expect)
+        if (!placed || placed.name !== blockName) {
+          placed = this.bot.blockAt(new Vec3(sp.x, sp.y, sp.z))
+        }
         if (placed && placed.name === blockName) return placed
+        this.log(`[place] 放完检查不到（期望 ${expect.x},${expect.y},${expect.z} 是 ${blockName}）`)
       } catch (e) {
         const msg = String(e && e.message || '')
         // blockUpdate 超时说明服务端没回包（网络或卡顿），不是位置问题
@@ -1232,7 +1366,16 @@ class Actions {
     const times = Math.ceil(need / pick.r.result.count)
 
     // 走到工作台旁边再确认配方
-    if (table) await this.goto(table.position.x, table.position.y, table.position.z, 3, 15000)
+    // 关键：走不到就立刻报错。openBlock 不做距离校验，
+    // 站太远时服务端直接丢弃 use_item_on，客户端会静默等满 20 秒 windowOpen 超时，
+    // 然后 safeCraft 重试 4 次 = 白烧 84 秒。宁可在第一步就失败。
+    if (table) {
+      const arrived = await this.goto(table.position.x, table.position.y, table.position.z, 3, 15000)
+      if (arrived !== true && arrived !== 'ok') {
+        throw new Error('走不到工作台（差 ' +
+          table.position.distanceTo(this.pos()).toFixed(1) + ' 格）')
+      }
+    }
     const usable = this.bot.recipesFor(id, null, Math.max(1, count - this.countOf(name)), table || null)
     // 关键：优先用补料时选的那个配方，别让 usable[0] 换成别的变体
     // （补的是 oak_planks，结果用了需要 birch_planks 的配方 -> missing ingredient）
@@ -1241,7 +1384,17 @@ class Actions {
       const same = usable.find(r => r.result.id === pick.r.result.id)
       recipe = same || usable[0]
     }
-    await this.safeCraft(recipe, times, table || null)
+    const okCraft = await this.safeCraft(recipe, times, table || null)
+    if (!okCraft) throw new Error('合成 ' + name + ' 失败')
+    // 合成后确认真的进了背包。recipesFor 返回配方 ≠ 服务端真的给了东西
+    // （材料被别的动作消耗、背包未同步，都会导致"报成功但没东西"）
+    if (this.countOf(name) < count) {
+      await sleep(250)
+      if (this.countOf(name) < count) {
+        throw new Error('合成 ' + name + ' 后背包没变化（' +
+          this.countOf(name) + '/' + count + '）')
+      }
+    }
     return true
   }
 
@@ -1250,21 +1403,26 @@ class Actions {
    *
    * 之前老失败的原因：服务端回包慢，本地 inventory 还没更新就去 craft，
    * mineflayer 算出"材料不够"，报 missing ingredient。
-   * 解决：合成前等一下、失败后重新取配方、必要时打开一次背包触发同步。
+   *
+   * 重要：失败必须抛错。之前重试 4 次后 `return false`，
+   * 调用方 craftSmart 又不检查返回值 -> 合成失败被当成成功，
+   * 上层继续往下走，最后表现为"做不出来但没人知道为什么"。
    */
   async safeCraft (recipe, times, table) {
+    let lastErr = null
     for (let i = 0; i < 4; i++) {
       try {
         await this.bot.craft(recipe, times, table || null)
         return true
       } catch (e) {
+        lastErr = e
         const msg = String((e && e.message) || '')
         this.log('craft retry' + i + ': ' + msg)
 
         // 等一会儿让背包同步
         await sleep(600 + i * 400)
 
-        // 打开再关一次箱子/背包，强制同步物品栏
+        // 材料不够：先同步背包再看配方还在不在
         if (/missing ingredient|not enough/i.test(msg)) {
           await this.syncInventory()
         }
@@ -1275,26 +1433,40 @@ class Actions {
           if (id) {
             const rs = this.bot.recipesFor(id, null, Math.max(1, times), table || null)
             if (rs && rs.length) { recipe = rs[0]; continue }
+            // 取不到配方 = 材料真的不够，再试也是空转，直接失败
+            throw new Error('材料不够，配方已不可用: ' + msg)
           }
-        } catch (e2) {}
+        } catch (e2) {
+          if (/配方已不可用/.test(String(e2 && e2.message))) throw e2
+        }
 
-        if (i === 3) throw new Error('合成反复失败: ' + msg)
+        if (i === 3) break
       }
     }
-    return false
+    throw new Error('合成反复失败: ' + String((lastErr && lastErr.message) || lastErr))
   }
 
-  /** 强制同步背包：开关一次随身合成格 */
+  /**
+   * 同步背包。
+   *
+   * 老实现发的是非法包：1.21.11 的 window_click 要 7 个字段
+   * （windowId/stateId/slot/mouseButton/mode/changedSlots/sequence），
+   * 只传 4 个会让 protodef 报 "SizeOf error for play.toServer"，
+   * 服务端一个字节都收不到 —— 也就是说"强制同步"从来没生效过，还白等 300ms。
+   *
+   * 现在只做安全的事：请求服务端重发一次当前窗口内容。
+   */
   async syncInventory () {
     try {
-      // 触发服务端重发背包
-      this.bot._client.write('window_click', {
-        windowId: 0, slot: -999, mouseButton: 0,
-        mode: 0, item: { present: false }
-      })
-      await sleep(300)
+      if (this.bot.currentWindow) {
+        await this.bot.syncWindow(this.bot.currentWindow)
+      } else {
+        // 没开窗口时没有可靠的"重发背包"包，只能等一个 tick 让 inventory 事件落地
+        await sleep(200)
+      }
     } catch (e) {}
   }
+
 
   // 保证身边有工作台
   async ensureTable () {
@@ -1678,24 +1850,46 @@ class Actions {
       }
 
       // 2) 跳起来，在自己脚下垫一块
-      await recenter()                             // 站格子中心，不然放置被拒
-      try {
-        await bot.equip(fill, 'hand')
-        await sleep(120)
-        bot.setControlState('jump', true)
-        await sleep(260)                           // 升到最高点附近
-        const mid = this.pos()
-        const ref = bot.blockAt(new Vec3(
-          Math.floor(mid.x), Math.floor(mid.y) - 1, Math.floor(mid.z)))
-        if (ref) {
-          await bot.lookAt(ref.position.offset(0.5, 1.0, 0.5), true)
-          await bot.placeBlock(ref, new Vec3(0, 1, 0))
+      //
+      // 踩过的两个坑（都是实测出来的）：
+      //   a) 参考块不能用 mid.y 算。跳到半空时 floor(mid.y) 会变成 F+1，
+      //      算出来的参考块就跑到了脚底下那格下面，放置位置直接错一格。
+      //      必须用起跳前的 F，固定在原地那一列。
+      //   b) 不能用固定 260ms。脚还没抬到目标方块上面（y-F < 1.0）时，
+      //      服务端认为方块和自己重叠，拒绝放置 —— 这就是 53↔54 反复来回的原因。
+      //      改成轮询到脚确实越过 F+1 再放。
+      //   c) 放方块在正下方不需要 recenter（参考块就在脚底），
+      //      而 recenter 会把人往前推、推出柱子边缘掉下去。
+      const colX = Math.floor(p.x)
+      const colZ = Math.floor(p.z)
+      let placed = false
+      for (let attempt = 0; attempt < 2 && !placed; attempt++) {
+        try {
+          await bot.equip(fill, 'hand')
+          await sleep(100)
+          bot.setControlState('jump', true)
+          // 轮询到脚越过目标方块顶面（F+1），最多 700ms
+          let airborne = false
+          for (let i = 0; i < 35; i++) {
+            await sleep(20)
+            if (this.pos().y - F >= 1.02) { airborne = true; break }
+          }
+          if (airborne) {
+            const ref = bot.blockAt(new Vec3(colX, F - 1, colZ))
+            if (ref && ref.boundingBox === 'block') {
+              await bot.lookAt(ref.position.offset(0.5, 1.0, 0.5), true)
+              await bot.placeBlock(ref, new Vec3(0, 1, 0))
+              placed = isSolid(new Vec3(colX, F, colZ))
+            }
+          }
+          bot.setControlState('jump', false)
+          await sleep(420)
+        } catch (e) {
+          try { bot.setControlState('jump', false) } catch (e2) {}
+          await sleep(250)
         }
-        bot.setControlState('jump', false)
-        await sleep(450)
-      } catch (e) {
-        try { bot.setControlState('jump', false) } catch (e2) {}
       }
+      if (placed) await sleep(200)
 
       // 3) 没垫上就退到 pathfinder（它自己会搭塔，main.js 已开 allow1by1towers）
       if (this.pos().y < F + 0.9) {
@@ -2026,7 +2220,7 @@ class Actions {
    * （"the block is still air"）。石头、泥土上就没问题。
    * 所以这里给底座方块打分，优先选稳定的。
    */
-  findPlaceSpot (radius = 6) {
+  findPlaceSpot (radius = 6, maxDist = 0) {
     const p = this.pos()
     const solid = (n) => {
       if (!n || n === 'air' || n === 'cave_air') return false
@@ -2061,6 +2255,13 @@ class Actions {
             const atFree = at.name === 'air' || at.name === 'cave_air' || at.boundingBox === 'empty'
             const upOk = up.boundingBox !== 'block'
             if (!atFree || !upOk) continue
+
+            // 可选：只收伸手范围内的格子（放置有 4.5 格硬上限，
+            // 超出服务端会直接丢弃 use_item_on，还回 "the block is still air"）
+            if (maxDist > 0) {
+              const tp = new Vec3(Math.floor(p.x + dx), Math.floor(p.y + dy), Math.floor(p.z + dz))
+              if (tp.distanceTo(p) > maxDist) continue
+            }
 
             const score = baseScore(base.name) - r * 0.5 - Math.abs(dy) * 0.3
             cands.push({
@@ -2324,7 +2525,13 @@ class Actions {
         continue
       }
       try {
-        await this.digAt(below)
+        // digAt 返回 false 表示没挖成（够不到/被挡/挖断了）。
+        // 原来不管返回值都 depth++，所以日志里会出现「往上挖了0格」。
+        const ok = await this.digAt(below)
+        if (!ok) {
+          this.log('[dig] 这格没挖成，停下')
+          break
+        }
         depth++
         await sleep(200)
         await this.pickupNearby(4)
@@ -2340,13 +2547,30 @@ class Actions {
   async ensureWood (n = 3) {
     const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log',
       'acacia_log', 'dark_oak_log', 'cherry_log', 'mangrove_log', 'pale_oak_log']
-    let have = 0
-    for (const l of logs) have += this.countOf(l)
+    const count = () => logs.reduce((s, l) => s + this.countOf(l), 0)
+
+    let have = count()
     if (have >= n) return have
-    const need = n - have
-    await this.chopTree(Math.max(1, Math.ceil(need / 3)))
-    let now = 0
-    for (const l of logs) now += this.countOf(l)
+
+    // 最多补两轮：砍树可能只砍到 1 棵，再补一次通常就够了
+    for (let round = 0; round < 2 && count() < n; round++) {
+      const need = n - count()
+      // 一棵树平均给 3~6 块原木，别一次要太多（砍不完白耗时间）
+      const wantTrees = Math.min(3, Math.max(1, Math.ceil(need / 3)))
+      try {
+        const got = await this.chopTree(wantTrees)
+        if (!got) {
+          this.log('[wood] 这一轮没砍到树')
+          break
+        }
+      } catch (e) {
+        this.log('[wood] 砍树失败: ' + e.message)
+        break
+      }
+    }
+
+    const now = count()
+    if (now < n) this.log(`[wood] 只有 ${now}/${n} 个原木`)
     return now
   }
 
@@ -2361,28 +2585,61 @@ class Actions {
   }
 
   // 把任意原木做成对应木板，返回做出了多少
+  /**
+   * 原木 -> 木板。
+   *
+   * 老实现的三个坑：
+   *  1. 直接用 `bot.craft`，失败被 `catch {}` 吞掉，上层以为成功了
+   *  2. `made += this.countOf(p)` 累加的是"当前总量"，多种原木时会重复计数
+   *  3. 只 `return countOf(p)` 就退出，混着两种原木时永远做不全
+   *
+   * 现在：一次一个原木地做，每做一次核对增量，做不动就换下一种原木。
+   */
   async anyPlanks (n = 4) {
     const pairs = [
       ['oak_log', 'oak_planks'], ['birch_log', 'birch_planks'], ['spruce_log', 'spruce_planks'],
       ['jungle_log', 'jungle_planks'], ['acacia_log', 'acacia_planks'], ['dark_oak_log', 'dark_oak_planks'],
-      ['cherry_log', 'cherry_planks'], ['mangrove_log', 'mangrove_planks'], ['pale_oak_log', 'pale_oak_planks']
+      ['cherry_log', 'cherry_planks'], ['mangrove_log', 'mangrove_planks'], ['pale_oak_log', 'pale_oak_planks'],
+      ['crimson_stem', 'crimson_planks'], ['warped_stem', 'warped_planks'], ['bamboo_block', 'bamboo_planks']
     ]
-    let made = 0
+    const total = () => pairs.reduce((s, [, p]) => s + this.countOf(p), 0)
+
+    if (total() >= n) return total()
+
     for (const [l, p] of pairs) {
-      if (this.countOf(p) >= n) return this.countOf(p)
-      const logs = this.countOf(l)
-      if (logs > 0) {
-        try {
-          const id = this.itemId(p)
-          const rs = this.bot.recipesFor(id, null, 1, null)
-          if (rs && rs.length) {
-            await this.bot.craft(rs[0], logs, null)
-            made += this.countOf(p)
-          }
-        } catch (e) {}
+      if (total() >= n) break
+      let logs = this.countOf(l)
+      if (logs <= 0) continue
+
+      const id = this.itemId(p)
+      // 1 原木 = 4 木板，算出还差几个原木就够
+      const lack = n - total()
+      const use = Math.min(logs, Math.max(1, Math.ceil(lack / 4)))
+
+      let rs = null
+      try { rs = this.bot.recipesFor(id, null, use, null) } catch (e) { rs = null }
+      if (!rs || !rs.length) {
+        // 合成格没同步：等一下重取
+        await sleep(200)
+        try { rs = this.bot.recipesFor(id, null, use, null) } catch (e) { rs = null }
+      }
+      if (!rs || !rs.length) {
+        this.log(`[planks] 取不到 ${p} 配方（有 ${logs} 个 ${l}）`)
+        continue
+      }
+
+      try {
+        await this.safeCraft(rs[0], use, null)
+        this.log(`[planks] ${l} x${use} -> ${p}，现有 ${this.countOf(p)}`)
+      } catch (e) {
+        this.log(`[planks] ${p} 合成失败: ${e.message}`)
+        continue
       }
     }
-    return made
+
+    const got = total()
+    if (got < n) this.log(`[planks] 只做出 ${got}/${n} 木板（原木 ${this.woodCount()} 个）`)
+    return got
   }
 
   // 缺原料就去弄（木头/石头这类能从世界上直接拿的）
@@ -2574,6 +2831,7 @@ class Actions {
    */
   async findFood () {
     const bot = this.bot
+    const t0 = Date.now()
 
     // 0. 先确认自己能走动。困在坑里的话什么都干不了
     if (!(await this.canMoveAround())) {
@@ -2588,41 +2846,87 @@ class Actions {
       if (ate) return '吃了背包里的 ' + ate
     }
 
-    // 2. 打动物 -> 捡肉 -> 能烤就烤（动物经常在几十格外，得走过去）
-    const animals = ['cow', 'pig', 'chicken', 'sheep', 'rabbit']
-    for (const a of animals) {
-      const e = this.nearestEntity(a, 96)
-      if (!e) continue
-      try {
-        // 太远就先追过去（用 GoalFollow，动物会动）
-        const dist = e.position.distanceTo(this.pos())
-        if (dist > 8) {
-          this.log('[food] ' + a + ' 在 ' + Math.round(dist) + ' 格外，追过去')
-          try {
-            await this.chase(a, 45000)
-          } catch (err) {
-            this.log('[food] 追不上: ' + err.message)
-          }
+    /**
+     * 打死一只动物并把肉捡回来。
+     *
+     * 老写法 `attack(name, 8)` 的根本问题：空手伤害 1，牛有 10 血，
+     * 8 次攻击里还要扣掉"距离 >3.2 就 continue"的那些轮次，
+     * 结果动物没死，自然也没有掉落物 —— 这就是"附近有 3 只猪但背包没食物"。
+     *
+     * 现在：追到跟前，反复攻击直到实体消失（或超时），再捡掉落物。
+     */
+    const hunt = async (animalName, budgetMs = 30000) => {
+      const s = Date.now()
+      let hits = 0
+      while (Date.now() - s < budgetMs) {
+        this.check()
+        const e = this.nearestEntity(animalName, 64)
+        if (!e) {
+          // 实体没了 = 打死了（或者跑掉了），去捡东西
+          break
         }
-        await this.attack(a, 8)
-        await this.pickupNearby(12)
-        // 打到生肉了吗
-        const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') || this.item('chicken') || this.item('rabbit')
+        const d = e.position.distanceTo(this.pos())
+        if (d > 3.0) {
+          try {
+            this.bot.pathfinder.setGoal(new goals.GoalFollow(e, 2), true)
+          } catch (err) {}
+          await sleep(280)
+          continue
+        }
+        try { this.bot.pathfinder.setGoal(null) } catch (err) {}
+        try {
+          await this.bot.lookAt(e.position.offset(0, 1.2, 0), true)
+          // 1.21 有攻击冷却，间隔太小会被服务端丢弃
+          await sleep(620)
+          await this.bot.attack(e)
+          hits++
+        } catch (err) {
+          await sleep(300)
+        }
+        if (hits > 30) break
+      }
+      try { this.bot.pathfinder.setGoal(null) } catch (err) {}
+      if (hits) this.log(`[food] 打了 ${animalName} ${hits} 下`)
+      await this.pickupNearby(12)
+      return hits > 0
+    }
+
+    // 2. 打动物 -> 捡肉 -> 能烤就烤
+    // 优先打近的，省时间（远处那几只等前一轮失败再说）
+    const animals = ['cow', 'pig', 'sheep', 'chicken', 'rabbit']
+    const near = animals
+      .map(n => ({ n, e: this.nearestEntity(n, 64) }))
+      .filter(x => x.e)
+      .sort((a, b) => a.e.position.distanceTo(this.pos()) - b.e.position.distanceTo(this.pos()))
+
+    for (const { n: a, e } of near) {
+      if (Date.now() - t0 > 120000) break
+      try {
+        const dist = e.position.distanceTo(this.pos())
+        this.log(`[food] 目标 ${a} 在 ${Math.round(dist)} 格外`)
+        if (dist > 12) {
+          try { await this.chase(a, 25000) } catch (err) {}
+        }
+        await hunt(a, 30000)
+        const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') ||
+          this.item('chicken') || this.item('rabbit')
         if (raw) {
-          // 有熔炉和燃料就烤，没有就直接吃
           const cooked = await this.tryCook(raw.name).catch(() => null)
           if (cooked) return '打了' + a + '，烤熟了吃'
           const ate = await this.eat()
           if (ate) return '打了' + a + '，吃了' + ate
+          return '打了' + a + '，拿到 ' + raw.name + ' x' + raw.count
         }
         if (this.hasFood()) {
           const ate = await this.eat()
           if (ate) return '打了' + a + '，吃了' + ate
         }
-      } catch (err) {}
+      } catch (err) {
+        this.log('[food] 打 ' + a + ' 失败: ' + err.message)
+      }
     }
 
-    // 3. 浆果
+    // 3. 浆果（挖丛也会掉 sweet_berries）
     for (const bush of ['sweet_berry_bush', 'cave_vines', 'cave_vines_plant']) {
       const b = this.findBlock(bush, 48)
       if (!b) continue
@@ -2633,6 +2937,8 @@ class Actions {
           const ate = await this.eat()
           if (ate) return '摘了浆果吃了'
         }
+        const berry = this.item('sweet_berries')
+        if (berry) return '摘到 sweet_berries x' + berry.count
       } catch (e) {}
     }
 
@@ -2647,22 +2953,23 @@ class Actions {
           const ate = await this.eat()
           if (ate) return '弄了' + crop + '吃了'
         }
+        if (this.item('melon_slice')) return '弄到 melon_slice'
       } catch (e) {}
     }
 
     // 5. 抓鱼
     for (const fish of ['cod', 'salmon']) {
-      const e = this.nearestEntity(fish, 24)
+      const e = this.nearestEntity(fish, 32)
       if (!e) continue
       try {
-        await this.attack(fish, 6)
-        await this.pickupNearby(10)
+        await hunt(fish, 20000)
         const raw = this.item('cod') || this.item('salmon')
         if (raw) {
           const cooked = await this.tryCook(raw.name).catch(() => null)
           if (cooked) return '抓了鱼，烤熟了吃'
           const ate = await this.eat()
           if (ate) return '抓了鱼吃'
+          return '抓了 ' + raw.name
         }
       } catch (err) {}
     }
@@ -2670,22 +2977,28 @@ class Actions {
     // 6. 走远再找一轮
     try {
       this.log('[food] 附近没有，走远找')
-      await this.wander(48)
+      await this.wander(40)
       await this.ensureChunks(4000)
-      const e = this.nearestEntity('cow', 96) || this.nearestEntity('pig', 96) ||
-        this.nearestEntity('chicken', 96) || this.nearestEntity('sheep', 96)
-      if (e) {
-        await this.attack(e.name, 8)
-        await this.pickupNearby(12)
+      const far = animals
+        .map(n => ({ n, e: this.nearestEntity(n, 96) }))
+        .filter(x => x.e)
+        .sort((a, b) => a.e.position.distanceTo(this.pos()) - b.e.position.distanceTo(this.pos()))
+      for (const { n: a, e } of far) {
+        try { await this.chase(a, 20000) } catch (err) {}
+        await hunt(a, 25000)
         const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') || this.item('chicken')
         if (raw) {
           const cooked = await this.tryCook(raw.name).catch(() => null)
-          if (cooked) return '走远打了' + e.name + '，烤熟了吃'
+          if (cooked) return '走远打了' + a + '，烤熟了吃'
+          const ate = await this.eat()
+          if (ate) return '走远打了' + a + '，吃了' + ate
+          return '走远打了' + a + '，拿到 ' + raw.name + ' x' + raw.count
         }
         if (this.hasFood()) {
           const ate = await this.eat()
           if (ate) return '走远打到猎物吃了'
         }
+        break     // 只试最近的一只，别把时间耗光
       }
       const b = this.findBlock('sweet_berry_bush', 40)
       if (b) {
@@ -2695,9 +3008,12 @@ class Actions {
           const ate = await this.eat()
           if (ate) return '走远摘到浆果'
         }
+        const berry = this.item('sweet_berries')
+        if (berry) return '走远摘到 sweet_berries x' + berry.count
       }
     } catch (err) {}
 
+    this.log('[food] 什么都没弄到')
     return null
   }
 
@@ -3050,14 +3366,55 @@ class Actions {
 
   // ---------------- 捡东西 ----------------
 
+  /**
+   * 捡地上的掉落物。
+   *
+   * 老实现是坏的：用 `goto(x,y,z,1)` 走过去，而 goto 的到达判定是
+   *   if (dxz <= range + 2 && dyAbs <= 2) return true
+   * range=1 -> 阈值 3 格。掉落物在 1.99 格时**已经算"到达"**，
+   * 人一步没挪，函数返回，东西还在原地。
+   * 实测：digAt 成功、掉落物生成、距离 1.99，背包 0 -> 0。
+   *
+   * 现在用 GoalBlock 精确踩到掉落物所在格，1 格内停下等吸附
+   * （原版 1 格内自动拾取），并轮询"掉落物消失 / 数量减少"作为完成判据。
+   */
   async pickupNearby (radius = 8) {
-    const p = this.pos()
-    const drops = Object.values(this.bot.entities).filter(e =>
-      e.name === 'item' && e.position.distanceTo(p) < radius)
-    for (const d of drops) {
-      try { await this.goto(d.position.x, d.position.y, d.position.z, 1) } catch (e) {}
+    const t0 = Date.now()
+    const BUDGET = 8000
+    let passes = 0
+
+    while (Date.now() - t0 < BUDGET) {
+      this.check()
+      const p = this.pos()
+      const drops = Object.values(this.bot.entities)
+        .filter(e => e && e.name === 'item' && e.position.distanceTo(p) < radius)
+        .sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
+      if (!drops.length) break
+
+      const d = drops[0]
+      const dist = d.position.distanceTo(this.pos())
+
+      if (dist > 1.0) {
+        // 精确走到掉落物那一格（不是 GoalNear，避免又"差不多到了"）
+        try {
+          this.bot.pathfinder.setGoal(new goals.GoalBlock(
+            Math.floor(d.position.x),
+            Math.floor(d.position.y),
+            Math.floor(d.position.z)
+          ))
+        } catch (e) {}
+        await sleep(250)
+      } else {
+        // 已经在 1 格内：停下等原版吸附，别继续走（走反而会推远）
+        try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+        await sleep(300)
+      }
+      passes++
+      if (passes > 40) break       // 兜底，别无限转
     }
-    return drops.length
+
+    try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+    return passes
   }
 
   // ---------------- 睡觉 ----------------

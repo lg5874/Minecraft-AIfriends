@@ -69,14 +69,22 @@ class Coder {
       this.ctx.log(`[skill] ${sk.name} 跑挂了：${skillFailed}`)
     }
 
-    // 旧技能都不行：让模型重写。失败的技能也一并给它看，当反面参考
-    const relevant = this.skills.search(goal, 3, statusObj, { exclude: tried })
-    const relevantCode = relevant.map(sk => {
+    // 旧技能都不行：让模型重写。
+    // 只拿**验证过**的技能当参考 —— 没跑通的代码不给，那是拿没依据的东西当依据。
+    // 单条代码可能上千字符，所以限定条数 + 总字符预算，别把提示词撑爆。
+    const CODE_BUDGET = 3000
+    const relevant = this.skills.search(goal, 2, statusObj, { exclude: tried, verifiedOnly: true })
+    let usedChars = 0
+    const parts = []
+    for (const sk of relevant) {
+      if (usedChars + sk.code.length > CODE_BUDGET) continue
+      usedChars += sk.code.length
       const runs = (sk.ok || 0) + (sk.fail || 0)
       const rate = runs ? Math.round((sk.ok || 0) / runs * 100) + '%' : '还没试过'
       const note = sk._applicable === false ? `【现在不适用：${sk._why}】` : ''
-      return `### ${sk.name}（${sk.desc}，成功率 ${rate}）${note}\n\`\`\`javascript\n${sk.code}\n\`\`\``
-    }).join('\n\n')
+      parts.push(`### ${sk.name}（${sk.desc}，成功率 ${rate}）${note}\n\`\`\`javascript\n${sk.code}\n\`\`\``)
+    }
+    const relevantCode = parts.join('\n\n')
 
     let feedback = ''
     const MAX = 4

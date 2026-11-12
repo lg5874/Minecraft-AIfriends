@@ -30,7 +30,8 @@ const STOP = new Set('的了是我你他她它在有和就都也很不个这那�
 const CHITCHAT = [
   /^(嗯+[啊哦恩]?|哦+|啊+|哈+|好吧|行吧|可以|知道了|收到|ok|okay|草|6+|牛|牛逼|对|是|行|好)[。！？.!?]*$/i,
   /^(你好|hi|hello|在吗|在不在|在不在啊)[。！？.!?]*$/i,
-  /^(谢谢|谢了|多谢|thx|thanks)[。！？.!?]*$/i
+  /^(谢谢|谢了|多谢|thx|thanks)[。！？.!?]*$/i,
+  /^(你厉害|厉害|你牛|牛啊|行行行|好好好|随便|不知道|没事|算了)[。！？.!?]*$/i
 ]
 
 // 有情绪的词。情绪是"这件事进得去脑子"的最强理由。
@@ -92,10 +93,11 @@ const SIG = {
   social: /(帮我|给我|带我|救我|救了我|借我|送我|陪我|一起|合伙|联手|谢谢|谢了|感谢|够意思|好兄弟|讲义气|信任|夸我|教我|让我|给了我|送了|说他|说我|笑我|喊我)/,
   // 恩怨
   grievance: /(打我|杀我|砍我|偷|抢|骗|坑我|炸我|推我|害我|骂我|怼我|放我鸽子|背后捅|坑了)/,
-  // 承诺 / 约定
-  promise: /(答应|说好|约好|保证|欠你|欠我|回头给|明天给|下次给|等我.{0,8}给|说定了|一会.{0,6}给|待会.{0,6}给|等会.{0,6}给)/,
+  // 承诺 / 约定。
+  // 方向很重要：「我答应给你」是他的承诺；「你回头给我」是别人的事（记成人，不是他的承诺）。
+  promise: /(答应|说好|约好|保证|欠你|欠我|说定了|回头给你|明天给你|下次给你|一会给你|待会给你|等会给你|等我.{0,8}给你)/,
   // 危险 / 生死
-  danger: /(苦力怕|爬行者|僵尸|骷髅|蜘蛛|末影人|女巫|溺尸|岩浆|熔岩|摔死|淹死|差点|危险|爆炸|炸飞|砍死|弄死|打死了|死了|挂了|没命)/,
+  danger: /(苦力怕|爬行者|僵尸|骷髅|蜘蛛|末影人|女巫|溺尸|岩浆|熔岩|摔死|淹死|差点|危险|爆炸|炸飞|砍死|弄死|打死了|挂了|没命)/,
   // 教训
   lesson: /(教训|记住|别再|下次别|千万别|小心|以后不|不能碰)/,
   // 第一次 / 发现
@@ -119,7 +121,26 @@ const RESOURCE = /(煤矿|铁矿|金矿|钻石|红石|青金石|绿宝石|石英
 const HAS_STRUCT = /(?:有|藏着|发现|全是|都是|住着|能挖到|底下是|下面是|深处是|埋着)/
 
 // 他说出来的死法：「草，被僵尸挠死了」「又栽水里了 溺尸这玩意真烦」
-const DEATH_LINE = /(?:被|让|给)[\u4e00-\u9fa5A-Za-z_]{2,8}(?:弄死|挠死|咬死|砍死|射死|炸死|打死|拖下水|淹死|烧死|摔死|弄死)|(?:又|刚|差点)?死(?:了|掉|一回)|没命了/
+const DEATH_LINE = new RegExp(
+  '(?:被|让|给)[\\u4e00-\\u9fa5A-Za-z_]{2,8}(?:弄死|挠死|咬死|砍死|射死|炸死|打死|拖下水|淹死|烧死|摔死)' +
+  '|(?:又|刚|差点)死(?:了|掉|一回)' +
+  // 「死了」得是句末，而且前面不能是「烦/累/笑/气/吓」这种情绪词，
+  // 也不能是「打死/砍死/弄死」这种他动词（那是别人死，不是他死）
+  '|(?<![\\u4e00-\\u9fa5])死了(?=[，。！？…\\s]|$)'
+)
+
+// 单独的「死了」还要再过一道：
+// 「烦死了」「笑死了」是心情；「张三打死了僵尸」是别人的事。
+function isSelfDeath (t) {
+  if (!DEATH_LINE.test(t)) return false
+  // 「烦死了/笑死了/累死了」——说的是心情，不是死
+  if (/[烦累笑气吓馋想忙急饿困冷热疼爽]死了/.test(t)) return false
+  // 「张三打死了僵尸」——死的是别人，不是我。
+  // 但有「被/让/给」就是被动："被僵尸挠死了" 死的是我。
+  const passive = /(?:被|让|给)[\u4e00-\u9fa5A-Za-z_]{2,8}(?:弄死|挠死|咬死|砍死|射死|炸死|打死|淹死|烧死|摔死|拖下水)/.test(t)
+  if (!passive && /[打杀砍射炸弄咬挠踢推骂扔砸]死[了掉]/.test(t)) return false
+  return true
+}
 
 // 不是人名的词
 const NAME_STOP = new Set([
@@ -273,7 +294,9 @@ function emotionOf (t) {
 // 4. 从「教训：X 没成（Y）」里提炼规则
 // ============================================================
 
-const ITEM_RE = /(木棍|木板|原木|木头|圆石|石头|煤炭?|铁|工作台|熔炉|食物|面包|床|镐|斧|剑|锹)/
+// 只放**材料**。镐/斧/剑/锹 是目标本身，不能当"缺的东西"
+// （否则会说出「缺斧这事就卡住了」这种鬼话）
+const ITEM_RE = /(木棍|木板|原木|木头|圆石|石头|煤炭?|铁锭|铁|工作台|熔炉|食物|面包|羊毛|皮革|线)/
 const TOOL_RE = /(石镐|木镐|铁镐|石斧|木斧|铁斧|石剑|木剑|铁剑|石锹|木锹|工作台|熔炉|箱子|床|火把)/
 const BLOCKED_RE = /(不够|只有|缺|没有|差|做不了|做不成|没做成|没法)/
 
@@ -284,17 +307,50 @@ function lessonFrom (goal, err) {
   // 模型/网络/HTML 报错 —— 这不是他的教训，是运维事故
   if (/模型调用失败|HTTP\s*\d{3}|<!DOCTYPE|<html/i.test(e)) return null
 
-  const lack = ITEM_RE.test(e) && BLOCKED_RE.test(e)
-  if (!lack) return null
+  if (!ITEM_RE.test(e) || !BLOCKED_RE.test(e)) return null
 
-  const item = (e.match(new RegExp(`(?:缺|没有|差|只有|不够)\\s*([\\u4e00-\\u9fa5]{1,4})`)) || [])[1] ||
-    (e.match(ITEM_RE) || [])[1]
-  if (!item) return null
-  if (!ITEM_RE.test(item)) return null
+  // 「可能缺工作台」「可能材料不够」是猜的，不是事实。
+  // 猜出来的教训会教坏他 —— 宁可这条不记。
+  if (/(?:可能|也许|大概|好像|说不定|估计)[^。；]{0,10}(?:缺|差|少|不够|没做成|做不了)/.test(e)) return null
 
-  const tool = (g.match(TOOL_RE) || [])[1]
-  if (tool) return `做${tool}得先备够${item}`
-  return `缺${item}这事就卡住了`
+  // 缺的东西：必须有明确的"缺/不够/只有/没有"标记，
+  // 然后取**离这个标记最近**的已知物品名。
+  // 不能只看"只有"后面那几个字 ——「木棍只有 1 根做不了新的」里后面是"1 根做不了新"。
+  const marks = []
+  const markRe = /(?:缺|不够|不足|只有|没有|差|做不了|做不成|没做成)/g
+  let mm
+  while ((mm = markRe.exec(e))) marks.push(mm.index)
+  if (!marks.length) return null
+
+  // 工具名先定下来：取「做/合/造 + 量词 + 工具」里第一个。
+  // 这比"goal 里出现的第一个工具"准。
+  const tm = g.match(new RegExp('(?:做|合|造|合成|craft)\\s*(?:一把|一个|把|个|成|出)?\\s*(' + TOOL_RE.source + ')'))
+  const tool = tm ? tm[1] : null
+  const toolBase = tool ? tool.replace(/^(石|木|铁|金|钻)/, '') : null
+
+  const itemRe = new RegExp(ITEM_RE.source, 'g')
+  let best = null
+  let bestD = Infinity
+  let im
+  while ((im = itemRe.exec(e))) {
+    const w = im[0]
+    // 跳过"他自己"：工具名本身、以及它的裸名（石斧 -> 斧）
+    if (tool && (w.includes(tool) || tool.includes(w))) continue
+    if (toolBase && w.includes(toolBase)) continue
+    // 跳过"其实已经有了"的：报错说"工作台已就绪"，就不能写「做木镐得先备够工作台」
+    const after = e.slice(im.index + w.length, im.index + w.length + 10)
+    const before = e.slice(Math.max(0, im.index - 6), im.index)
+    if (/(?:已|已经|都)?(?:就绪|有了|备好|弄到|拿到|做好)/.test(after) &&
+        !/(?:缺|没有|不够|不足|差)/.test(before)) continue
+    for (const mi of marks) {
+      const d = Math.abs(im.index - mi)
+      if (d < bestD) { bestD = d; best = w }
+    }
+  }
+  if (!best) return null
+
+  if (tool) return `做${tool}得先备够${best}`
+  return `缺${best}这事就卡住了`
 }
 
 // ============================================================
@@ -376,12 +432,13 @@ function scan (t, ctx = {}) {
   // 也不是「跟张三一起下了个矿洞」—— 后者是关于人，不是地点。
   const placeKnowledge = placeWord && HAS_STRUCT.test(t) && resource && !social
 
-  // 光是"提到了某个地方"不算记忆。
-  // 「在河边走了走」「在洞里转两圈」—— 这是位移，不是知识。
+  // 关键设计：**情绪本身不是内容**。
+  // 「烦死了」「笑死」只是心情，心情归 mood.js 管。
+  // 情绪只能放大一个已经存在的信号（有人、有地方、有后果），不能凭空造出一条记忆。
+  // 同理，光是"提到了某个地方"也不算 ——「在河边走了走」是位移，不是知识。
   const any =
-    social || grievance || promise || danger || lesson || discovery ||
-    placeKnowledge || emotion >= 0.35
-  const strong = social || grievance || promise || danger || lesson || emotion >= 0.5
+    social || grievance || promise || danger || lesson || discovery || placeKnowledge
+  const strong = social || grievance || promise || danger || lesson || placeKnowledge
 
   return {
     social, grievance, promise, danger, placeWord, placeKnowledge, resource,
@@ -390,8 +447,25 @@ function scan (t, ctx = {}) {
 }
 
 /** 分种类：承诺 > 恩怨 > 地点 > 教训 > 关于人 > 事件 */
-function pickKind (sig, given) {
-  if (sig.promise) return KINDS.PROMISE
+function pickKind (sig, given, isSelf, who, t) {
+  // 承诺的方向很重要，记反了就是记错事。
+  //   「我答应张三给他铁」「我答应给你铁」 -> 他的承诺（promise，永不衰减）
+  //   「张三说他一会给我铁」             -> 张三答应给他（person，别人的话要转述）
+  //
+  // 判据是主语，不是前缀 —— talk.js 传别人的话时没有「我说：」，
+  // 但他自己写记忆时也可能不带前缀，光看前缀会判反。
+  if (sig.promise) {
+    const selfSubject = /^(?:我|咱)\s*(?:答应|说好|约好|保证|欠|回头|明天|下次|一会|待会|等会)/.test(t) ||
+      /我\s*(?:答应|保证|说好)/.test(t)
+    // 「镐子给我，我一会给你更多镐子」—— 这是**对方**在要东西并许诺，
+    // 不是他给别人承诺。有索取语（给我/借我/分我）就不是他的承诺。
+    const asking = /(?:给|借|送|分|拿|还)\s*我/.test(t) || /^[^，。]{1,10}给我/.test(t)
+    const otherSubject = /(?:他|她|你|[A-Za-z0-9_\u4e00-\u9fa5]{2,8})\s*(?:说|答应|保证)[^。]{0,12}(?:给|送)/.test(t) &&
+      !selfSubject
+    if (selfSubject || isSelf) return KINDS.PROMISE
+    if (asking) return KINDS.PERSON
+    if (!otherSubject) return KINDS.PROMISE
+  }
   if (sig.grievance) return KINDS.GRIEVANCE
   if (sig.placeKnowledge) return KINDS.PLACE
   if (sig.lesson) return KINDS.SKILL
@@ -456,22 +530,29 @@ function admit (input = {}) {
       {
         who,
         where: where || null,
-        emotion: death.emotion,
-        importance: death.importance,
+        emotion: Math.max(death.emotion, Number(input.emotion) || 0),
+        importance: Math.max(death.importance, Number(input.importance) || 0),
         reason: 'death'
       }
     )
   }
 
   // ---- A1. 别种写法的死：'草，被僵尸挠死了' ----
-  const death2 = t.match(DEATH_LINE)
-  if (death2) {
+  if (isSelfDeath(t)) {
     const who = normalizeWho(input.who, t)
     const where = input.where || firstPlace(t)
     return keep(
       condense(t).slice(0, 60),
       who.length ? KINDS.GRIEVANCE : KINDS.EVENT,
-      { who, where: where || null, emotion: 0.65, importance: 0.5, reason: 'death' }
+      {
+        who,
+        where: where || null,
+        // 取两者较大值：调用方说"这次特别惨"（0.95）不能被压回 0.65，
+        // 否则"情感≥0.7 永不衰减"这条设计就进不来了。
+        emotion: Math.max(0.65, Number(input.emotion) || 0),
+        importance: Math.max(0.5, Number(input.importance) || 0),
+        reason: 'death'
+      }
     )
   }
 
@@ -521,7 +602,7 @@ function admit (input = {}) {
   }
 
   // ---- F. 组装 ----
-  const kind = pickKind(sig, input.kind)
+  const kind = pickKind(sig, input.kind, isSelf, sig.who, t)
   const who = sig.who
   const where = sig.where
 

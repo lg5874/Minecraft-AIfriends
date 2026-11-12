@@ -456,10 +456,90 @@ async function testReuseFailure () {
   ok(successRate(s) < 0.5, '失败后成功率掉到 50% 以下', String(successRate(s)))
 }
 
+// ==================== 13. 容量上限与淘汰 ====================
+async function testCap () {
+  console.log('\n[容量上限]')
+  const dir = tmpDir('cap')
+  const lib = new SkillLibrary(dir)
+  // 直接塞 60 条互不相同的技能，绕开 add 的去重
+  lib.data.skills = []
+  for (let i = 0; i < 60; i++) {
+    lib.data.skills.push(lib.migrate({
+      name: 'k_' + i, desc: '技能' + i, code: 'return ' + i,
+      uses: 0, ok: 0, fail: 0, created: Date.now() + i, updated: Date.now() + i
+    }))
+  }
+  // 5 条好成绩但很旧
+  const good = lib.all().slice(0, 5).map(s => s.name)
+  good.forEach(n => { const s = lib.get(n); s.ok = 9; s.fail = 1; s.uses = 10; s.updated = 1 })
+  // 5 条差成绩但很新
+  const bad = lib.all().slice(5, 10).map(s => s.name)
+  bad.forEach(n => { const s = lib.get(n); s.ok = 1; s.fail = 9; s.uses = 10; s.updated = Date.now() + 99999 })
+
+  ok(lib.all().length === 60, '塞了 60 条', String(lib.all().length))
+  const dropped = lib.prune(50)
+  ok(lib.all().length === 50, 'prune 后压到 50 条', String(lib.all().length))
+  ok(dropped.length === 10, '淘汰了 10 条', String(dropped.length))
+  ok(good.every(n => !!lib.get(n)), '高成功率的老技能保住了')
+  ok(bad.every(n => !lib.get(n)), '低成功率的新技能被淘汰')
+
+  // add 触发自动 prune
+  const dir2 = tmpDir('cap2')
+  const lib2 = new SkillLibrary(dir2)
+  lib2.data.skills = []
+  for (let i = 0; i < 55; i++) {
+    lib2.data.skills.push(lib2.migrate({
+      name: 'x_' + i, desc: '旧任务' + i, code: 'return ' + i,
+      uses: 0, ok: 0, fail: 0, created: i, updated: i
+    }))
+  }
+  lib2.add({ name: 'x_new', desc: '全新任务：去挖红石', code: 'return 1' })
+  ok(lib2.all().length <= 50, 'add() 会自动触发修剪', String(lib2.all().length))
+}
+
+// ==================== 14. 提示词只注入验证过的技能 ====================
+async function testPromptSize () {
+  console.log('\n[提示词体积]')
+  const dir = tmpDir('prompt')
+  const lib = new SkillLibrary(dir)
+
+  // 未验证的技能不该出现在目录里
+  lib.add({ name: 'k_unverified', desc: '用圆石做一把石镐', code: CODE_STONE_PICK })
+  const cat1 = lib.catalog(20)
+  ok(!/k_unverified/.test(cat1), '未验证的技能不进目录', cat1)
+  ok(/还没有验证过/.test(cat1), '目录明确说明"还没有验证过的技能"')
+
+  // 验证过（跑成功过）才进目录
+  lib.markUse('k_unverified', true)
+  const cat2 = lib.catalog(20)
+  ok(/k_unverified/.test(cat2), '跑成功过才进目录', cat2)
+  ok(/成功率 100%/.test(cat2), '带真实成功率', cat2)
+
+  // 只失败过的也不进目录
+  lib.add({ name: 'k_always_fail', desc: '用圆石做一把石斧', code: CODE_STONE_PICK.replace('pickaxe', 'axe') })
+  lib.markUse('k_always_fail', false)
+  const cat3 = lib.catalog(20)
+  ok(!/k_always_fail/.test(cat3), '只失败过的不进目录', cat3)
+
+  // 目录有上限，不会无限长
+  const dir2 = tmpDir('prompt2')
+  const lib3 = new SkillLibrary(dir2)
+  for (let i = 0; i < 40; i++) {
+    lib3.add({ name: 'v_' + i, desc: '第' + i + '个已验证技能：去挖第' + i + '种矿', code: 'return ' + i })
+    lib3.markUse('v_' + i, true)
+  }
+  const cat4 = lib3.catalog(20)
+  const lines = cat4.split('\n').filter(Boolean)
+  ok(lines.length <= 20, '目录最多 20 行', String(lines.length))
+  ok(cat4.length < 1200, '目录字符数受控（< 1200）', String(cat4.length))
+}
+
 // ==================== 汇总 ====================
 ;(async () => {
   await testCoderReuse()
   await testReuseFailure()
+  await testCap()
+  await testPromptSize()
 
   console.log('\n' + '='.repeat(46))
   console.log(`通过 ${pass}，失败 ${fail}`)

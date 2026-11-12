@@ -18,6 +18,9 @@ const crypto = require('crypto')
 // ==================== 工具等级 ====================
 // 用来判断"现在有更好的工具了，这个技能过时了"
 const TOOL_TIERS = { wooden: 1, stone: 2, iron: 3, golden: 3, diamond: 4, netherite: 5 }
+
+// 技能库上限。超过就按"成绩差的先走"淘汰，避免无限膨胀。
+const MAX_SKILLS = 50
 const TOOL_KINDS = ['pickaxe', 'axe', 'sword', 'shovel', 'hoe']
 
 function parseToolName (item) {
@@ -396,6 +399,7 @@ class SkillLibrary {
       hit.uses = hit.uses || 0
       hit.variants = (hit.variants || 1) + 1
       this.writeCode(hit.name, hit.code)
+      this.prune()
       this.save()
       return hit
     }
@@ -420,8 +424,26 @@ class SkillLibrary {
     })
     this.data.skills.push(s)
     this.writeCode(name, code)
+    this.prune()
     this.save()
     return s
+  }
+
+  // 超容量时淘汰：先踢没验证过的，再踢成功率低的，最后踢最久没用的
+  prune (max = MAX_SKILLS) {
+    if (this.data.skills.length <= max) return []
+    const ranked = this.data.skills.slice().sort((a, b) => {
+      const ra = totalRuns(a) ? successRate(a) : 0.5
+      const rb = totalRuns(b) ? successRate(b) : 0.5
+      if (Math.abs(ra - rb) > 0.01) return rb - ra          // 成功率高的留
+      const ua = totalRuns(a); const ub = totalRuns(b)
+      if (ua !== ub) return ub - ua                          // 跑得多的留
+      return (b.updated || 0) - (a.updated || 0)             // 新的留
+    })
+    const keep = new Set(ranked.slice(0, max).map(s => s.name))
+    const dropped = this.data.skills.filter(s => !keep.has(s.name))
+    this.data.skills = ranked.slice(0, max)
+    return dropped
   }
 
   writeCode (name, code) {
@@ -472,14 +494,23 @@ class SkillLibrary {
     const a = skill.analysis || analyzeCode(skill.code)
 
     // 1. 工具被更好的替代了 —— "用木镐挖石头" 在有石镐之后作废
+    //
+    //    注意：技能里常写 "有石镐就用石镐，没有就退回木镐" 这种兜底链，
+    //    那不是过时，是稳。所以按**该工具种类的最高档**来比，
+    //    而不是"提到过任何低档工具就判死"。
+    const bestInSkill = new Map()   // kind -> {tier, rank}
     for (const t of a.tools) {
+      const cur = bestInSkill.get(t.kind)
+      if (!cur || t.rank > cur.rank) bestInSkill.set(t.kind, t)
+    }
+    for (const [kind, t] of bestInSkill) {
       for (const [item, n] of Object.entries(inv)) {
         if (!n) continue
         const have = parseToolName(item)
-        if (have && have.kind === t.kind && have.rank > t.rank) {
+        if (have && have.kind === kind && have.rank > t.rank) {
           return {
             ok: false,
-            reason: '已被更好的工具替代（技能用 ' + t.tier + '_' + t.kind +
+            reason: '已被更好的工具替代（技能最多用到 ' + t.tier + '_' + kind +
               '，现在有 ' + item + '）'
           }
         }
@@ -501,10 +532,14 @@ class SkillLibrary {
 
   // ---------- 检索 ----------
   // 打分 = 相关度 + 真实成功率 + 新鲜度；不适用的降权而不是直接删（留着当参考）
+  //
+  // opts.verifiedOnly：只返回跑成功过的技能。coder 注入代码时用这个，
+  // 免得把从没验证过的代码塞进提示词 —— 那是拿没依据的东西当依据。
   search (query, limit = 6, ctx = null, opts = {}) {
     const exclude = opts.exclude instanceof Set ? opts.exclude : new Set(opts.exclude || [])
     const q = String(query || '')
-    const pool = this.data.skills.filter(s => !exclude.has(s.name))
+    let pool = this.data.skills.filter(s => !exclude.has(s.name))
+    if (opts.verifiedOnly) pool = pool.filter(s => (s.ok || 0) > 0)
 
     if (!q.trim()) {
       return pool
@@ -620,17 +655,27 @@ class SkillLibrary {
   }
 
   // ---------- 提示词目录 ----------
-  catalog (limit = 40) {
-    const list = this.data.skills
-      .slice()
-      .sort((a, b) => (b.updated || 0) - (a.updated || 0))
+  // 给提示词用的目录。
+  // 关键：只列**验证过**的技能（至少成功跑过一次）。
+  // 没跑通的代码不占提示词 —— 那是在喂没依据的东西。
+  catalog (limit = 20) {
+    const verified = this.data.skills
+      .filter(s => (s.ok || 0) > 0)
+      .sort((a, b) => {
+        // 成功率高的、用得多的排前面
+        const ra = successRate(a)
+        const rb = successRate(b)
+        if (Math.abs(ra - rb) > 0.01) return rb - ra
+        return (b.uses || 0) - (a.uses || 0)
+      })
       .slice(0, limit)
-    if (!list.length) return '（还不会什么，都要现学）'
-    return list.map(s => {
+
+    if (!verified.length) return '（还没有验证过的技能，都要现学）'
+    return verified.map(s => {
       const runs = totalRuns(s)
       // 给人看的用原始比值，不用平滑值 —— 3 次全成就是 100%
       const rate = runs ? Math.round((s.ok || 0) / runs * 100) + '%' : '未用'
-      return `- ${s.name}：${s.desc}（用过 ${s.uses || 0} 次，成功率 ${rate}）`
+      return `- ${s.name}：${s.desc}（跑过 ${runs} 次，成功率 ${rate}）`
     }).join('\n')
   }
 

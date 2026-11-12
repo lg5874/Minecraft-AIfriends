@@ -105,16 +105,57 @@ class Reflex {
     } catch (e) {}
   }
 
+  /**
+   * 现在有没有任务在跑。
+   *
+   * main.js 一直在传 busy 回调，但这个类从来没读过它 ——
+   * 结果是每 800ms 无条件跑完 6 级检查，跟任务抢同一个 bot：
+   *   flee -> pathfinder.setGoal
+   *   shelter -> bot.dig + placeBlock
+   *   unstuck -> setControlState + digOut(bot.dig)
+   *   eat -> bot.equip + bot.consume
+   * 最坑的是 checkStuck：任务在算路时 isMoving() 恰好为真、位置还没动，
+   * 8 秒后判"卡住" -> unstuck -> digOut 挖脚下，
+   * 把任务正在挖的方块打断（就是那堆 "Digging aborted"）。
+   */
+  isBusy () {
+    try {
+      return typeof this.ctx.busy === 'function' ? !!this.ctx.busy() : false
+    } catch (e) {
+      return false
+    }
+  }
+
   tick () {
     if (!this.enabled || !this.bot.entity) return
     const bot = this.bot
 
-    // 1. 快死了 / 掉虚空 -> 自救
+    // 0. 掉虚空 -> 自救。这条永远先跑，不看 busy
     try {
       if (bot.entity.position.y < -60) {
         this.ctx.onEvent && this.ctx.onEvent('void', {})
       }
     } catch (e) {}
+
+    // ===== 任务执行中：只保留救命的事 =====
+    // 血还够就一律让路。抢 bot 比"少躲一次夜"危险得多。
+    if (this.isBusy()) {
+      // 血真的少了 + 身边确实有怪 -> 还是得跑
+      if (bot.health <= 6) {
+        const near = this.nearestHostile(10)
+        if (near) this.flee(near)
+      }
+      // 被怪贴脸也要还手（attack 不抢 pathfinder / dig）
+      if (this.ctx.aggressive !== false && bot.health > 6) {
+        const near = this.nearestHostile(2.5)   // 半径收窄：只有真贴脸才打
+        if (near) this.retaliate(near)
+      }
+      // 关键：busy 期间仍然刷新卡住基线。
+      // 不然任务一结束，第一次 checkStuck 会拿很久以前的坐标比，
+      // 算出一个巨大的位移（或反过来），判定完全失真。
+      this.syncStuckBaseline()
+      return
+    }
 
     // 2. 饿到不行就吃
     if (bot.food <= 17 && !this.eating) {
@@ -144,6 +185,18 @@ class Reflex {
 
     // 6. 卡住脱困（只在真的想动却没动时才触发）
     this.checkStuck()
+  }
+
+  /**
+   * 只更新"上次位置"，不判卡住。
+   * busy 期间用它保持基线新鲜，避免任务结束后第一次判断失真。
+   */
+  syncStuckBaseline () {
+    try {
+      const p = this.bot.entity.position
+      this.lastPos = p.clone()
+      this.stuckSince = 0
+    } catch (e) {}
   }
 
   // 天黑自救：挖三格洞把自己埋起来

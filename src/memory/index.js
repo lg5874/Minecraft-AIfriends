@@ -127,8 +127,19 @@ class Memory {
       const kept = []
       for (const e of old.entries) {
         const r = sanitizeEntry(e)
-        if (r) kept.push(r)
-        else this.journal.push({ t: e.createdAt || 0, text: short(e.text), from: 'migrate' })
+        if (!r) {
+          this.journal.push({ t: e.createdAt || 0, text: short(e.text), from: 'migrate' })
+          continue
+        }
+        // 迁移不走 add()，所以这里自己合并一次同类条目
+        // （否则历史里 5 条「缺木棍这事就卡住了」会原样带进来）
+        const dup = kept.find(k => k.kind === r.kind && similarText(k.text, r.text))
+        if (dup) {
+          dup.repeat = (dup.repeat || 1) + 1
+          dup.lastAt = Math.max(dup.lastAt || 0, r.lastAt || 0)
+          continue
+        }
+        kept.push(r)
       }
       this.entries = kept
     }
@@ -304,7 +315,12 @@ class Memory {
       const e = this.entries[i]
       if (e.archived) continue
       if (e.kind !== kind) continue
-      if (now - (e.lastAt || e.createdAt) > 30) continue
+
+      // 时间窗：默认 30 游戏分钟。
+      // 但「教训/技能」和「地点」是不衰减的长期知识 —— 同一句规则隔几天又踩一次，
+      // 也该合并成一条（记 repeat 次数），而不是堆成 5 条一样的「缺木棍这事就卡住了」。
+      const forever = kind === KINDS.SKILL || kind === KINDS.PLACE
+      if (!forever && now - (e.lastAt || e.createdAt) > 30) continue
 
       const sameWho = whoArr.length && (e.who || []).some(w => whoArr.includes(w))
       if (whoArr.length && !sameWho) continue
@@ -681,6 +697,13 @@ function agoText (mins) {
 function normWho (w) {
   if (!w) return []
   return (Array.isArray(w) ? w : [w]).filter(Boolean).slice(0, 6)
+}
+
+/** 两句话是不是在说同一件事（用于合并重复） */
+function similarText (a, b) {
+  const A = cnChars(a, STOP)
+  const B = cnChars(b, STOP)
+  return jaccard(A, B) >= 0.6
 }
 
 /**

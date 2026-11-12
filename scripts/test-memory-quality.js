@@ -479,6 +479,26 @@ section('[八] 衰减设计没被动过（这是设计，不是 bug）')
 }
 
 // ------------------------------------------------------------
+section('[九] 承诺的方向不能记反')
+// ------------------------------------------------------------
+
+{
+  const m = fresh()
+  // 他的承诺 -> promise（永不衰减）
+  const mine = m.add({ text: '我答应张三给他铁', who: ['张三'] })
+  ok(mine && mine.kind === KINDS.PROMISE, '「我答应张三给他铁」= 他的承诺')
+
+  // 别人的许诺 -> 记成人，不是他的承诺
+  const other = m.add({ text: '张三说他明天给我一把镐', who: ['张三'] })
+  ok(other && other.kind !== KINDS.PROMISE, '「张三说他明天给我一把镐」不是他的承诺（实际 ' + (other && other.kind) + '）')
+  ok(other && (other.who || []).includes('张三'), '但记在张三名下')
+
+  // 对方在索取 -> 也不是他的承诺
+  const ask = m.add({ text: '镐子给我，我一会给你更多镐子', who: ['Xylitol6983'] })
+  ok(ask && ask.kind !== KINDS.PROMISE, '「镐子给我，我一会给你…」是对方在要东西，不是他的承诺（实际 ' + (ask && ask.kind) + '）')
+}
+
+// ------------------------------------------------------------
 
 console.log('\n' + '='.repeat(62))
 if (fail) {

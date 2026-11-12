@@ -565,12 +565,9 @@ class Home {
         const p = bot.entity.position
         const dxz = Math.hypot(p.x - x, p.z - z)
         const dy = Math.abs(p.y - y)
+        // 水平到了就算到（xz 模式不看高度；正常模式垂直也得对）
         if (dxz <= range + 1.5 && (useXZ || dy <= 2.5)) {
-          if (useXZ && dy > 2.5) {
-            // 水平到了但高度不对，让最后一段自己处理；先判定成功
-            return { ok: true, seconds: this._sec(t0), dist: dxz, note: '高度差 ' + dy.toFixed(1) }
-          }
-          return { ok: true, seconds: this._sec(t0), dist: dxz }
+          return { ok: true, seconds: this._sec(t0), dist: dxz, dy: Math.round(dy * 10) / 10 }
         }
 
         const moved = p.distanceTo(last)
