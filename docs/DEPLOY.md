@@ -54,12 +54,12 @@ node scripts/package.js
 ```
 打包完成
   产物   /root/workspace/minecraft-AIfriend/dist/minecraft-aifriend-0.1.0-20261113-054257.tar.gz
-  大小   186.9 KB（tar 566.5 KB 压缩后）
+  大小   187.7 KB（tar 568.5 KB 压缩后）
   文件   37 个
   build  9e5ad9d50aba048c
 ```
 
-> **187 KB**。不含 `node_modules`（500MB 那坨由服务器装），不含 `config.json`（key 绝不进包）。
+> **188 KB**。不含 `node_modules`（500MB 那坨由服务器装），不含 `config.json`（key 绝不进包）。
 > 打包脚本会自己扫一遍：发现疑似 key 就直接拒绝打包并报出是哪一行。
 
 想先看会打进去什么：
@@ -311,27 +311,28 @@ supervise:
 
 ## 9. 自己验证（不碰服务器）
 
-两个自检程序，都是纯 Java、不需要 Paper、不会连你的服务器。
+三个自检程序，都是纯 Java、不需要 Paper、不会连你的服务器。
 
 ### 9.1 单元自检
 
 ```bash
 cd /root/workspace/mcplugin
 ./build.sh
-java -cp build/classes com.xjj.runner.SelfTest \
-  /tmp/xjj-selftest \
-  /root/workspace/minecraft-AIfriend/dist/minecraft-aifriend-0.1.0-*.tar.gz
+
+PKG=$(ls -t /root/workspace/minecraft-AIfriend/dist/*.tar.gz | head -1)
+java -cp build/classes com.xjj.runner.SelfTest /tmp/xjj-selftest "$PKG"
 ```
+
+> 用 `$PKG` 变量取**绝对路径**。`dist/*.tar.gz` 这种相对路径在 `mcplugin/` 目录下是找不到的
+> （自检会直接 SKIP，不会报错——这个坑我自己踩过）。
 
 验四件事：真包能解开（含 UTF-8 中文）、日志轮转正确、进程能起、崩了会重启。
 
 ### 9.2 全流程部署验证
 
 ```bash
-java -cp build/classes com.xjj.runner.DeployCheck \
-  /tmp/clean-server \
-  /root/workspace/minecraft-AIfriend/dist/minecraft-aifriend-0.1.0-*.tar.gz \
-  --npm
+PKG=$(ls -t /root/workspace/minecraft-AIfriend/dist/*.tar.gz | head -1)
+java -cp build/classes com.xjj.runner.DeployCheck /tmp/clean-server "$PKG" --npm
 ```
 
 模拟一台干净服务器：建 `plugins/XJJBot/upload/` → 放包 → 解包 → **真跑 npm install** → 生成 config.json → 起进程 → `kill -9` 验证重启 → 优雅停止。
@@ -354,7 +355,7 @@ cd /root/workspace/mcplugin && ./build.sh
 
 `build.sh` 除了编译打包，还会跑 `tools/PaperCompat.java`：用真实的 Bukkit API 加载插件类，确认主类继承关系、命令签名、依赖类完整、jar 里没混进自检类或 paper-api。
 
-**当前实测：插件兼容 23 项 + 单元自检 31 项 + 部署验证 28 项 + 边界 21 项 = 103 项全过。**
+**当前实测：插件兼容 23 + 单元自检 31 + 边界 21 + 部署验证 34 = 109 项全过。**
 
 ### 9.5 只在本地验证包本身
 
@@ -410,7 +411,7 @@ tail -200 plugins/XJJBot/logs/bot/bot.log     # 他的视角
 
 上服务器前对照这个：
 
-- [ ] `node scripts/package.js` 跑过，产物 ≤ 5MB（实际 187KB）
+- [ ] `node scripts/package.js` 跑过，产物 ≤ 5MB（实际 188KB）
 - [ ] `./build.sh` 跑过，`XJJBot.jar` 有 48KB
 - [ ] jar 在 `plugins/XJJBot.jar`
 - [ ] 包在 `plugins/XJJBot/upload/`
