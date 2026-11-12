@@ -3340,7 +3340,25 @@ class Actions {
    * 吃。用 minecraft-data 的食物表，按"吃了能回多少"排序。
    * 生的先吃也没事 —— 真人饿急了不会挑。
    */
-  async eat ({ preferCooked = true } = {}) {
+  /**
+   * 吃。用 minecraft-data 的食物表，按"吃了能回多少"排序。
+   * 生的先吃也没事 —— 真人饿急了不会挑。
+   *
+   * 两个必须处理的坑：
+   *  1. 饱食度满（20）时 mineflayer 的 bot.consume() 直接抛 'Food is full'。
+   *     老实现 catch 掉之后 continue，把包里每样食物都试一遍，
+   *     每次失败还要走完一次 equip —— 白耗时间，最后返回 null，
+   *     上层以为"没吃的"。现在饱食度满就直接返回 null（没需求，不是失败）。
+   *  2. 吃成功之后 bot.food 是异步更新的，立刻读可能还是旧值。
+   *     这里等一下再返回，让调用方能读到真实饱食度。
+   *
+   * @param {{preferCooked?:boolean, force?:boolean}} opts
+   * @returns {Promise<string|null>} 吃掉的物品名
+   */
+  async eat ({ preferCooked = true, force = false } = {}) {
+    // 不饿就别吃（除非调用方明确要求）
+    if (!force && this.bot.food >= 20) return null
+
     const items = this.bot.inventory.items()
     const foods = []
 
@@ -3364,9 +3382,23 @@ class Actions {
     for (const f of foods) {
       try {
         await this.bot.equip(f.it, 'hand')
+      } catch (e) {
+        continue
+      }
+      try {
         await this.bot.consume()
-        return f.name
-      } catch (e) { continue }
+      } catch (e) {
+        const msg = String((e && e.message) || '')
+        // 饱食度满：没需求，别再试别的食物了
+        if (/Food is full/i.test(msg)) return null
+        continue
+      }
+      // 等饱食度落地（服务端 set_health 回包有延迟）
+      for (let i = 0; i < 10; i++) {
+        if (this.bot.food > 0) break
+        await sleep(80)
+      }
+      return f.name
     }
     return null
   }
