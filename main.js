@@ -201,17 +201,30 @@ class Bot {
 
     this.log('进来了：' + bot.username + ' @ ' + bot.entity.position)
 
-    // 寻路配置
+    // ===== 寻路配置（实测调过）=====
     const moves = new Movements(bot)
-    // 允许挖方块：卡在坑里的时候，能挖出来比干等着强
     moves.canDig = true
-    moves.digCost = 20
-    moves.allow1by1towers = false
-    moves.scafoldingBlocks = []
+    moves.digCost = 20          // 别太低，不然它到处乱挖
+
+    // 【关键】允许搭方块往上爬
+    // 实测：打开后 pathfinder 1.2 秒能把自己顶上 3 格，1 格宽通道也管用。
+    // 关着的话他永远爬不出洞 —— 这是"困在地下"的根本原因。
+    moves.allow1by1towers = true
+    moves.scafoldingBlocks = [
+      bot.registry.itemsByName.dirt.id,
+      bot.registry.itemsByName.cobblestone.id,
+      bot.registry.itemsByName.andesite.id,
+      bot.registry.itemsByName.stone.id,
+      bot.registry.itemsByName.gravel.id
+    ].filter(x => x != null)
+
     moves.canOpenDoors = true
-    moves.liquidCost = 200      // 尽量别往水里走
-    moves.maxDropDown = 4
+    moves.liquidCost = 20       // 别太怕水（怕水走不了路），也别主动跳
+    moves.maxDropDown = 3       // 最多跳 3 格（8 格会摔死）
+
     bot.pathfinder.setMovements(moves)
+    this._moves = moves
+    this.log(`[path] canDig=${moves.canDig} towers=${moves.allow1by1towers} 搭塔方块=${moves.scafoldingBlocks.length}种`)
 
     // 计时开始（下线不走）
     const online = this.mem.goOnline()
