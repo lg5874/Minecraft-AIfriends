@@ -34,6 +34,7 @@ class Memory {
     this.people = {}         // 人物档案，单独存（不衰减）
     this.places = {}         // 地点，单独存（不衰减）
     this.session = []        // 本次上线的事件（虚拟分钟 + 文本）
+    this.secrets = []        // 别人私下托付的秘密
     this.lastDecayAt = 0
     this.load()
   }
@@ -52,6 +53,7 @@ class Memory {
       this.people = d.people || {}
       this.places = d.places || {}
       this.session = Array.isArray(d.session) ? d.session : []
+      this.secrets = Array.isArray(d.secrets) ? d.secrets : []
       this.lastDecayAt = d.lastDecayAt || 0
       this.summaries = d.summaries || []
     } catch (e) {
@@ -69,6 +71,7 @@ class Memory {
     this.people = {}
     this.places = {}
     this.session = []
+    this.secrets = []
     this.summaries = []
     // 旧的 people
     for (const [name, p] of Object.entries(old.people || {})) {
@@ -116,6 +119,7 @@ class Memory {
         people: this.people,
         places: this.places,
         session: this.session,
+        secrets: this.secrets,
         summaries: this.summaries,
         lastDecayAt: this.lastDecayAt
       }, null, 0), 'utf8')
@@ -308,6 +312,50 @@ class Memory {
     })
   }
 
+  // ---------------- 秘密 ----------------
+
+  /** 存一个别人托付的秘密 */
+  addSecret ({ content, from, about, weight }) {
+    if (!content) return null
+    // 同一个人重复说同一件事，合并
+    const dup = this.secrets.find(s => s.from === from && s.content === content)
+    if (dup) return dup
+
+    const sec = {
+      id: 's' + Date.now().toString(36),
+      content: String(content).slice(0, 200),
+      from,
+      about: about || '',
+      weight: weight == null ? 0.5 : weight,
+      promiseStrength: 0.8,
+      t: this.clock.now(),
+      toldTo: []
+    }
+    this.secrets.push(sec)
+    if (this.secrets.length > 30) this.secrets.shift()
+    this.save()
+    this.add({
+      text: `${from} 私下跟我说：${content}${about ? '（不能让 ' + about + ' 知道）' : ''}`,
+      kind: 'promise', who: [from].concat(about ? [about] : []),
+      importance: 0.8, emotion: 0.5
+    })
+    return sec
+  }
+
+  /** 取秘密（可以按问的人过滤） */
+  getSecrets (askerName) {
+    return this.secrets.filter(s => !askerName || !(s.toldTo || []).includes(askerName))
+  }
+
+  /** 记录"我跟谁说了" */
+  markTold (secretId, to) {
+    const s = this.secrets.find(x => x.id === secretId)
+    if (!s) return
+    s.toldTo = s.toldTo || []
+    if (!s.toldTo.includes(to)) s.toldTo.push(to)
+    this.save()
+  }
+
   // ---------------- 地点 ----------------
 
   place (name, pos, note) {
@@ -430,7 +478,8 @@ class Memory {
       people: Object.keys(this.people).length,
       places: Object.keys(this.places).length,
       playMinutes: Math.round(this.clock.now()),
-      sessions: this.clock.sessions || 0
+      sessions: this.clock.sessions || 0,
+      secrets: (this.secrets || []).length
     }
   }
 }

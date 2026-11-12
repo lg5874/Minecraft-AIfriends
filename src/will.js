@@ -1,36 +1,13 @@
 'use strict'
 // 意愿层：决定"他现在想干嘛"。不是教学大纲，是他自己心里的事。
 
-const WILL_TEMPLATES = [
-  '去挖点圆石做个石镐',
-  '去下矿看看能不能找到铁',
-  '把身上的东西整理一下，做几个箱子',
-  '找个视野好的地方看看周围是什么地形',
-  '去砍一批木头存起来',
-  '想弄把石剑，打怪用',
-  '天黑了，找个地方待着等天亮',
-  '挖个洞下去看看有没有矿',
-  '弄点煤，晚上要点火把',
-  '想盖个带门的小屋',
-  '去河边看看能不能钓鱼',
-  '看看附近有没有洞穴入口',
-  '打点猎，弄点肉烤着吃',
-  '去把工作台附近收拾一下',
-  '想弄把好点的镐子',
-  '想找个地方盖个屋',
-  '想去看看前面那片地形',
-  '想下矿找点铁',
-  '想去挖点石头备着',
-  '想把背包收拾一下',
-  '想砍点木头',
-  '想找个怪物练练手',
-  '想沿着河走走看看',
-  '想爬个高点看看周围',
-  '想找个村子',
-  '想弄点吃的',
-  '想试试能不能挖到钻石',
-  '想盖个小仓库放东西',
-  '想看看附近有没有洞穴'
+// 兜底：模型实在给不出想法时才用。
+// 这不是"随机抽一句话"，是"想不出来时先干最基础的"。
+const FALLBACK_WILLS = [
+  '弄点木头，先做把镐',
+  '找地方挖点石头',
+  '弄点吃的，别饿着',
+  '看看周围有什么'
 ]
 
 class Will {
@@ -108,7 +85,11 @@ ${this.mem.lastSummary() ? '上次下线前在：' + this.mem.lastSummary().text
       if (text.length > 40 || !text) text = null
     } catch (e) {}
 
-    if (!text) text = WILL_TEMPLATES[Math.floor(Math.random() * WILL_TEMPLATES.length)]
+    if (!text) {
+      // 模型这次没给出想法：挑一个最基础的，并按顺序轮换（不是随机）
+      text = FALLBACK_WILLS[this.fallbackIndex % FALLBACK_WILLS.length]
+      this.fallbackIndex = (this.fallbackIndex || 0) + 1
+    }
 
     // 这块地方资源太差？去别处看看
     try {
@@ -129,8 +110,19 @@ ${this.mem.lastSummary() ? '上次下线前在：' + this.mem.lastSummary().text
     const sig = t => String(t).replace(/[，。！？,.!?\s]/g, '').slice(0, 8)
     const recentSig = this.recent.map(sig)
     if (recentSig.includes(sig(text))) {
-      const pool = WILL_TEMPLATES.filter(t => !recentSig.includes(sig(t)))
-      if (pool.length) text = pool[Math.floor(Math.random() * pool.length)]
+      // 跟刚做过的太像：让它重新想，而不是抽一条模板
+      try {
+        const r = await this.llm.chat([{
+          role: 'user',
+          content: `你刚才想做的是"${text}"，但你已经做过了。换个别的事做。
+
+现在的状况：血 ${status.health}，饿 ${status.food}，背包 ${Object.entries(status.inventory || {}).map(([k, v]) => k + 'x' + v).join(' ') || '空的'}。
+
+只回一句话，说清楚要做什么，别跟"${text}"重复。`
+        }], { maxTokens: 100, temperature: 1.1 })
+        const alt = (r.text || '').split('\n')[0].trim().replace(/^["「『]|["」』]$/g, '')
+        if (alt && alt.length <= 40 && !recentSig.includes(sig(alt))) text = alt
+      } catch (e) {}
     }
 
     this.current = { text, since: now, done: false }

@@ -9,6 +9,9 @@
 
 const knowledge = require('./knowledge')
 const games = require('./games')
+const values = require('./values')
+const secrets = require('./secrets')
+const realtime = require('./realtime')
 
 /**
  * 漏嘴过滤器。
@@ -36,12 +39,9 @@ const LEAK = [
   /我(只是|不过是)\s*(一段|一个)?\s*(代码|程序|数据)/
 ]
 
-const FALLBACK = [
-  '你说啥呢，我人在这儿站着',
-  '有病吧你，我打游戏呢',
-  '？？？你才机器人',
-  '别闹了，我在挖矿'
-]
+// 万一真漏嘴了，不拿固定台词顶 —— 直接这一句作废，让他重说或者不说。
+// 预设台词就是人机的最大来源。
+
 
 function isLeak (text) {
   if (!text) return false
@@ -49,7 +49,7 @@ function isLeak (text) {
 }
 
 function fallbackLine () {
-  return FALLBACK[Math.floor(Math.random() * FALLBACK.length)]
+  return null   // 宁可不说，也不说预设的话
 }
 
 /**
@@ -58,12 +58,14 @@ function fallbackLine () {
  * @param {string} [stateLine] 当前状态描述
  * @param {object[]} [recalled] 这次想起的记忆
  */
-function systemPrompt (mem, stateLine, recalled) {
+function systemPrompt (mem, stateLine, recalled, opts) {
+  opts = opts || {}
   const people = mem.peopleDigest()
   const places = mem.placesDigest()
   const recent = mem.recentSession(10)
   const last = mem.lastSummary()
   const basics = knowledge.basics.slice(0, 22).map(k => '- ' + k).join('\n')
+  const rules = (knowledge.worldRules || []).map(k => '- ' + k).join('\n')
   const gamesBrief = games.brief()
 
   const recalledBlock = (recalled && recalled.length)
@@ -95,6 +97,9 @@ ${basics}
 
 再深的（下界、附魔、红石、村民交易那些）你也不太懂，得自己慢慢摸。不懂就说不懂，别装懂。
 
+## 这个服务器
+${rules}
+
 ## 你自己
 你玩游戏是为了自己开心。你有自己想干的事：想弄把好镐子、想盖个屋、想去前面那座山看看。
 没人管你的时候你就干这些。有人找你你会应，但不一定马上放下手上的活。
@@ -117,6 +122,13 @@ ${recalledBlock || '（这会儿没想起什么）'}
 
 ## 你知道的地方
 ${places}
+
+${values.valuesPrompt(mem)}
+
+${opts.secrets ? secrets.secretsPrompt(opts.secrets, opts.viewer) : ''}
+
+## 现在几点
+${realtime.timePrompt(realtime.realTime())}
 ${lastBlock}
 ## 你现在
 ${stateLine || '（刚上线）'}

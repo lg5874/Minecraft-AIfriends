@@ -20,6 +20,7 @@ const Talk = require('./src/talk')
 const Will = require('./src/will')
 const persona = require('./src/persona')
 const knowledge = require('./src/knowledge')
+const spontaneous = require('./src/spontaneous')
 
 const ROOT = __dirname
 const DATA = path.join(ROOT, 'data', 'runtime')
@@ -56,6 +57,8 @@ class Bot {
     this.sheltered = false
     this.reconnectTimer = null
     this.clockTimer = null
+    this.spont = null
+    this.lastInventory = {}
   }
 
   log (s) {
@@ -92,6 +95,15 @@ class Bot {
     bot.on('chat', (username, message) => {
       if (!this.talk) return
       this.talk.onChat(username, message).catch(e => this.log('chat err ' + e.message))
+    })
+
+    bot.on('playerJoined', (p) => {
+      if (p.username === bot.username) return
+      if (this.spont) this.spont.push(spontaneous.onPlayerJoin(p.username))
+    })
+    bot.on('playerLeft', (p) => {
+      if (p.username === bot.username) return
+      if (this.spont) this.spont.push(spontaneous.onPlayerLeave(p.username))
     })
 
     bot.on('message', (msg) => {
@@ -195,26 +207,22 @@ class Bot {
     })
     this.reflex.start()
 
-    // 第一次进服打个招呼
-    if (!this.greeted) {
-      this.greeted = true
-      setTimeout(() => {
-        const names = Object.keys(bot.players).filter(n => n !== bot.username)
-        if (names.length && Math.random() < 0.7) this.talk.say('来了')
-      }, 3000 + Math.random() * 3000)
-    }
+    this.spont = new spontaneous.Spontaneity({
+      log: (s) => this.log(s),
+      busy: () => this.busy
+    })
+    this.lastInventory = this.snapshotInventory()
 
-    // 上次下线前的事，可能主动提一句
+    // 上线：如果有人在，让他自己决定说不说、说什么
     const last = this.mem.lastSummary()
-    if (last && online.sessionsBefore > 0 && Math.random() < 0.4) {
-      setTimeout(() => {
-        const names = Object.keys(bot.players).filter(n => n !== bot.username)
-        if (names.length) {
-          const lines = ['我又来了', '上线', '回来了']
-          this.talk.say(lines[Math.floor(Math.random() * lines.length)])
-        }
-      }, 6000 + Math.random() * 8000)
-    }
+    setTimeout(async () => {
+      const names = Object.keys(bot.players).filter(n => n !== bot.username)
+      if (!names.length) return
+      const situation = online.sessionsBefore > 0
+        ? `你刚上线，服务器里 ${names.join('、')} 在。上次下线前你在：${last ? last.text : '（记不清了）'}。`
+        : `你刚进服务器，${names.join('、')} 已经在里面了。`
+      await this.talk.speak(situation, { chance: 0.65, maxLen: 25, people: names })
+    }, 4000 + Math.random() * 4000)
 
     this.loop().catch(e => this.log('loop crash ' + e.message))
   }
@@ -247,17 +255,25 @@ class Bot {
     this.deathCount++
     this.deathsSinceSafe++
 
-    const line = knowledge.deathLines[Math.floor(Math.random() * knowledge.deathLines.length)]
-    this.log('[death] ' + (this.lastDeathMsg || '') + ' | ' + line)
-    if (this.talk) this.talk.say(line)
+    const how = this.lastDeathMsg || '不知道怎么回事'
+    this.log('[death] ' + how)
 
     // 记住这次死
     this.mem.add({
-      text: '死了：' + (this.lastDeathMsg || '不知道怎么回事'),
+      text: '死了：' + how,
       kind: 'event',
-      emotion: 0.6,
+      emotion: 0.65,
       importance: 0.5
     })
+
+    // 让他自己就这次死说点什么（可能什么都不说）
+    if (this.talk) {
+      const near = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
+      this.talk.speak(
+        `你刚死了。死因：${how}。服务器里 ${near.length ? near.join('、') + ' 在' : '没人'}。`,
+        { chance: 0.55, maxLen: 30, people: near, minGap: 0 }
+      ).catch(() => {})
+    }
     this.lastDeathMsg = null
 
     this.busy = false
@@ -324,13 +340,21 @@ class Bot {
   // ==================== 反射事件 ====================
 
   onReflexEvent (kind, data) {
+    if (!this.talk) return
     if (kind === 'hurt_confused') {
-      if (Math.random() < 0.5) this.talk.say('干嘛啊')
+      // 头一两次被打：还没搞清状况
+      this.talk.speak(
+        `${data.by} 打了你一下，这是第 ${data.times} 次。你还不太确定他是闹着玩还是故意。`,
+        { chance: 0.5, maxLen: 20, people: [data.by] }
+      ).catch(() => {})
     } else if (kind === 'hurt_repeat') {
       const hs = this.mem.hitStats(data.by)
       if (hs.times >= 3) {
         this.mem.note(data.by, `老打我（第${hs.times}次）`)
-        if (Math.random() < 0.6) this.talk.say(data.by + '你有完没完')
+        this.talk.speak(
+          `${data.by} 又打你了，这已经是第 ${hs.times} 次。之前他没道过歉。`,
+          { chance: 0.7, maxLen: 25, people: [data.by] }
+        ).catch(() => {})
       }
     }
   }
@@ -384,10 +408,18 @@ class Bot {
       return
     }
 
-    // 4. 正在干活不打断
+    // 4. 检查背包有没有新收获，攒个"想说话"的念头
+    this.checkNewLoot()
+
+    // 5. 有攒着的念头就问他要不要说
+    if (this.spont && this.talk) {
+      await this.spont.tick(this.talk).catch(() => {})
+    }
+
+    // 6. 正在干活不打断
     if (this.busy) return
 
-    // 5. 决定干什么
+    // 7. 决定干什么
     const want = await this.will.think()
     if (!want) return
 
@@ -422,10 +454,8 @@ class Bot {
           importance: 0.4,
           emotion: 0.3
         })
-        if (Math.random() < 0.35) {
-          const lines = ['搞定了', '弄完了', '行了', '差不多了']
-          this.talk.say(lines[Math.floor(Math.random() * lines.length)])
-        }
+        // 干完了：攒个念头，让主动层决定说不说
+        if (this.spont) this.spont.push(spontaneous.onGoalDone(want.text, outText))
       } else {
         this.log(`<<< 失败（${secs}s）：${result.error || outText}`)
         this.mem.add({
@@ -434,7 +464,11 @@ class Bot {
           importance: 0.65
         })
         this.will.finish()
-        if (Math.random() < 0.3) this.talk.say('这咋弄啊')
+        const others = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
+        if (this.spont) this.spont.push({
+          situation: `你想${want.text}，但是没成。原因：${String(result.error || outText).slice(0, 50)}。`,
+          chance: 0.3, maxLen: 30, people: others
+        })
       }
     } catch (e) {
       this.log('任务异常: ' + e.message)
@@ -506,9 +540,42 @@ ${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
     const below = bot.blockAt(pos.offset(0, -1, 0))
     if (below && below.name === 'lava') return 'lava'
 
+    // 血量骤降记一下（用来事后开口）
+    if (this._lastHealth != null && bot.health < this._lastHealth - 6) {
+      if (this.spont) {
+        this.spont.push(require('./src/spontaneous').onNearDeath(
+          this.lastDamageKind ? this.lastDamageKind + ' 伤害' : '被打了'
+        ))
+      }
+    }
+    this._lastHealth = bot.health
+
     if (bot.health <= 8) return 'lowhp'
     if (bot.health <= 14 && bot.food < 18) return 'lowhp'
     return null
+  }
+
+  /** 背包快照 */
+  snapshotInventory () {
+    const out = {}
+    try {
+      for (const i of this.bot.inventory.items()) out[i.name] = (out[i.name] || 0) + i.count
+    } catch (e) {}
+    return out
+  }
+
+  /** 对比上次快照，发现新收获就攒个念头 */
+  checkNewLoot () {
+    if (!this.spont) return
+    const now = this.snapshotInventory()
+    const prev = this.lastInventory || {}
+    for (const [name, count] of Object.entries(now)) {
+      const gained = count - (prev[name] || 0)
+      if (gained <= 0) continue
+      const ev = spontaneous.onValuableFind(name, gained)
+      if (ev) this.spont.push(ev)
+    }
+    this.lastInventory = now
   }
 
   async doSurvive (why) {
