@@ -11,7 +11,8 @@
     "test:memory": "node scripts/test-memory.js",
     "test:decay": "node scripts/test-decay.js",
     "test:persona": "node scripts/test-persona.js",
-    "test": "node scripts/test-memory.js && node scripts/test-decay.js && node scripts/test-persona.js"
+    "test": "node scripts/test-memory.js && node scripts/test-decay.js && node scripts/test-persona.js && node scripts/test-perceive.js",
+    "test:perceive": "node scripts/test-perceive.js"
   },
   "keywords": [
     "minecraft",

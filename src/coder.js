@@ -242,6 +242,24 @@ return '砍了树但没木头'
 - actions.withdraw(x,y,z,itemName,count)  取东西
 - actions.pickupNearby(radius)  捡地上的东西
 
+### 指令（这个服支持的玩法）
+- actions.runCommand('/home')  回家
+- actions.runCommand('/spawn')  回出生点
+- actions.runCommand('/tpa 张三')  请求传送到某人
+- actions.runCommand('/msg 张三 内容')  私聊
+管理指令（/op /give /tp /gamemode 等）会被拒绝，别用。
+
+### 人的动作（不产出资源，但很像人）
+- actions.lookAround(几圈)  转头看看四周
+- actions.walkTo('东北', 格数)  按方位走，不是按坐标
+- actions.peek('北')  探头看一眼
+- actions.wait(秒)  站着等（会偶尔转头，不是死等）
+- actions.sit(秒)  蹲下（像坐着）
+- actions.glance('张三')  瞥某人一眼
+- actions.point('东')  转头指向某个方向
+- actions.toss('铁锭', 数量)  丢东西
+- actions.listen()  听听附近有什么动静
+
 ### 其他
 - actions.sleepInBed()  睡觉
 - actions.look(yaw, pitch)

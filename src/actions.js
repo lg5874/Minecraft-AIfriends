@@ -432,6 +432,13 @@ class Actions {
   }
 
   // 砍树：找原木，挖掉整棵
+  /** 通知外部"遇到挫折了"（用来触发吐槽） */
+  complain (kind, detail) {
+    if (this.ctx && this.ctx.onComplain) {
+      try { this.ctx.onComplain(kind, detail) } catch (e) {}
+    }
+  }
+
   async chopTree (count = 1) {
     await this.ensureChunks()
     const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log',
@@ -453,7 +460,10 @@ class Actions {
       if (!found) {
         found = await this.travelToFind(() => this.findAny(logs, 64), 5, 45)
       }
-      if (!found) throw new Error('走了很远也没找到树')
+      if (!found) {
+        this.complain('nothingFound', '走了一圈没树')
+        throw new Error('走了很远也没找到树')
+      }
       // 砍这一棵：从下往上
       const base = found.position
       for (let dy = 0; dy < 8; dy++) {
@@ -1716,6 +1726,136 @@ class Actions {
     if (!bed) return false
     await this.goto(bed.position.x, bed.position.y, bed.position.z, 1)
     try { await this.bot.sleep(bed); return true } catch (e) { return false }
+  }
+
+  /** 敲一个指令（比如 /home /spawn /tpa 张三） */
+  async runCommand (cmd) {
+    const clean = String(cmd || '').replace(/^\//, '').trim()
+    if (!clean) return false
+    // 管理指令一律不许
+    if (/^(op|deop|ban|kick|whitelist|gamemode|give|tp|setblock|fill|clone|summon|kill|effect|enchant|xp|clear|difficulty|gamerule|stop|reload)\b/i.test(clean)) {
+      this.log('[cmd] 拒绝管理指令: /' + clean)
+      return false
+    }
+    try {
+      this.bot.chat('/' + clean)
+      await sleep(500)
+      return true
+    } catch (e) { return false }
+  }
+
+  // ---------------- 人的动作（不产出资源，纯人味） ----------------
+
+  /** 转头看四周（真的转一圈） */
+  async lookAround (steps = 4) {
+    const bot = this.bot
+    for (let i = 0; i < steps; i++) {
+      const yaw = (Math.PI * 2 / steps) * i
+      try { await bot.look(yaw, 0.1, true) } catch (e) {}
+      await sleep(420)
+    }
+    return true
+  }
+
+  /** 按方位走（不是坐标，是"往东北走一段"） */
+  async walkTo (dir, blocks = 10) {
+    const map = { 北: [0, -1], 南: [0, 1], 东: [1, 0], 西: [-1, 0],
+      东北: [0.7, -0.7], 西北: [-0.7, -0.7], 东南: [0.7, 0.7], 西南: [-0.7, 0.7] }
+    const d = map[dir] || map[北]
+    const p = this.pos()
+    return this.goto(p.x + d[0] * blocks, p.y, p.z + d[1] * blocks, 2, 25000)
+  }
+
+  /** 探头看（往前探一下再回来） */
+  async peek (dir = '北') {
+    const map = { 北: [0, -1], 南: [0, 1], 东: [1, 0], 西: [-1, 0] }
+    const d = map[dir] || map[北]
+    const p = this.pos()
+    try {
+      await this.bot.look(Math.atan2(-d[0], d[1]), 0, true)
+      await sleep(200)
+      await this.goto(p.x + d[0] * 2, p.y, p.z + d[1] * 2, 1, 8000)
+    } catch (e) {}
+    return true
+  }
+
+  /** 站着等（不是 sleep —— 是站在原地，会转头看看） */
+  async wait (seconds = 10) {
+    const bot = this.bot
+    const t0 = Date.now()
+    while (Date.now() - t0 < seconds * 1000) {
+      this.check()
+      // 偶尔转头
+      if (Math.random() < 0.3) {
+        try { await bot.look(bot.entity.yaw + (Math.random() - 0.5), 0, false) } catch (e) {}
+      }
+      await sleep(1200)
+    }
+    return true
+  }
+
+  /** 坐下（潜行 = 蹲下，视觉上像坐着） */
+  async sit (seconds = 8) {
+    const bot = this.bot
+    try { bot.setControlState('sneak', true) } catch (e) {}
+    await this.wait(seconds)
+    try { bot.setControlState('sneak', false) } catch (e) {}
+    return true
+  }
+
+  /** 瞥某人一眼 */
+  async glance (name) {
+    const pl = this.bot.players[name]
+    if (!pl || !pl.entity) return false
+    try {
+      await this.bot.lookAt(pl.entity.position.offset(0, 1.6, 0), true)
+      await sleep(600)
+    } catch (e) {}
+    return true
+  }
+
+  /** 指方向（转头对着那个方向，然后回来看人） */
+  async point (dir) {
+    const map = { 北: 0, 东北: Math.PI / 4, 东: Math.PI / 2, 东南: Math.PI * 3 / 4,
+      南: Math.PI, 西南: -Math.PI * 3 / 4, 西: -Math.PI / 2, 西北: -Math.PI / 4 }
+    try {
+      await this.bot.look(map[dir] || 0, 0, true)
+      await sleep(700)
+    } catch (e) {}
+    return true
+  }
+
+  /** 丢东西给某人 */
+  async toss (itemName, count = 1) {
+    const it = this.item(itemName)
+    if (!it) throw new Error('没有 ' + itemName)
+    try {
+      await this.bot.equip(it, 'hand')
+      await this.bot.look(this.bot.entity.yaw, -0.6, true)
+      this.bot.activateItem()
+      await sleep(300)
+      this.bot.deactivateItem()
+      return true
+    } catch (e) { return false }
+  }
+
+  /** 听声音：返回附近能听到的动静 */
+  listen (radius = 24) {
+    const bot = this.bot
+    const p = this.pos()
+    const heard = []
+    for (const e of Object.values(bot.entities)) {
+      if (!e || e === bot.entity || !e.name) continue
+      const d = e.position.distanceTo(p)
+      if (d > radius) continue
+      const map = {
+        zombie: '低吼', skeleton: '骨头响', creeper: '嘶嘶声', spider: '窸窣声',
+        cow: '哞', pig: '哼唧', chicken: '咯咯', sheep: '咩'
+      }
+      const snd = map[e.name]
+      if (snd) heard.push(`${snd}（${Math.round(d)} 格外）`)
+    }
+    return heard.length ? heard.join('、') : '没什么动静'
   }
 
   // ---------------- 状态 ----------------

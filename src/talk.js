@@ -34,6 +34,44 @@ class Talk {
     this.lastSpokeAt = 0
     this.pendingDemand = null
     this.persuasion = new persuasion.Persuasion(ctx.dataDir || '/tmp')
+    this.recentSaid = []      // 最近说过的话，用于语气疲劳判断
+  }
+
+  /**
+   * 语气疲劳检查：如果最近几句都是同一种反应，这次要换。
+   * 这是 personagent 的 register-fatigue 规则。
+   */
+  fatigueHint () {
+    const recent = this.recentSaid.slice(-3)
+    if (recent.length < 2) return ''
+
+    const kinds = recent.map(r => r.kind).filter(Boolean)
+    const same = kinds.length >= 2 && kinds.every(k => k === kinds[0])
+    // 开头字重复也算
+    const heads = recent.map(r => String(r.text || '').slice(0, 2))
+    const sameHead = heads.length >= 2 && heads.every(h => h === heads[0])
+
+    if (!same && !sameHead) return ''
+
+    const lastTexts = recent.map(r => `"${r.text}"`).join('、')
+    return `\n\n【重要】你最近说过 ${lastTexts}，都是同一个路数。
+这次必须换，不能再这样：
+- 换成平淡的："嗯" "行" "哦" "可以"
+- 或者换个角度说，别用一样的句式开头
+- 或者干脆不说（输出 [不说] / [不理]）
+连着用同一种反应说话，会显得很假。`
+  }
+
+  /**
+   * 把"现在在干嘛"说清楚。
+   * 说话要跟手上的事挂钩，不然像客服。
+   */
+  describeDoing () {
+    if (this.ctx.busy && this.ctx.busy()) {
+      const task = this.ctx.taskDesc ? this.ctx.taskDesc() : ''
+      return task ? `你正忙着${task}，是中途停下来说话的。` : '你正忙着。'
+    }
+    return '你现在手头没别的事。'
   }
 
   /** 直接说一句（已经有内容了） */
@@ -45,6 +83,11 @@ class Talk {
 
     if (persona.isLeak(t)) {
       this.ctx.log('[leak blocked] ' + t)
+      return false
+    }
+    // 说出程序味的话就别说了（宁可不说，也不能念日志）
+    if (persona.isMachineTalk(t)) {
+      this.ctx.log('[machine talk blocked] ' + t)
       return false
     }
 
@@ -88,10 +131,12 @@ class Talk {
     // 意愿：不是每次都开口
     if (!opts.force && opts.chance != null && Math.random() > opts.chance) return false
 
-    const status = this.ctx.actions ? this.ctx.actions.status() : null
-    const stateLine = status
-      ? `你站在 ${status.pos.x},${status.pos.y},${status.pos.z}，血 ${status.health}，饿 ${status.food}，${status.time}，手上是 ${status.held || '空手'}。${this.ctx.currentTaskDesc()}`
-      : ''
+    const doing = this.describeDoing()
+    let world = ''
+    try {
+      world = this.ctx.perceive ? this.ctx.perceive.brief() : ''
+    } catch (e) {}
+    const stateLine = world ? `${world}\n${doing}` : doing
 
     const recalled = this.mem.remember(situation, { people: opts.people || [], limit: 5 })
 
@@ -112,7 +157,9 @@ class Talk {
 - 不要每次都感叹，普通事就平静地说
 - 不要用书面语
 ${opts.extraHint ? '- ' + opts.extraHint : ''}
-- 如果你觉得这事不值一提、不想说，就只输出 [不说]`
+- **绝对不要念出方块的英文名、数量、坐标、括号里的返回值**。说人话。
+- 如果你觉得这事不值一提、不想说，就只输出 [不说]
+${this.fatigueHint()}`
       }
     ]
 
@@ -139,6 +186,10 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
 
     this.history.push({ who: '我', msg: out })
     if (this.history.length > 40) this.history = this.history.slice(-40)
+
+    // 记录说过的话（语气疲劳用）
+    this.recentSaid.push({ text: out, at: Date.now(), kind: detectSayKind(out) })
+    if (this.recentSaid.length > 10) this.recentSaid.shift()
 
     // 自己说的话里如果有承诺之类，也记一笔
     this.mem.maybeRemember('我说：' + out, { hasNewInfo: false })
@@ -188,16 +239,21 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
     // 是不是在套某个秘密
     const probing = this.detectProbe(message)
 
-    // 忙的时候不一定搭理
-    const cfg = this.ctx.cfg.behavior
-    if (this.ctx.busy && this.ctx.busy()) {
-      if (Math.random() < cfg.ignoreChanceWhenBusy) {
-        this.ctx.log('[chat] 忙着，先没理 ' + username)
-        if (Math.random() < 0.5) {
-          setTimeout(() => this.reply(username, message), 4000 + Math.random() * 6000)
-        }
+    // 忙的时候**照样回**，只是回得短、回得慢。
+    // 真人不会因为手上在挖矿就不理人，他会边挖边回一句"等会儿"。
+    const busy = this.ctx.busy && this.ctx.busy()
+    if (busy) {
+      const cfg = this.ctx.cfg.behavior
+      // 只有一小部分情况是真的没看见（比如正在打怪）
+      if (Math.random() < 0.15) {
+        this.ctx.log('[chat] 这会儿腾不出手 ' + username)
         return
       }
+      // 慢一点回，像腾出手来才打字的
+      const delay = 1500 + Math.random() * 3000
+      this.ctx.log('[chat] 忙着，' + Math.round(delay / 1000) + '秒后回 ' + username)
+      setTimeout(() => this.reply(username, message, { busy: true }), delay)
+      return
     }
 
     await this.reply(username, message)
@@ -234,9 +290,14 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
   }
 
   /** 回一句话 */
-  async reply (username, message) {
-    const status = this.ctx.actions.status()
-    const stateLine = `你站在 ${status.pos.x},${status.pos.y},${status.pos.z}，血 ${status.health}，饿 ${status.food}，${status.time}，手上是 ${status.held || '空手'}。${this.ctx.currentTaskDesc()}`
+  async reply (username, message, opts = {}) {
+    const busyReply = !!opts.busy
+    const doing = this.describeDoing()
+    let world = ''
+    try {
+      world = this.ctx.perceive ? this.ctx.perceive.brief() : ''
+    } catch (e) {}
+    const stateLine = world ? `${world}\n${doing}` : doing
 
     const recalled = this.mem.remember(message, {
       people: [username],
@@ -314,10 +375,12 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
       }) },
       {
         role: 'system',
-        content: `${persona.chatHint({ maxLen: 50 })}${nameHint}${secretHint}${demandHint}
+        content: `${persona.chatHint({ maxLen: busyReply ? 20 : 50 })}${nameHint}${secretHint}${demandHint}${this.fatigueHint()}${busyReply ? '\n\n【注意】你手上正忙着，回一句短的就行，别停下来长聊。可以让他等（"等会儿""我弄完这个"），也可以边干边回。' : ''}
 
-另外：如果对方在这句话里告诉了你该怎么称呼他（比如"叫我老王""我叫XX"），
-你要自然地接受，并在回复里用上。`
+另外：
+- 如果对方在这句话里告诉了你该怎么称呼他（"叫我老王""我叫XX"），自然接受并在回复里用上
+- **你正在忙的话，回得短一点**，甚至就一句"等会儿""忙着呢"，不用停下来长篇回
+- 不忙的时候可以多聊两句`
       }
     ]
 
@@ -349,6 +412,10 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
     this.history.push({ who: username, msg: message })
     this.history.push({ who: '我', msg: out })
     if (this.history.length > 40) this.history = this.history.slice(-40)
+
+    // 记录说过的话（语气疲劳用）
+    this.recentSaid.push({ text: out, at: Date.now(), kind: detectSayKind(out) })
+    if (this.recentSaid.length > 10) this.recentSaid.shift()
 
     // 试着从对方话里提取称呼
     const m = message.match(/(?:叫我|喊我|我叫|我是)\s*([\u4e00-\u9fa5A-Za-z0-9_]{1,12})/)

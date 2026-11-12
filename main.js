@@ -21,6 +21,9 @@ const Will = require('./src/will')
 const persona = require('./src/persona')
 const knowledge = require('./src/knowledge')
 const spontaneous = require('./src/spontaneous')
+const { Perception } = require('./src/perceive')
+const { PluginAdapter } = require('./src/plugin')
+const { EventQueue } = require('./src/events')
 const { Taste } = require('./src/taste')
 const Mood = require('./src/mood')
 const { Impulse, classify, judgeFeeling } = require('./src/impulse')
@@ -65,6 +68,9 @@ class Bot {
     this.taste = null
     this.mood = null
     this.impulse = null
+    this.perceive = null
+    this.events = null
+    this.plugin = null
   }
 
   log (s) {
@@ -99,16 +105,31 @@ class Bot {
     bot.on('death', () => this.onDeath())
 
     bot.on('chat', (username, message) => {
+      if (username === bot.username) return
+      // 是不是在跟我说话：叫我名字、叫我外号、或者带我的称呼
+      const myName = bot.username
+      const called = message.includes(myName) ||
+        (this.mem.people[username] && false) ||
+        /^(你|XJJ|小徐|俊杰)/.test(message) ||
+        /[?？]$/.test(message)
+
+      if (this.events) {
+        if (called) this.events.push('chat_me', { who: username, message }, `${username} 跟你说：${message}`)
+        else this.events.push('chat_any', { who: username, message }, `${username} 说：${message}`)
+      }
+
       if (!this.talk) return
       this.talk.onChat(username, message).catch(e => this.log('chat err ' + e.message))
     })
 
     bot.on('playerJoined', (p) => {
       if (p.username === bot.username) return
+      if (this.events) this.events.push('player_join', { who: p.username }, `${p.username} 上线了`)
       if (this.spont) this.spont.push(spontaneous.onPlayerJoin(p.username))
     })
     bot.on('playerLeft', (p) => {
       if (p.username === bot.username) return
+      if (this.events) this.events.push('player_leave', { who: p.username }, `${p.username} 下线了`)
       if (this.spont) this.spont.push(spontaneous.onPlayerLeave(p.username))
     })
 
@@ -135,6 +156,15 @@ class Bot {
         if (ENV[t]) { this.lastDamageKind = ENV[t]; return }
         const srcId = pkt.sourceCauseId ? pkt.sourceCauseId - 1 : -1
         const ent = srcId >= 0 ? bot.entities[srcId] : null
+        if (this.events) {
+          const from = ent ? (ent.username || ent.name || '什么东西') : '不知道什么东西'
+          const isPlayer = ent && ent.type === 'player'
+          this.events.push(
+            isPlayer ? 'attack_by_player' : 'damage',
+            { from, health: bot.health },
+            `你被${from}打了，血剩 ${Math.round(bot.health)}`
+          )
+        }
         if (this.reflex) this.reflex.onHurt(ent)
       } catch (e) {}
     })
@@ -187,7 +217,12 @@ class Bot {
       log: (s) => this.log(s),
       cfg: this.cfg,
       mem: this.mem,
-      get reflex () { return self.reflex }
+      get reflex () { return self.reflex },
+      onComplain: (kind, detail) => {
+        if (!this.spont) return
+        const ev = spontaneous.onComplain(kind, detail)
+        if (ev) this.spont.push(ev)
+      }
     })
     this.coder = new Coder(bot, this.actions, this.llm, this.skills, {
       log: (s) => this.log(s),
@@ -207,10 +242,12 @@ class Bot {
         return true
       },
       currentTaskDesc: () => this.taskDesc ? `你现在正在${this.taskDesc}。` : '你现在没什么事干。',
+      taskDesc: () => this.taskDesc,
       actions: this.actions,
       dataDir: DATA,
       mood: this.mood,
       taste: this.taste,
+      perceive: this.perceive,
       // 他答应了别人要干的事：插队执行
       onComply: (who, task) => {
         this.log('[comply] 答应 ' + who + ' 去干：' + task)
@@ -240,6 +277,25 @@ class Bot {
       onEvent: (kind, data) => this.onReflexEvent(kind, data)
     })
     this.reflex.start()
+
+    // 事件队列：所有事情先进这里
+    this.events = this.events || new EventQueue({ log: (m) => this.log(m) })
+    this.events.onWake((ev) => this.onUrgentEvent(ev))
+
+    // 感知层：把世界翻译成人能看懂的话
+    this.perceive = new Perception(bot, {
+      mem: this.mem,
+      events: this.events,
+      log: (m) => this.log(m)
+    })
+
+    // 插件适配：探测这个服有哪些玩法
+    this.plugin = new PluginAdapter(bot, { log: (m) => this.log(m), mem: this.mem })
+    setTimeout(() => {
+      this.plugin.scan().then(list => {
+        this.log('[plugin] 扫描完成: ' + list.length + ' 个可用指令')
+      }).catch(e => this.log('[plugin] 扫描失败: ' + e.message))
+    }, 6000)
 
     // 品味（自己长出来的）和心情（会影响判断）
     this.taste = this.taste || new Taste(DATA)
@@ -317,6 +373,7 @@ class Bot {
 
     const how = this.lastDeathMsg || '不知道怎么回事'
     this.log('[death] ' + how)
+    if (this.events) this.events.push('death', { how }, `你死了（${how}）`)
 
     // 记住这次死
     this.mem.add({
@@ -326,13 +383,13 @@ class Bot {
       importance: 0.5
     })
 
-    // 让他自己就这次死说点什么（可能什么都不说）
-    if (this.talk) {
-      const near = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
-      this.talk.speak(
-        `你刚死了。死因：${how}。服务器里 ${near.length ? near.join('、') + ' 在' : '没人'}。`,
-        { chance: 0.55, maxLen: 30, people: near, minGap: 0 }
-      ).catch(() => {})
+    // 死亡吐槽（连续死会说得更重）
+    if (this.spont) {
+      const recentDeaths = (this._deathTimes || []).filter(t => Date.now() - t < 300000).length
+      const ev = recentDeaths >= 3
+        ? spontaneous.onComplain('diedAgain', how)
+        : spontaneous.onComplain('died', how)
+      if (ev) this.spont.push(ev)
     }
     this.lastDeathMsg = null
 
@@ -411,6 +468,30 @@ class Bot {
     }
   }
 
+  /** 急件来了：立刻有反应 */
+  onUrgentEvent (ev) {
+    this.log('[urgent] ' + ev.what)
+    switch (ev.type) {
+      case 'chat_me':
+        // 有人叫我：如果在忙，记下来等会儿回；不忙就直接回
+        break
+      case 'damage':
+      case 'attack_by_player':
+        // 反射层已经在处理了
+        break
+      case 'danger':
+        // 反射层处理
+        break
+      case 'death':
+        break
+      case 'gift':
+        this.mood && this.mood.onEvent('gift', 1)
+        break
+      case 'demand':
+        break
+    }
+  }
+
   // ==================== 反射事件 ====================
 
   onReflexEvent (kind, data) {
@@ -459,6 +540,23 @@ class Bot {
     const bot = this.bot
     if (!bot || !bot.entity) return
 
+    // 0. 处理事件队列：攒够了就交给模型看
+    if (this.events) {
+      this.events.prune()
+      const r = this.events.ripe()
+      if (r.ripe) {
+        const evs = this.events.drain()
+        this.log(`[events] 处理 ${evs.length} 条（${r.reason}）`)
+        for (const e of evs) this.log('  · ' + e.what)
+        // 急件里的"有人叫我"：立刻回应
+        const chats = evs.filter(e => e.type === 'chat_me')
+        if (chats.length && this.talk && !this.busy) {
+          const last = chats[chats.length - 1]
+          this.talk.reply(last.data.who, last.data.message).catch(() => {})
+        }
+      }
+    }
+
     // 1. 危险先自救
     const danger = this.checkSurvival()
     if (danger) {
@@ -496,7 +594,7 @@ class Bot {
     // 5. 检查背包有没有新收获，攒个"想说话"的念头
     this.checkNewLoot()
 
-    // 6. 有攒着的念头就问他要不要说
+    // 6. 有攒着的念头就问他要不要说（吐槽类不受"忙"限制）
     if (this.spont && this.talk) {
       await this.spont.tick(this.talk).catch(() => {})
     }
@@ -608,10 +706,15 @@ class Bot {
         this.will.finish()
         if (this.mood) this.mood.onEvent('task_fail', 1)
         const others = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
-        if (this.spont) this.spont.push({
-          situation: `你想${want.text}，但是没成。原因：${String(result.error || outText).slice(0, 50)}。`,
-          chance: 0.3, maxLen: 30, people: others
-        })
+        if (this.spont) {
+          const err = String(result.error || outText || '')
+          const kind = /找不到|没找到|没树|没有/.test(err) ? 'nothingFound'
+            : /合成|craft|材料/.test(err) ? 'craftFail'
+            : /卡住|走不动/.test(err) ? 'stuck'
+            : 'nothingFound'
+          const ev = spontaneous.onComplain(kind, err.slice(0, 30))
+          if (ev) this.spont.push(ev)
+        }
       }
     } catch (e) {
       this.log('任务异常: ' + e.message)
@@ -629,20 +732,29 @@ class Bot {
   }
 
   contextForTask () {
+    // 用感知层生成"你现在看到什么"，而不是一堆方块计数
+    let world = ''
+    try {
+      world = this.perceive ? this.perceive.snapshot({ radius: 22 }) : ''
+    } catch (e) {
+      this.log('[perceive] ' + e.message)
+    }
+
     const s = this.actions.status()
-    const inv = Object.entries(s.inventory).map(([k, v]) => `${k}x${v}`).join(', ')
-    const scan = this.actions.scan(10)
-    const found = Object.entries(scan.blocks).slice(0, 10).map(([k, v]) => `${k}(${v})`).join(' ')
-    const others = Object.keys(this.bot.players).filter(n => n !== this.bot.username)
     const recalled = this.mem.remember(s.pos.x + ',' + s.pos.z, { limit: 4 })
 
-    return `背包：${inv || '空'}（${this.actions.hasFood() ? '有吃的' : '没吃的'}）
-周围看到：${found || '没什么'}
-附近的人：${others.join('、') || '没有别人'}
-血 ${s.health}，饿 ${s.food}，${s.time}
-${recalled.length ? '想起：' + recalled.map(e => e.text).join('；') : ''}
-${s.food < 18 ? '注意：饱食度低于 18 不会回血，先解决吃的' : ''}
-${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
+    const extra = []
+    if (s.food < 18) extra.push('注意：饱食度低于 18 不会回血，先解决吃的')
+    if (s.health < 10) extra.push('注意：血很低，先保证安全')
+    if (recalled.length) extra.push('想起：' + recalled.map(e => e.text).join('；'))
+
+    // 这个服有哪些玩法
+    let pluginHint = ''
+    try {
+      pluginHint = this.plugin ? this.plugin.prompt() : ''
+    } catch (e) {}
+
+    return world + '\n' + extra.join('\n') + (pluginHint ? '\n' + pluginHint : '')
   }
 
   dumpCode (goal, code, attempt) {

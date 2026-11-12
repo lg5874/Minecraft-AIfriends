@@ -61,7 +61,13 @@ function onNearDeath (how) {
 
 /** 干成了一件事，而且是自己一直想干的 */
 function onGoalDone (goal, how) {
-  return { situation: `你一直想${goal}，刚做成了。${how || ''}`, chance: 0.4, maxLen: 30 }
+  // 注意：how 是程序返回的执行结果，里面全是数字和方块名。
+  // 绝对不能原样塞给模型，不然他会念出来（"挖了脚边的andesite（mine返回1）"）。
+  return {
+    situation: `你刚把「${goal}」这件事做完了。`,
+    chance: 0.4,
+    maxLen: 20
+  }
 }
 
 /** 时间很晚了 */
@@ -109,9 +115,15 @@ class Spontaneity {
    */
   async tick (talk) {
     if (!this.pendingEvents.length) return false
-    if (Date.now() - this.lastSpokeAt < this.cooldownMs) return false
-    // 忙的时候不主动搭话（真人也一样）
-    if (this.ctx.busy && this.ctx.busy()) return false
+
+    // 先看看最早的事件是不是"吐槽"，吐槽不受冷却限制
+    const first = this.pendingEvents[0]
+    const isComplain = first && /死了|找不到|失败|卡住|差点|走错|奇怪|运气/.test(first.ev.situation || '')
+    if (!isComplain && Date.now() - this.lastSpokeAt < this.cooldownMs) return false
+    if (isComplain && Date.now() - this.lastSpokeAt < 8000) return false   // 至少隔 8 秒
+    // 忙的时候一般不主动搭话……
+    // 但"吐槽"例外：正在挖矿被怪弄死，当场就会骂一句，不会等忙完
+    if (this.ctx.busy && this.ctx.busy() && !isComplain) return false
 
     // 挑最新的一条
     const item = this.pendingEvents.shift()
@@ -130,8 +142,28 @@ class Spontaneity {
   }
 }
 
+/** 吐槽事件：只在这些真实发生时触发，不凭空来 */
+function onComplain (what, detail) {
+  const map = {
+    died: { s: `你刚死了（${detail || '不知道咋死的'}）。`, c: 0.75, m: 20 },
+    diedAgain: { s: `你今天已经死了好几次了，刚又死了一回（${detail || ''}）。`, c: 0.85, m: 20 },
+    nothingFound: { s: `你找了半天什么都没找到（${detail || ''}）。`, c: 0.6, m: 20 },
+    craftFail: { s: `你合成失败了（${detail || ''}）。`, c: 0.55, m: 18 },
+    stuck: { s: `你走不动了，卡住了（${detail || ''}）。`, c: 0.5, m: 18 },
+    almostDied: { s: `你差点死了（${detail || ''}），现在活下来了。`, c: 0.65, m: 20 },
+    gotLost: { s: `你走错路了，绕了一大圈（${detail || ''}）。`, c: 0.55, m: 18 },
+    robbed: { s: `有人拿了你的东西（${detail || ''}）。`, c: 0.7, m: 20 },
+    weird: { s: `你看到个奇怪的东西（${detail || ''}）。`, c: 0.5, m: 18 },
+    lucky: { s: `你运气不错（${detail || ''}）。`, c: 0.5, m: 18 }
+  }
+  const e = map[what]
+  if (!e) return null
+  return { situation: e.s, chance: e.c, maxLen: e.m }
+}
+
 module.exports = {
   Spontaneity,
+  onComplain,
   onValuableFind,
   onNewTerrain,
   onFriendInDanger,
