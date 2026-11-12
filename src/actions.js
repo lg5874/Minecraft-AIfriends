@@ -3380,191 +3380,219 @@ class Actions {
    *   5. 水边抓鱼
    *   6. 走远再找一轮
    */
-  async findFood () {
-    const bot = this.bot
-    const t0 = Date.now()
+  /**
+   * 找吃的。
+   *
+   * 老实现跑满 180 秒还不返回，实测原因（一条一条对过日志）：
+   *
+   *  1. **没有总预算**：每一步都有自己的 25~30 秒超时，
+   *     5 只动物 x 30 秒 chase + 30 秒 hunt + 抓鱼 20 秒 + 走远再一轮 …
+   *     加起来远超测试的 180 秒，任务永远"超时"，而且什么都没拿到。
+   *  2. **先 chase 再 hunt，chase 失败也照打**：动物在 40 格外时
+   *     chase 白烧 25 秒，然后 hunt 又对着一个够不着的实体空挥 30 秒。
+   *  3. **烤肉的链条太长**：tryCook 没熔炉就去 digStone(8) 挖圆石，
+   *     挖石头本身又要镐子 → 砍树 → 木板 … 在"找食物"这个上下文里
+   *     这是几十秒起步的赌博，而且失败后 raw 肉还在包里，
+   *     其实**生的就能吃**，完全没必要等。
+   *  4. **没有"快速失败"**：什么都没找到时不早退，硬走完 6 个阶段。
+   *
+   * 现在：给一个硬预算（默认 60 秒），每一步都按剩余时间收缩，
+   * 拿到任何能吃的立刻返回（生肉也算 —— 真饿急了不挑），
+   * 预算用完立刻返回 null 并说清楚试过什么。
+   *
+   * @param {{budgetMs?:number, allowCook?:boolean}} opts
+   * @returns {Promise<string|null>} 拿到了什么（null = 没找到）
+   */
+  async findFood (opts = {}) {
+    const budgetMs = opts.budgetMs || 60000
+    const allowCook = opts.allowCook !== false
+    const deadline = Date.now() + budgetMs
+    const left = () => deadline - Date.now()
+    const tried = []
 
-    // 0. 先确认自己能走动。困在坑里的话什么都干不了
-    if (!(await this.canMoveAround())) {
-      this.log('[food] 动不了，先挖出去')
-      if (this.ctx && this.ctx.reflex) await this.ctx.reflex.digOut().catch(() => {})
-      else await this.digOutSelf()
-    }
-
-    // 1. 背包里有
+    // 0. 背包里有能吃的
+    //    注意：饱食度满（20）时 bot.consume() 会直接抛 'Food is full'，
+    //    所以这里先判断"有没有存货"，有存货且不饿就直接算成功。
     if (this.hasFood()) {
-      const ate = await this.eat()
-      if (ate) return '吃了背包里的 ' + ate
+      if (this.bot.food < 20) {
+        const ate = await this.eat()
+        if (ate) return '吃了背包里的 ' + ate
+      }
+      const f = this.foodList()[0]
+      if (f) return '背包里已经有 ' + f.name + ' x' + f.count
     }
 
-    /**
-     * 打死一只动物并把肉捡回来。
-     *
-     * 老写法 `attack(name, 8)` 的根本问题：空手伤害 1，牛有 10 血，
-     * 8 次攻击里还要扣掉"距离 >3.2 就 continue"的那些轮次，
-     * 结果动物没死，自然也没有掉落物 —— 这就是"附近有 3 只猪但背包没食物"。
-     *
-     * 现在：追到跟前，反复攻击直到实体消失（或超时），再捡掉落物。
-     */
-    const hunt = async (animalName, budgetMs = 30000) => {
+    // 0.5 动不了就先挖出去（限时，别在这里耗光预算）
+    if (left() > 8000) {
+      const movable = await Promise.race([
+        this.canMoveAround(),
+        sleep(6000).then(() => true)     // 判不出来就当能动，别卡死
+      ])
+      if (!movable) {
+        this.log('[food] 动不了，先挖出去')
+        try {
+          if (this.ctx && this.ctx.reflex) await this.ctx.reflex.digOut()
+          else await this.digOutSelf()
+        } catch (e) {}
+      }
+    }
+
+    /** 打死一只动物并捡回掉落物。budgetMs 是这个动物身上的总时间 */
+    const hunt = async (animalName, huntMs) => {
       const s = Date.now()
       let hits = 0
-      while (Date.now() - s < budgetMs) {
+      while (Date.now() - s < huntMs && left() > 2000) {
         this.check()
         const e = this.nearestEntity(animalName, 64)
-        if (!e) {
-          // 实体没了 = 打死了（或者跑掉了），去捡东西
-          break
-        }
+        if (!e) break                    // 打死了 / 跑掉了
         const d = e.position.distanceTo(this.pos())
         if (d > 3.0) {
-          try {
-            this.bot.pathfinder.setGoal(new goals.GoalFollow(e, 2), true)
-          } catch (err) {}
-          await sleep(280)
+          try { this.bot.pathfinder.setGoal(new goals.GoalFollow(e, 2), true) } catch (err) {}
+          await sleep(250)
           continue
         }
         try { this.bot.pathfinder.setGoal(null) } catch (err) {}
         try {
           await this.bot.lookAt(e.position.offset(0, 1.2, 0), true)
-          // 1.21 有攻击冷却，间隔太小会被服务端丢弃
-          await sleep(620)
+          await sleep(620)               // 1.21 有攻击冷却
           await this.bot.attack(e)
           hits++
         } catch (err) {
-          await sleep(300)
+          await sleep(250)
         }
-        if (hits > 30) break
+        if (hits > 25) break
       }
       try { this.bot.pathfinder.setGoal(null) } catch (err) {}
       if (hits) this.log(`[food] 打了 ${animalName} ${hits} 下`)
-      await this.pickupNearby(12)
+      // 捡东西必须做，不然打死了也没有肉
+      try { await this.pickupNearby(12) } catch (e) {}
       return hits > 0
     }
 
-    // 2. 打动物 -> 捡肉 -> 能烤就烤
-    // 优先打近的，省时间（远处那几只等前一轮失败再说）
+    /** 拿到生肉后：能吃就吃，能烤就烤（烤只给有限时间，烤不动就吃生的） */
+    const settleRaw = async (rawName) => {
+      if (!rawName) return null
+      if (allowCook && left() > 12000) {
+        try {
+          const cooked = await Promise.race([
+            this.tryCook(rawName),
+            sleep(Math.min(20000, Math.max(2000, left() - 4000))).then(() => null)
+          ])
+          if (cooked) return '烤熟了 ' + cooked
+        } catch (e) {}
+      }
+      if (this.bot.food < 20) {
+        const ate = await this.eat()
+        if (ate) return '吃了 ' + ate
+      }
+      const it = this.item(rawName)
+      if (it) return '拿到 ' + rawName + ' x' + it.count
+      return null
+    }
+
+    // 1. 打动物（最近的那只，预算内打不完就换下一只，最多试 2 只）
     const animals = ['cow', 'pig', 'sheep', 'chicken', 'rabbit']
     const near = animals
-      .map(n => ({ n, e: this.nearestEntity(n, 64) }))
+      .map(n => ({ n, e: this.nearestEntity(n, 48) }))
       .filter(x => x.e)
       .sort((a, b) => a.e.position.distanceTo(this.pos()) - b.e.position.distanceTo(this.pos()))
 
+    let animalTries = 0
     for (const { n: a, e } of near) {
-      if (Date.now() - t0 > 120000) break
-      try {
-        const dist = e.position.distanceTo(this.pos())
-        this.log(`[food] 目标 ${a} 在 ${Math.round(dist)} 格外`)
-        if (dist > 12) {
-          try { await this.chase(a, 25000) } catch (err) {}
-        }
-        await hunt(a, 30000)
-        const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') ||
-          this.item('chicken') || this.item('rabbit')
-        if (raw) {
-          const cooked = await this.tryCook(raw.name).catch(() => null)
-          if (cooked) return '打了' + a + '，烤熟了吃'
-          const ate = await this.eat()
-          if (ate) return '打了' + a + '，吃了' + ate
-          return '打了' + a + '，拿到 ' + raw.name + ' x' + raw.count
-        }
-        if (this.hasFood()) {
-          const ate = await this.eat()
-          if (ate) return '打了' + a + '，吃了' + ate
-        }
-      } catch (err) {
-        this.log('[food] 打 ' + a + ' 失败: ' + err.message)
+      if (left() < 12000 || animalTries >= 2) break
+      animalTries++
+      const dist = e.position.distanceTo(this.pos())
+      this.log(`[food] 目标 ${a} 在 ${Math.round(dist)} 格外`)
+
+      // 太远就先拉近，但只给有限时间（别把预算烧在赶路上）
+      if (dist > 12) {
+        const chaseMs = Math.min(12000, Math.max(3000, left() - 10000))
+        try { await this.chase(a, chaseMs) } catch (err) {}
+      }
+      // 还没贴近就跳过这只，别对着够不着的实体空挥
+      const now = this.nearestEntity(a, 64)
+      if (!now) { tried.push(a + '(跑了)'); continue }
+      if (now.position.distanceTo(this.pos()) > 6) {
+        this.log(`[food] ${a} 还是够不着，换下一只`)
+        tried.push(a + '(够不着)')
+        continue
+      }
+
+      await hunt(a, Math.min(20000, Math.max(4000, left() - 4000)))
+      const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') ||
+        this.item('chicken') || this.item('rabbit')
+      if (raw) {
+        const r = await settleRaw(raw.name)
+        if (r) return r
+      }
+      if (this.hasFood()) {
+        const f = this.foodList()[0]
+        if (f) return '打猎后有 ' + f.name + ' x' + f.count
+      }
+      tried.push(a)
+    }
+
+    // 2. 野生浆果 / 作物（比打猎稳，但要走过去）
+    if (left() > 10000) {
+      for (const bush of ['sweet_berry_bush', 'cave_vines', 'cave_vines_plant']) {
+        if (left() < 6000) break
+        let b = null
+        try { b = this.findBlock(bush, 32) } catch (e) {}
+        if (!b) continue
+        try {
+          await this.digAt(b)
+          await this.pickupNearby(6)
+          if (this.hasFood()) {
+            if (this.bot.food < 20) {
+              const ate = await this.eat()
+              if (ate) return '摘了浆果吃了'
+            }
+            const berry = this.item('sweet_berries')
+            if (berry) return '摘到 sweet_berries x' + berry.count
+          }
+        } catch (e) {}
+        tried.push(bush)
       }
     }
 
-    // 3. 浆果（挖丛也会掉 sweet_berries）
-    for (const bush of ['sweet_berry_bush', 'cave_vines', 'cave_vines_plant']) {
-      const b = this.findBlock(bush, 48)
-      if (!b) continue
-      try {
-        await this.digAt(b)
-        await this.pickupNearby(6)
-        if (this.hasFood()) {
-          const ate = await this.eat()
-          if (ate) return '摘了浆果吃了'
-        }
-        const berry = this.item('sweet_berries')
-        if (berry) return '摘到 sweet_berries x' + berry.count
-      } catch (e) {}
-    }
-
-    // 4. 瓜
-    for (const crop of ['melon', 'pumpkin']) {
-      const b = this.findBlock(crop, 48)
-      if (!b) continue
-      try {
-        await this.digAt(b)
-        await this.pickupNearby(6)
-        if (this.hasFood()) {
-          const ate = await this.eat()
-          if (ate) return '弄了' + crop + '吃了'
-        }
-        if (this.item('melon_slice')) return '弄到 melon_slice'
-      } catch (e) {}
-    }
-
-    // 5. 抓鱼
-    for (const fish of ['cod', 'salmon']) {
-      const e = this.nearestEntity(fish, 32)
-      if (!e) continue
-      try {
-        await hunt(fish, 20000)
-        const raw = this.item('cod') || this.item('salmon')
-        if (raw) {
-          const cooked = await this.tryCook(raw.name).catch(() => null)
-          if (cooked) return '抓了鱼，烤熟了吃'
-          const ate = await this.eat()
-          if (ate) return '抓了鱼吃'
-          return '抓了 ' + raw.name
-        }
-      } catch (err) {}
-    }
-
-    // 6. 走远再找一轮
-    try {
-      this.log('[food] 附近没有，走远找')
-      await this.wander(40)
-      await this.ensureChunks(4000)
-      const far = animals
-        .map(n => ({ n, e: this.nearestEntity(n, 96) }))
-        .filter(x => x.e)
-        .sort((a, b) => a.e.position.distanceTo(this.pos()) - b.e.position.distanceTo(this.pos()))
-      for (const { n: a, e } of far) {
-        try { await this.chase(a, 20000) } catch (err) {}
-        await hunt(a, 25000)
-        const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') || this.item('chicken')
-        if (raw) {
-          const cooked = await this.tryCook(raw.name).catch(() => null)
-          if (cooked) return '走远打了' + a + '，烤熟了吃'
-          const ate = await this.eat()
-          if (ate) return '走远打了' + a + '，吃了' + ate
-          return '走远打了' + a + '，拿到 ' + raw.name + ' x' + raw.count
-        }
-        if (this.hasFood()) {
-          const ate = await this.eat()
-          if (ate) return '走远打到猎物吃了'
-        }
-        break     // 只试最近的一只，别把时间耗光
+    // 3. 瓜类
+    if (left() > 10000) {
+      for (const crop of ['melon', 'pumpkin']) {
+        if (left() < 6000) break
+        let b = null
+        try { b = this.findBlock(crop, 32) } catch (e) {}
+        if (!b) continue
+        try {
+          await this.digAt(b)
+          await this.pickupNearby(6)
+          if (this.hasFood()) {
+            const f = this.foodList()[0]
+            if (f) return '弄到 ' + f.name + ' x' + f.count
+          }
+        } catch (e) {}
+        tried.push(crop)
       }
-      const b = this.findBlock('sweet_berry_bush', 40)
-      if (b) {
-        await this.digAt(b)
-        await this.pickupNearby(6)
-        if (this.hasFood()) {
-          const ate = await this.eat()
-          if (ate) return '走远摘到浆果'
-        }
-        const berry = this.item('sweet_berries')
-        if (berry) return '走远摘到 sweet_berries x' + berry.count
-      }
-    } catch (err) {}
+    }
 
-    this.log('[food] 什么都没弄到')
+    // 4. 抓鱼：只有时间充裕才试（鱼会跑，最耗时间）
+    if (left() > 20000) {
+      for (const fish of ['cod', 'salmon']) {
+        if (left() < 14000) break
+        const e = this.nearestEntity(fish, 24)
+        if (!e) continue
+        try {
+          await hunt(fish, Math.min(15000, left() - 6000))
+          const raw = this.item('cod') || this.item('salmon')
+          if (raw) {
+            const r = await settleRaw(raw.name)
+            if (r) return r
+          }
+        } catch (err) {}
+        tried.push(fish)
+      }
+    }
+
+    this.log(`[food] ${Math.round(budgetMs / 1000)}s 预算内没弄到吃的（试过: ${tried.join('/') || '附近没有目标'}）`)
     return null
   }
 
