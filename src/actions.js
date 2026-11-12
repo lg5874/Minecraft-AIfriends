@@ -1843,9 +1843,15 @@ class Actions {
    * 所以这里只在**不够做桌子**时才去动木板；够的话优先：
    *   附近的台子 -> 背包里的台子 -> 用"额外的"原木现做一个（不动调用方的木板）
    *
-   * @param {number} reservePlanks 调用方还要留多少张木板（默认 0）
+   * 默认预留 8 张：这是"最大单色木板消耗"（箱子 8 张）的量。
+   * 之所以给非 0 默认值，是因为 craftSmart 调用时没传参 ——
+   * 它刚按配方备好的木板不能被这里抽走，否则配方当场失效。
+   * 严格来说应该由 craftSmart 把"这个配方还要几张"传进来，
+   * 但那在 action-fixer 负责的函数里，这里先用保守默认值兜住。
+   *
+   * @param {number} reservePlanks 调用方还要留多少张木板（默认 8）
    */
-  async ensureTable (reservePlanks = 0) {
+  async ensureTable (reservePlanks = 8) {
     // 1. 附近已经有了
     const near = this.findBlock('crafting_table', 10)
     if (near) return near
@@ -1906,6 +1912,11 @@ class Actions {
 
       // 合成了就放
       if (this.countOf('crafting_table') > 0) {
+        // 关键：桌子吃掉了 4 张木板，把调用方的储备补回来。
+        // 有原木就补；没原木就认了（下面 craftSmart 会报材料不够）。
+        if (reservePlanks > 0 && this.woodCount() > 0 && this.plankTotal() < reservePlanks) {
+          try { await this.anyPlanks(reservePlanks) } catch (e) {}
+        }
         const placed = await this.placeNearby('crafting_table')
         if (placed) return placed
         // 放不下也算有（拿着也行，craft 时传 table 对象另说）
