@@ -73,3 +73,17 @@ npm start
 - `docs/memory.md` 记忆方案调研
 - `docs/architecture.md` 架构调研
 - 手机里：`/sdcard/Download/DSH-Go/项目盘点与我的判断.md`
+## 教训：测试要用独立账号
+
+之前所有测试脚本都用 `XJJ`（跟正式运行的 bot 同名），
+导致 duplicate_login 互相踢，实测数据全部污染：
+- setControlState('forward') 走 1 秒只动 0.21 格（正常 4.3）
+- jump 按下去 y 完全不变
+- placeBlock 超时 5000ms
+
+这些不是代码 bug，是"被踢了但客户端还以为自己在"。
+
+规则：
+1. 测代码用独立账号（XJJ_TEST / XJJ_TEST2 ...）
+2. 跑正式 bot 时，不要用 XJJ 跑任何测试脚本
+3. 测之前先确认 `ps aux | grep node main.js` 是空的

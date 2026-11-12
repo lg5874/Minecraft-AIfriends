@@ -1535,48 +1535,86 @@ class Actions {
     }
     const towerOk = !!(moves && moves.allow1by1towers)
 
-    // 原地上顶一格。成功返回 true。
-    const tryPillar = async (dbg) => {
-      if (!towerOk) { this.log('[dbg] 塔升不可用 towerOk=false'); return false }
-      if (!filler()) { this.log('[dbg] 没有垫脚方块'); return false }
+    /**
+     * 找正上方第一个实心方块，离脚底多少格。
+     * 头顶可能是 2 格空，也可能是 9 格空 —— 写死范围必错。
+     * 返回 -1 表示 24 格内全是空的（那就是到地表了）。
+     */
+    const firstSolidAbove = (p, max = 24) => {
+      for (let dy = 1; dy <= max; dy++) {
+        if (isSolid(p.offset(0, dy, 0))) return dy
+      }
+      return -1
+    }
+
+    /**
+     * 原地上顶一格。
+     *
+     * 真人往上爬柱子就两件事：
+     *   1. 把头顶第一个实心块挖掉，再往上多挖 2 格，给自己腾出 3 格站人空间
+     *   2. 跳起来，趁脚离地的那一下在自己脚下垫一块
+     *
+     * 之前失败的两个原因：
+     *   - 挖的 dy 范围写死成 2..4，头顶是 9 格空的时候一格都没挖到（Lead 实测指出）
+     *   - 只 setGoal 不垫方块：脚下没台阶，跳上去也站不住
+     */
+    const tryPillar = async () => {
+      if (!towerOk) return false
+      const fill = filler()
+      if (!fill) return false                      // 没有垫脚方块就顶不上去
+
       const p = this.pos()
       const F = Math.floor(p.y)
 
-      // 头顶 8 格里有水/岩浆就别直着上（会淹死/烧死）
-      for (let dy = 2; dy <= 8; dy++) {
-        const n = nameAt(p.offset(0, dy, 0))
-        if (/water|lava/.test(n)) { this.log(`[dbg] 头顶 +${dy} 是 ${n}，不直上`); return false }
+      // 头顶 10 格内有水/岩浆就别直着上（会淹死/烧死）
+      for (let dy = 2; dy <= 10; dy++) {
+        if (/water|lava/.test(nameAt(p.offset(0, dy, 0)))) return false
       }
-      // 挖出站人和起跳的空间
-      const dug = []
-      for (let dy = 2; dy <= 4; dy++) {
-        if (isSolid(p.offset(0, dy, 0))) {
-          const ok = await digOne(p.offset(0, dy, 0))
-          dug.push(`+${dy}:${ok ? 'ok' : 'FAIL'}:${nameAt(p.offset(0, dy, 0))}`)
-        }
+
+      // 1) 找第一个实心块，挖它和上面两格
+      const fs = firstSolidAbove(p)
+      if (fs < 0) return false                     // 头顶全空，交给外面的地表判定
+      for (let dy = fs; dy <= fs + 2; dy++) {
+        if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
       }
-      if (dbg && dug.length) this.log('[dbg] 挖头顶 ' + dug.join(' '))
+      // 挖完必须至少有 3 格空（脚 + 身体 + 头），否则跳不起来
+      for (let dy = 0; dy <= 3; dy++) {
+        if (isSolid(p.offset(0, dy, 0))) return false
+      }
+
+      // 2) 跳起来，在自己脚下垫一块
+      await recenter()                             // 站格子中心，不然放置被拒
       try {
-        let st = '?'
-        const onUpd = (r) => { st = r.status }
-        bot.on('path_update', onUpd)
-        if (dbg) this.log(`[dbg] 配置 towers=${moves && moves.allow1by1towers} scaff=${moves && moves.scafoldingBlocks && moves.scafoldingBlocks.length} canDig=${moves && moves.canDig} moving=${(() => { try { return bot.pathfinder.isMoving() } catch (e) { return 'err' } })()}`)
-        bot.pathfinder.setGoal(new goals.GoalBlock(Math.floor(p.x), F + 1, Math.floor(p.z)))
-        for (let i = 0; i < 18; i++) {
-          await sleep(200)
-          if (this.pos().y >= F + 0.9) break
+        await bot.equip(fill, 'hand')
+        await sleep(120)
+        bot.setControlState('jump', true)
+        await sleep(260)                           // 升到最高点附近
+        const mid = this.pos()
+        const ref = bot.blockAt(new Vec3(
+          Math.floor(mid.x), Math.floor(mid.y) - 1, Math.floor(mid.z)))
+        if (ref) {
+          await bot.lookAt(ref.position.offset(0.5, 1.0, 0.5), true)
+          await bot.placeBlock(ref, new Vec3(0, 1, 0))
         }
-        bot.removeListener('path_update', onUpd)
-        if (dbg) this.log('[dbg] path_update 最后状态 = ' + st)
+        bot.setControlState('jump', false)
+        await sleep(450)
       } catch (e) {
-        this.log('[dbg] setGoal 异常 ' + e.message)
+        try { bot.setControlState('jump', false) } catch (e2) {}
       }
-      try { bot.pathfinder.setGoal(null) } catch (e) {}
-      const rose = this.pos().y >= F + 0.9
-      if (dbg && !rose) {
-        this.log(`[dbg] 塔升失败 F=${F} y=${this.pos().y.toFixed(2)} 头顶=${[0,1,2,3,4].map(d => nameAt(p.offset(0, d, 0))).join(',')}`)
+
+      // 3) 没垫上就退到 pathfinder（它自己会搭塔，main.js 已开 allow1by1towers）
+      if (this.pos().y < F + 0.9) {
+        try {
+          bot.pathfinder.setGoal(new goals.GoalBlock(Math.floor(p.x), F + 1, Math.floor(p.z)))
+          for (let i = 0; i < 15; i++) {
+            await sleep(200)
+            if (this.pos().y >= F + 0.9) break
+          }
+        } catch (e) {}
+        try { bot.pathfinder.setGoal(null) } catch (e) {}
       }
-      return rose
+
+      return this.pos().y >= F + 0.9
     }
 
     try {
@@ -1590,7 +1628,7 @@ class Actions {
         }
 
         // ===== 主策略：原地往上顶一格 =====
-        if (await tryPillar(true)) continue
+        if (await tryPillar()) continue
 
         // ===== 兜底：挖台阶（头顶有水/岩浆、或者没垫脚方块时才走这里）=====
         const p = this.pos()

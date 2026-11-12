@@ -171,6 +171,24 @@
    "uses": 0,
    "ok": 0,
    "fail": 0
+  },
+  {
+   "name": "k_mwdz5b0s",
+   "desc": "先用石镐在脚边挖几块石头，找找铁或煤。",
+   "tags": [
+    "mine",
+    "挖矿",
+    "iron",
+    "stone",
+    "pickaxe",
+    "find"
+   ],
+   "code": "// 目标：先做出石镐（需要木棍/木头），再在脚边挖石头找铁或煤\ntry {\n  const logNames = ['oak_log', 'birch_log', 'spruce_log']\n  const beforeIron = actions.countOf('raw_iron')\n  const beforeCoal = actions.countOf('coal')\n\n  // —— 1. 没有石镐就从头搞：木头→木板→木棍→石镐 ——\n  if (!actions.item('stone_pickaxe')) {\n    // 缺木棍就先找树\n    if (actions.countOf('stick') < 2) {\n      let t = null\n      for (let i = 0; i < 6 && !t; i++) {\n        try { t = await actions.findAny(logNames, 48) } catch (e) { log('找树出错:' + e) }\n        if (!t) { await actions.wander(5); await sleep(300) }\n      }\n      if (t) {\n        try { await actions.equip('stone_axe') } catch (e) {}\n        // 多砍几块，确保够做木板和木棍\n        for (let k = 0; k < 4; k++) {\n          let ok = false\n          try { ok = await actions.digAt(t) } catch (e) { log('砍树出错:' + e) }\n          if (!ok) {\n            try { await actions.goto(t.x, t.y, t.z, 2) } catch (e) {}\n            try { ok = await actions.digAt(t) } catch (e) {}\n          }\n          if (!ok) break\n          await sleep(150)\n          // 找下一块原木\n          let nt = null\n          try { nt = await actions.findAny(logNames, 8) } catch (e) {}\n          if (!nt) break\n          t = nt\n        }\n        try { await actions.pickupNearby(5) } catch (e) {}\n        await sleep(200)\n        // 做木板和木棍\n        let logType = null\n        for (const n of logNames) { if (actions.countOf(n) > 0) { logType = n; break } }\n        if (logType) {\n          const plankType = logType.replace('_log', '_planks')\n          try { await actions.craft(plankType, 8) } catch (e) { log('做木板出错:' + e) }\n          try { await actions.craft('stick', 8) } catch (e) { log('做木棍出错:' + e) }\n        }\n      }\n    }\n    // 材料够就做石镐\n    if (actions.countOf('cobblestone') >= 3 && actions.countOf('stick') >= 2) {\n      try { await actions.craft('stone_pickaxe', 1) } catch (e) { log('做石镐出错:' + e) }\n    }\n  }\n\n  const toolOK = !!actions.item('stone_pickaxe')\n  if (!toolOK) {\n    return '没木棍没木头，做不出石镐，先收手（圆石有' + actions.countOf('cobblestone') + '个）'\n  }\n  try { await actions.equip('stone_pickaxe') } catch (e) {}\n\n  // —— 2. 找矿优先，没矿就挖石头碰运气 ——\n  const oreNames = ['coal_ore', 'iron_ore', 'deepslate_coal_ore', 'deepslate_iron_ore']\n  let minedOre = 0\n  let minedRock = 0\n  for (let i = 0; i < 24; i++) {\n    let isOre = true\n    let target = null\n    try { target = await actions.findAny(oreNames, 20) } catch (e) { log('找矿出错:' + e) }\n    if (!target) {\n      isOre = false\n      try { target = await actions.findBlock('stone', 12) } catch (e) { log('找石头出错:' + e) }\n      if (!target) { try { target = await actions.findBlock('andesite', 12) } catch (e) {} }\n      if (!target) { try { target = await actions.findBlock('diorite', 12) } catch (e) {} }\n      if (!target) break\n    }\n\n    try { await actions.bestToolFor(target) } catch (e) {}\n\n    let ok = false\n    try { ok = await actions.digAt(target) } catch (e) { log('挖出错:' + e) }\n    if (!ok) {\n      try { await actions.goto(target.x, target.y, target.z, 2) } catch (e) {}\n      try { ok = await actions.digAt(target) } catch (e) {}\n    }\n    if (!ok) {\n      await actions.wander(3)\n      await sleep(250)\n      continue\n    }\n    if (isOre) minedOre++\n    else minedRock++\n    await sleep(140)\n  }\n\n  // —— 3. 捡掉落物 ——\n  for (let i = 0; i < 4; i++) {\n    try { await actions.pickupNearby(5) } catch (e) { log('捡东西出错:' + e) }\n    await sleep(200)\n  }\n\n  // —— 4. 统计成果 ——\n  const iron = actions.countOf('raw_iron') - beforeIron\n  const coal = actions.countOf('coal') - beforeCoal\n  const part = []\n  if (iron > 0) part.push('铁' + iron + '个')\n  if (coal > 0) part.push('煤' + coal + '个')\n  const gain = part.length ? '挖到 ' + part.join('、') : '没挖到铁和煤'\n\n  return '做出石镐后挖了' + minedOre + '个矿、' + minedRock + '块石头，' + gain +\n         '；背包圆石 ' + actions.countOf('cobblestone') + ' 个'\n} catch (e) {\n  return '出错了: ' + e\n}",
+   "created": 1794513739277,
+   "updated": 1794513739277,
+   "uses": 0,
+   "ok": 0,
+   "fail": 0
   }
  ]
 }
