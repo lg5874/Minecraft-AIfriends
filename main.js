@@ -28,6 +28,8 @@ const SelfState = require('./src/selfstate')
 const { Taste } = require('./src/taste')
 const Mood = require('./src/mood')
 const { Impulse, classify, judgeFeeling } = require('./src/impulse')
+const { Home } = require('./src/home')
+const { Goals } = require('./src/goals')
 
 const ROOT = __dirname
 // 数据目录：多实例时每个实例独立（记忆/品味/心情/技能互不干扰）
@@ -77,6 +79,10 @@ class Bot {
     this.events = null
     this.plugin = null
     this.selfState = null
+    this.home = null
+    this.goals = null
+    // 长期目标每 30 秒看一眼进度，记在同一处，避免多个地方各自计时
+    this._lastGoalObserveAt = 0
   }
 
   log (s) {
@@ -259,6 +265,16 @@ class Bot {
         if (ev) this.spont.push(ev)
       }
     })
+    // 家：认家 / 记路 / 走回去。
+    // 必须放在 actions 之后 —— 它寻路失败时要借 actions.goto 兜底。
+    // attach() 之后：放下箱子/床自动认家，每 1.5 秒记一次出门的路。
+    this.home = new Home(bot, {
+      dataDir: DATA,
+      log: (s) => this.log(s),
+      mem: this.mem,
+      actions: this.actions
+    })
+    this.home.attach()
     this.coder = new Coder(bot, this.actions, this.llm, this.skills, {
       log: (s) => this.log(s),
       say: (m) => this.talk ? this.talk.say(m) : null,
@@ -292,10 +308,23 @@ class Bot {
         }
       }
     })
+    // 长期目标：心里挂着的一件事，跨天不丢（data/runtime/goals.json）。
+    // 必须放在 will 之前 —— will.think() 第一件事就是看有没有长期目标的当前阶段，
+    // 有就直接接着干，而不是每天从零想"我今天干嘛"。
+    // taste 这时候还没构造，用 getter 延迟取（tasteBonus 是运行时才读的）。
+    this.goals = new Goals(DATA, {
+      llm: this.llm,
+      ctx: {
+        log: (s) => this.log(s),
+        get taste () { return self.taste },
+        actions: this.actions
+      }
+    })
     this.will = new Will(this.llm, this.mem, this.skills, {
       log: (s) => this.log(s),
       cfg: this.cfg,
       actions: this.actions,
+      goals: this.goals,
       deaths: () => this.deathsSinceSafe,
       deathsReset: () => { this.deathsSinceSafe = 0 }
     })
@@ -583,6 +612,10 @@ class Bot {
   async tick () {
     const bot = this.bot
     if (!bot || !bot.entity) return
+
+    // 0. 长期目标：先扫一眼进度（同步、很便宜，不会挡住自救）
+    //    这一步只更新"当前阶段完成到几成"，不跟模型说话。
+    this.observeGoals()
 
     // 0. 处理事件队列：攒够了就交给模型看
     if (this.events) {

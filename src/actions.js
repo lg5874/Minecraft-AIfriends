@@ -1020,12 +1020,34 @@ class Actions {
       // 已经在挖掘距离内，不用走
       if (base.distanceTo(this.pos()) <= 4.0) return true
       const spots = standSpotsNear(base)
+
+      // 远处（>16 格）时，树干旁边那几格可能还没加载到 / 被树叶盖住，
+      // standable 判定为空。这种情况不能直接放弃，先朝树的方向走近再说。
+      if (!spots.length) {
+        const p = this.pos()
+        const dx = base.x - p.x
+        const dz = base.z - p.z
+        const len = Math.hypot(dx, dz) || 1
+        const step = Math.min(20, Math.max(6, len - 3))
+        const tx = Math.round(p.x + dx / len * step)
+        const tz = Math.round(p.z + dz / len * step)
+        this.log(`[chop] 树旁没找到落脚点，先朝它走近（-> ${tx},${tz}）`)
+        await walkTo(tx, p.y, tz, 2, Math.min(timeout, 15000))
+        // 走近后重新找落脚点
+        const spots2 = standSpotsNear(base)
+        for (const s of spots2.slice(0, 3)) {
+          if (Date.now() - t0 > DEADLINE) return false
+          if (await walkTo(s.x, s.y, s.z, 0, timeout)) return true
+        }
+        return base.distanceTo(this.pos()) <= 4.2
+      }
+
       for (const s of spots.slice(0, 3)) {
         if (Date.now() - t0 > DEADLINE) return false
         const ok = await walkTo(s.x, s.y, s.z, 0, timeout)
         if (ok) return true
       }
-      return false
+      return base.distanceTo(this.pos()) <= 4.2
     }
 
     /** 找到某根原木所在那棵树的"树干最底下一格"（从找到的位置往下走） */

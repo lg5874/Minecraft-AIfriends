@@ -6,7 +6,9 @@ pnpm-debug.log*
 
 # 运行时数据（记忆、品味、心情、技能库、生成的代码、日志）
 data/runtime/
+data/runtime-*/
 data/memory/
+data/test-results/
 logs/
 *.log
 
@@ -32,3 +34,7 @@ Thumbs.db
 # 临时
 tmp/
 .cache/
+*.bak
+*.bak-*
+*.orig
+*.rej
