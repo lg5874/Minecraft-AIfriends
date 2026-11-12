@@ -3667,8 +3667,28 @@ class Actions {
    * 把生肉烤成熟肉。
    * 没熔炉就现做一个（8 个圆石），没燃料就砍点木头。
    */
-  async tryCook (rawName) {
+  /**
+   * 把生肉烤熟。
+   *
+   * 老实现的问题：没熔炉时会 `digStone(8)` 现场挖 8 个圆石。
+   * digStone 又要镐子，镐子又要砍树 → 木板 → 木棍……
+   * 在"我饿了想弄点吃的"这个上下文里，这是几十秒起步的赌博，
+   * 而且一旦失败，生肉还在包里、其实生的就能吃 —— 白等。
+   * 实测「找食物」180 秒超时，很大一块时间耗在这条链上。
+   *
+   * 现在：只在**熔炉已经存在 / 背包里有熔炉 / 圆石已经够**时才烤。
+   * 需要现挖圆石的路径一律跳过，直接返回 null 让调用方吃生的。
+   *
+   * @param {string} rawName
+   * @param {{allowDigStone?:boolean, budgetMs?:number}} opts
+   */
+  async tryCook (rawName, opts = {}) {
     if (!rawName) return null
+    const allowDigStone = opts.allowDigStone === true
+    const budgetMs = opts.budgetMs || 25000
+    const deadline = Date.now() + budgetMs
+    const left = () => deadline - Date.now()
+
     const cookedName = rawName.replace(/^beef$/, 'cooked_beef')
       .replace(/^porkchop$/, 'cooked_porkchop')
       .replace(/^mutton$/, 'cooked_mutton')
@@ -3678,48 +3698,62 @@ class Actions {
       .replace(/^salmon$/, 'cooked_salmon')
     if (cookedName === rawName) return null
     if (this.item(cookedName)) return cookedName
+    if (!this.item(rawName)) return null
 
-    // 有熔炉吗
-    let furnace = this.findBlock('furnace', 20)
+    // 1. 找熔炉：附近 -> 背包里现放
+    let furnace = null
+    try { furnace = this.findBlock('furnace', 16) } catch (e) {}
+    if (!furnace && this.countOf('furnace') > 0) {
+      try { furnace = await this.placeNearby('furnace') } catch (e) {}
+    }
+
+    // 2. 没熔炉：只有圆石已经够（或明确允许挖）才现做
     if (!furnace) {
-      // 现做一个：需要 8 个圆石
-      if (this.countOf('furnace') > 0) {
+      const stone = this.countOf('cobblestone') + this.countOf('cobbled_deepslate')
+      if (stone < 8) {
+        if (!allowDigStone) {
+          this.log(`[cook] 没熔炉、圆石只有 ${stone}/8，跳过烤制（生的也能吃）`)
+          return null
+        }
+        if (left() < 15000) {
+          this.log('[cook] 时间不够现挖圆石，跳过烤制')
+          return null
+        }
+        this.log('[cook] 圆石不够（' + stone + '/8），挖点')
+        try { await this.digStone(8) } catch (e) {}
+      }
+      if (this.countOf('cobblestone') + this.countOf('cobbled_deepslate') < 8) {
+        this.log('[cook] 圆石还是不够，跳过烤制')
+        return null
+      }
+      try {
+        await this.craftSmart('furnace', 1)
         furnace = await this.placeNearby('furnace')
-      } else {
-        let stone = this.countOf('cobblestone') + this.countOf('cobbled_deepslate')
-        if (stone < 8) {
-          this.log('[cook] 圆石不够（' + stone + '/8），挖点')
-          try { stone = await this.digStone(8) } catch (e) {}
-        }
-        if (stone < 8) {
-          this.log('[cook] 挖不到圆石，只能吃生的')
-          return null
-        }
-        try {
-          await this.craftSmart('furnace', 1)
-          furnace = await this.placeNearby('furnace')
-        } catch (e) {
-          this.log('[cook] 做熔炉失败: ' + e.message)
-          return null
-        }
+      } catch (e) {
+        this.log('[cook] 做熔炉失败: ' + e.message)
+        return null
       }
     }
     if (!furnace) return null
 
-    // 有燃料吗
+    // 3. 燃料：煤最好，其次木板/原木/木棍（燃料在包里就能用）
     const fuel = ['coal', 'charcoal', 'oak_planks', 'birch_planks', 'spruce_planks',
       'oak_log', 'birch_log', 'spruce_log', 'stick']
       .map(n => this.item(n)).find(Boolean)
+
     if (!fuel) {
-      this.log('[cook] 没燃料，砍点木头')
-      try { await this.ensureWood(2); await this.anyPlanks(2) } catch (e) {}
-      const f2 = ['oak_planks', 'birch_planks', 'oak_log', 'stick'].map(n => this.item(n)).find(Boolean)
-      if (!f2) return null
-      return await this.smelt(rawName, f2.name, 2).then(() => this.item(cookedName) ? cookedName : null).catch(() => null)
+      // 没燃料：别为了烤肉去砍树（又是几十秒）。生的能吃。
+      this.log('[cook] 没燃料，跳过烤制（生的也能吃）')
+      return null
     }
 
+    // 4. 烧：按剩余预算收缩，别烧满 90 秒
     try {
-      await this.smelt(rawName, fuel.name, 2)
+      const waitMs = Math.min(30000, Math.max(4000, left() - 2000))
+      await Promise.race([
+        this.smelt(rawName, fuel.name, 1),
+        sleep(waitMs).then(() => null)
+      ])
       if (this.item(cookedName)) {
         this.log('[cook] 烤好了 ' + cookedName)
         return cookedName
