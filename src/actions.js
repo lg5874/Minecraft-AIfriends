@@ -901,6 +901,27 @@ class Actions {
    * @returns {Promise<string>} 镐子物品名
    */
   async ensurePickaxe (opts = {}) {
+    // 重入保护。
+    // craftSmart 的第 3c 步（石头类材料缺失 -> 先弄镐子）会调到这里，
+    // 而这里第 2 步在有圆石+木棍时又会 craftSmart('stone_pickaxe') ——
+    // 两者一对上就是无限递归（depth 参数在 ensurePickaxe 这一层是断的）。
+    // 同一个实例上已有一次在跑，就直接按"拿不到"返回，让上层走它的兜底。
+    if (this._ensuringPickaxe) {
+      this.log('[tool] ensurePickaxe 正在跑，避免递归，直接返回')
+      const busyPick = this.bot.inventory.items()
+        .filter(i => /_pickaxe$/.test(i.name))
+        .sort((a, b) => this._toolRank(b.name) - this._toolRank(a.name))[0]
+      return busyPick ? busyPick.name : null
+    }
+    this._ensuringPickaxe = true
+    try {
+      return await this._ensurePickaxeInner(opts)
+    } finally {
+      this._ensuringPickaxe = false
+    }
+  }
+
+  async _ensurePickaxeInner (opts = {}) {
     // 默认 200 秒。算过的账：
     //   ensureWood(3) 内部最多两轮 chopTree(1)，单轮 chopTree 的 DEADLINE 是 85 秒，
     //   所以一轮备料最坏 ~85 秒（成功则远快，实测 53~99 秒砍到）。
@@ -1029,7 +1050,100 @@ class Actions {
     return r
   }
 
-  async mine (blockName, count = 1, maxDist = 32) {
+  /**
+   * 找附近某种方块。用 findBlocks（读区块缓存）而不是三重 blockAt 循环。
+   *
+   * 老实现的问题（实测）：
+   *   r=32 时是 65 × 21 × 65 ≈ 88,725 次 blockAt，
+   *   一次扫描 4.5 秒，而 mine() 的 while 每一轮都要扫一遍。
+   *   「挖石头」300 秒超时，绝大部分时间烧在这个循环里。
+   *
+   * findBlocks 直接遍历已加载区块的调色板，快几十倍；
+   * 代价是它只按水平距离筛、不限制 y，所以这里自己补上 y 范围过滤。
+   *
+   * @returns {Block[]} 已按"垂直加权距离"排好序
+   */
+  _scanBlocks (blockName, maxDist = 32, count = 1) {
+    const def = mcData.blocksByName[blockName]
+    if (!def) throw new Error('没有这种方块: ' + blockName)
+    const p = this.pos()
+    const r = Math.min(maxDist, 32)
+
+    let positions = []
+    try {
+      positions = this.bot.findBlocks({
+        matching: def.id,
+        maxDistance: r,
+        count: Math.max(24, count * 8 + 16)
+      }) || []
+    } catch (e) {
+      return []
+    }
+
+    const out = []
+    for (const pos of positions) {
+      // findBlocks 不限制垂直范围，自己筛。±12 比原来的 ±10 略宽，
+      // 因为垂直已经靠下面的加权排序降权了，不必靠硬砍范围。
+      if (Math.abs(pos.y - p.y) > 12) continue
+      const b = this.bot.blockAt(pos)
+      if (!b || b.name !== blockName) continue
+      out.push(b)
+    }
+
+    // 垂直加权：y 差 1 格 ≈ 水平差 4 格。
+    // 3D 欧氏距离把"y 差 10"和"水平差 10"当等价，但难度天差地别 ——
+    // 水平走过去几秒，y 差 10 格要挖楼梯/垫柱子。
+    // 实测：他一直在挑 y≈50-57 的 andesite（人在 y=63 地表），
+    // 日志里刷「高度到不了 / 172 个 andesite 都够不到」。
+    const vScore = (c) => {
+      const dxz = Math.hypot(c.position.x - p.x, c.position.z - p.z)
+      const dy = Math.abs(c.position.y - p.y)
+      return dxz + dy * 4
+    }
+    out.sort((a, b) => vScore(a) - vScore(b))
+    return out
+  }
+
+  /** 这个方块旁边有没有空位（有的话抬手就能挖，不用寻路） */
+  _isExposed (block) {
+    if (!block) return false
+    const around = [
+      [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]
+    ]
+    for (const [ox, oy, oz] of around) {
+      const nb = this.bot.blockAt(block.position.offset(ox, oy, oz))
+      if (!nb) continue
+      if (nb.boundingBox === 'empty' || nb.name === 'air' || nb.name === 'cave_air') return true
+    }
+    return false
+  }
+
+  /**
+   * 挖某种方块。
+   *
+   * 三个一起改的坑（都有实测数据撑着）：
+   *
+   * 1. **扫描慢**：三重 blockAt 循环 88,725 次 / 轮，实测 4.5 秒。
+   *    改成 _scanBlocks()（findBlocks + y 过滤）。
+   *
+   * 2. **可达性预筛把地下石头全毙了**：
+   *    老判据是"从自己到目标的连线上，实心方块不超过一半"。
+   *    可石头本来就埋在地下 —— 连线上当然全是实心。
+   *    结果 reachable 永远为空，日志刷「9331 个 stone 都够不到」，
+   *    然后 wander 换地方，再扫一遍，再全毙 —— 永远挖不到一块。
+   *    现在改成：够得着就挖；够不着但**有暴露面**就走过去挖；
+   *    两个都不是就**往下挖一格**靠近（真人挖石头就是这么干的）。
+   *
+   * 3. **无限扫描**：整个 mine() 最多扫 5 次，且总时长有硬上限，
+   *    到点就返回已经挖到的数量，绝不把 300 秒测试预算烧光。
+   *
+   * @param {string} blockName 方块名
+   * @param {number} count      要挖几个
+   * @param {number} maxDist    搜索半径
+   * @param {number} budgetMs   本函数总时长上限（默认 50 秒）
+   * @returns {Promise<number>} 背包真实增加的数量
+   */
+  async mine (blockName, count = 1, maxDist = 32, budgetMs = 50000) {
     await this.ensureChunks()
 
     // 挖石头类的东西之前，先确保有镐子（没镐子挖了不掉东西）
@@ -1055,133 +1169,110 @@ class Actions {
     const def = mcData.blocksByName[blockName]
     if (!def) throw new Error('没有这种方块: ' + blockName)
 
-    const failed = []      // 试过挖不到的坐标
-    let got = 0
-    let attempts = 0
-    const maxAttempts = count * 6 + 15
+    const REACH = 4.2
+    // 能靠"往下挖"接近的方块。原木/树叶之类不该往下挖，那类够不着就换地方。
+    const canApproachByDigging = /stone|deepslate|andesite|diorite|granite|tuff|calcite|_ore$|dirt|gravel|sand/.test(blockName)
 
-    while (got < count && attempts++ < maxAttempts) {
+    const failed = new Set()   // 试过挖不到的坐标（用 Set，别再 O(n) includes）
+    let got = 0
+    let scans = 0
+    let descents = 0
+    const MAX_SCANS = 5          // 整个函数最多扫 5 次
+    const MAX_DESCENTS = 6       // 最多往下挖 6 格靠近
+    const deadline = Date.now() + Math.max(5000, budgetMs)
+
+    while (got < count) {
       this.check()
       if (this.bot.health <= 6) throw new Error('血太少了，得先撤')
       if (this.bot.oxygenLevel < 8) throw new Error('快淹死了')
-
-      // 找最近的、没试过的
-      let target = null
-      const p = this.pos()
-      const r = Math.min(maxDist, 32)
-      const cands = []
-      for (let dx = -r; dx <= r; dx += 1) {
-        for (let dy = -10; dy <= 10; dy += 1) {
-          for (let dz = -r; dz <= r; dz += 1) {
-            const b = this.bot.blockAt(p.offset(dx, dy, dz))
-            if (!b || b.name !== blockName) continue
-            const key = `${b.position.x},${b.position.y},${b.position.z}`
-            if (failed.includes(key)) continue
-            cands.push(b)
-          }
-        }
-      }
-      if (!cands.length) {
-        if (got === 0) {
-          // 附近真没有：走远点找
-          this.log(`[mine] 附近 ${r} 格内没 ${blockName}，走远找`)
-          await this.wander(30)
-          await this.ensureChunks(3000)
-          continue
-        }
+      if (Date.now() > deadline) {
+        this.log(`[mine] 到时间上限（${Math.round(budgetMs / 1000)}s），已挖到 ${got} 个`)
         break
       }
-      // ===== 可达性预筛（关键）=====
-      // 之前按距离排序直接取最近的，不管能不能走到。
-      // 结果：目标在封闭矿洞里 -> goto 失败 -> digAt 报"够不到" -> 试8个放弃。
-      // 日志里 576 次"走不通"和 575 次"够不到"一一对应，就是这么来的。
-      //
-      // 现在：先按【垂直加权距离】排序，然后逐个检查是否真的能挖到，
-      // 挑第一个可达的。全不可达就换地方，不再硬试。
-      //
-      // 为什么垂直要加权：3D 欧氏距离把"y 差 10 格"和"水平差 10 格"当等价，
-      // 但实际难度天差地别 —— 水平 10 格走过去几秒，y 差 10 格要挖楼梯/搭柱子。
-      // 实测（目标「攒够垫脚的石头」）：他一直在挑 andesite，
-      // 那些生成在 y≈50-57，他在 y=63 地表，
-      // 日志里 [goto] 高度到不了（目标 y=57，现在 y=63）连着刷，
-      // [mine] 172 个 andesite 都够不到。
-      // 权重 4 是经验值：y 差 1 格 ≈ 水平 4 格（爬一格要挖/垫，够走四步）。
-      const vScore = (c) => {
-        const dxz = Math.hypot(c.position.x - p.x, c.position.z - p.z)
-        const dy = Math.abs(c.position.y - p.y)
-        return dxz + dy * 4
-      }
-      cands.sort((a, b) => vScore(a) - vScore(b))
 
-      // ===== 可达性预筛 =====
-      // 踩过的坑：只检查"周围有没有空气"是没用的 —— 石头里的矿周围本来就有空气
-      // （那是矿洞），但路不通。结果 500 个全判可达 -> digAt 全失败 ->
-      // "都够不到，换地方" -> 满地图乱跑（实测 8 分钟漂 100 格，0 个任务完成）。
-      //
-      // 正确做法：
-      //   1. 用 canDigBlock 过滤（工具等级）
-      //   2. 目标必须在"能挖到"的距离内，或者中间有连通空间
-      //   3. **严格限制换地方次数**，别无限漂移
-      const REACH = 4.2
-      const reachable = []
-      for (const c of cands) {
-        try {
-          if (!this.bot.canDigBlock(c)) continue
-        } catch (e) { continue }
+      const p = this.pos()
+      let cands = this._scanBlocks(blockName, maxDist, count)
+        .filter(c => !failed.has(`${c.position.x},${c.position.y},${c.position.z}`))
+      scans++
 
-        const dist = c.position.distanceTo(p)
-        // 已经够得着的：直接可用
-        if (dist <= REACH) { reachable.push(c); break }
-
-        // 远处的：检查视线（用 raycast 或者简单的地形判断）
-        // 简化版：检查从自己到目标连线上有没有大量实心方块
-        // （真正能不能走到，交给 digAt 的 goto 判断）
-        let blocked = 0
-        const steps = Math.min(8, Math.ceil(dist))
-        for (let i = 1; i <= steps; i++) {
-          const t = i / steps
-          const v = p.offset(
-            Math.round((c.position.x - p.x) * t),
-            Math.round((c.position.y - p.y) * t),
-            Math.round((c.position.z - p.z) * t)
-          )
-          const nb = this.bot.blockAt(v)
-          if (nb && nb.boundingBox === 'block') blocked++
-        }
-        // 连线上实心方块不超过一半，就值得试
-        if (blocked <= steps / 2) reachable.push(c)
-        if (reachable.length >= 3) break
-      }
-
-      if (!reachable.length) {
-        this.log(`[mine] ${cands.length} 个 ${blockName} 都够不到`)
-        // 严格限制：只换 2 次地方，然后明确失败
-        this._mineWanderCount = (this._mineWanderCount || 0) + 1
-        if (this._mineWanderCount >= 2 || got > 0) {
-          this.log('[mine] 换地方太多次了，这次放弃')
-          this._mineWanderCount = 0
-          break
-        }
+      if (!cands.length) {
+        if (got > 0 || scans >= MAX_SCANS) break
+        this.log(`[mine] 附近 ${Math.min(maxDist, 32)} 格内没 ${blockName}，走远找`)
         await this.wander(15)
         await this.ensureChunks(2500)
         continue
       }
-      this._mineWanderCount = 0
-      target = reachable[0]
 
+      // ---- 挑目标 ----
+      // 优先级：够得着 > 有暴露面（走过去就能挖）> 需要往下挖靠近
+      let target = null
+      let exposedButFar = null
+      for (const c of cands) {
+        try {
+          if (!this.bot.canDigBlock(c)) continue   // 工具等级不够
+        } catch (e) { continue }
+
+        const dist = c.position.distanceTo(p)
+        if (dist <= REACH) { target = c; break }
+        if (!exposedButFar && this._isExposed(c)) exposedButFar = c
+      }
+      if (!target && exposedButFar) target = exposedButFar
+
+      // ---- 够不着：往下挖一格靠近（真人挖石头就是这么干的）----
+      if (!target) {
+        if (!canApproachByDigging || descents >= MAX_DESCENTS || Date.now() > deadline) {
+          // 这类方块不能往下挖（比如原木），或者已经挖够了深度 → 换地方
+          if (got > 0 || scans >= MAX_SCANS) {
+            this.log(`[mine] ${cands.length} 个 ${blockName} 都够不到，放弃`)
+            break
+          }
+          this.log(`[mine] ${cands.length} 个 ${blockName} 都够不到，换个地方`)
+          await this.wander(15)
+          await this.ensureChunks(2500)
+          continue
+        }
+
+        // 往下挖一格
+        const below = this.bot.blockAt(p.offset(0, -1, 0))
+        if (!below || /bedrock|lava|water/.test(below.name)) {
+          this.log(`[mine] 下面不能挖（${below ? below.name : '未知'}），换个地方`)
+          if (got > 0) break
+          await this.wander(12)
+          continue
+        }
+        const y0 = p.y
+        const dug = await this.digAt(below)
+        if (!dug) {
+          this.log('[mine] 往下这一格没挖成，换个地方')
+          if (got > 0) break
+          await this.wander(12)
+          continue
+        }
+        descents++
+        // 等自己掉下去（1 格约 0.3 秒，多给一点）
+        for (let i = 0; i < 12 && this.pos().y > y0 - 0.6; i++) await sleep(100)
+        await this.pickupNearby(3)
+        continue
+      }
+
+      // ---- 挖 ----
       const ok = await this.digAt(target)
       if (ok) {
         got++
         try { await this.pickupNearby(4) } catch (e) {}
+        // 挖到之后重新扫描（位置可能变了），但别把扫描次数烧光
+        if (scans >= MAX_SCANS && got < count) {
+          // 还差一些，给一次额外机会
+          scans = MAX_SCANS - 1
+        }
       } else {
-        // 记下来，别再试
-        failed.push(`${target.position.x},${target.position.y},${target.position.z}`)
-        if (failed.length >= 8 && got === 0) {
-          this.log(`[mine] 试了 ${failed.length} 个都挖不到，放弃`)
+        failed.add(`${target.position.x},${target.position.y},${target.position.z}`)
+        if (failed.size >= 8 && got === 0) {
+          this.log(`[mine] 试了 ${failed.size} 个都挖不到，放弃`)
           break
         }
       }
-      await sleep(120)
+      await sleep(80)
     }
 
     // 返回真实增加的数量
@@ -1732,15 +1823,65 @@ class Actions {
     const pick = scored[0]
 
     // 3. 补齐缺的原料
+    //
+    // 降级链（实测「做石镐」32 秒后抛 missing ingredient，就是断在这里）：
+    //
+    //   craftSmart('stone_pickaxe')
+    //     -> 缺 cobblestone -> gather('cobblestone')
+    //     -> mine('stone')  -> ensurePickaxe()   <- 这里没木头，砍树又失败
+    //     -> 抛错 -> gather 返回 false -> craftSmart 抛"缺 cobblestone"
+    //
+    // 死结在于：**石头类材料必须有镐子才能拿到**，而镐子本身要先有木头。
+    // 所以遇到石头类材料缺失时，必须先补镐子，再用镐子去挖 —— 而不是
+    // 直接 mine() 撞死在里面。craftSmart 这里就是唯一能插手的降级点。
+    const STONE_MATS = /^(cobblestone|cobbled_deepslate|stone|deepslate|raw_iron|raw_copper|coal)$/
+
     for (const [iid, n] of Object.entries(pick.needs)) {
       const item = mcData.items[parseInt(iid, 10)]
       if (!item) continue
       if (this.countOf(item.name) >= n) continue
+
+      let got = false
+      let firstErr = null
+
+      // 3a. 先试递归合成（木板/木棍这种链短的走这条）
       try {
         await this.craftSmart(item.name, n, depth + 1)
+        got = this.countOf(item.name) >= n
       } catch (e) {
-        const got = await this.gather(item.name, n - this.countOf(item.name))
-        if (!got) throw new Error('缺 ' + item.name + '，也弄不到（' + e.message + '）')
+        firstErr = e
+      }
+
+      // 3b. 合不出来：直接从世界里拿
+      if (!got) {
+        try {
+          got = await this.gather(item.name, n - this.countOf(item.name))
+        } catch (e) { got = false }
+      }
+
+      // 3c. 还是不行，而且是石头类材料：先保证有镐子，再挖一次。
+      //     没有镐子时挖石头不掉东西，gather 里的 mine() 会一路空转。
+      if (!got && STONE_MATS.test(item.name)) {
+        this.log(`[craft] 缺 ${item.name}，先弄把镐子`)
+        let pick = null
+        try {
+          pick = await this.ensurePickaxe()
+        } catch (e) {
+          this.log('[craft] 镐子也没弄到: ' + e.message)
+        }
+        if (pick) {
+          this.log(`[craft] 有 ${pick} 了，再挖 ${item.name}`)
+          try {
+            got = await this.gather(item.name, Math.max(1, n - this.countOf(item.name)))
+          } catch (e) { got = false }
+        }
+      }
+
+      // 3d. 记录最终结果，别把"我试过什么"丢掉
+      if (!got) {
+        const attempt = firstErr ? String(firstErr.message || firstErr) : '合不出来'
+        throw new Error(`缺 ${item.name}（要 ${n} 个，有 ${this.countOf(item.name)} 个），` +
+          `合成/采集都失败：${attempt}`)
       }
     }
 
@@ -4081,48 +4222,82 @@ class Actions {
    *   if (dxz <= range + 2 && dyAbs <= 2) return true
    * range=1 -> 阈值 3 格。掉落物在 1.99 格时**已经算"到达"**，
    * 人一步没挪，函数返回，东西还在原地。
-   * 实测：digAt 成功、掉落物生成、距离 1.99，背包 0 -> 0。
    *
-   * 现在用 GoalBlock 精确踩到掉落物所在格，1 格内停下等吸附
-   * （原版 1 格内自动拾取），并轮询"掉落物消失 / 数量减少"作为完成判据。
+   * 现在用 GoalBlock 精确踩到掉落物所在格。
+   * 实测（probe18）：挖 dirt 后 1.2s 掉落物在 6.78 格外，
+   * GoalBlock 走过去 3 秒就捡到了 2 个。
+   *
+   * 关键细节：设完 goal 后**不要**每轮重设 —— 重设会让 pathfinder
+   * 反复重新规划，看起来像"走不动"。目标变了才重设。
    */
   async pickupNearby (radius = 8) {
     const t0 = Date.now()
-    const BUDGET = 8000
-    let passes = 0
+    const BUDGET = 9000
+    let goalKey = ''
+    let lastDist = 1e9
+    let stall = 0
+    const skip = new Set()
+    let sawAny = false
 
     while (Date.now() - t0 < BUDGET) {
       this.check()
       const p = this.pos()
       const drops = Object.values(this.bot.entities)
-        .filter(e => e && e.name === 'item' && e.position.distanceTo(p) < radius)
+        .filter(e => e && e.name === 'item' && !skip.has(e.id) &&
+          e.position.distanceTo(p) < radius)
         .sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
-      if (!drops.length) break
+
+      if (!drops.length) {
+        // 关键：刚挖完时掉落物还没进实体表（实测 300~600ms 才出现）。
+        // 老实现在这里直接 break，等于"挖完立刻放弃捡"。
+        if (!sawAny && Date.now() - t0 < 3000) {
+          await sleep(250)
+          continue
+        }
+        break
+      }
+      sawAny = true
 
       const d = drops[0]
-      const dist = d.position.distanceTo(this.pos())
+      const dist = d.position.distanceTo(p)
 
-      if (dist > 1.0) {
-        // 精确走到掉落物那一格（不是 GoalNear，避免又"差不多到了"）
+      // 1 格内：原版会自动吸附，站着别动（走反而推远）
+      if (dist < 1.2) {
+        if (goalKey) {
+          try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+          goalKey = ''
+        }
+        await sleep(300)
+        continue
+      }
+
+      const key = `${Math.floor(d.position.x)},${Math.floor(d.position.y)},${Math.floor(d.position.z)}`
+      if (key !== goalKey) {
+        // 换目标才重新下发
         try {
           this.bot.pathfinder.setGoal(new goals.GoalBlock(
-            Math.floor(d.position.x),
-            Math.floor(d.position.y),
-            Math.floor(d.position.z)
-          ))
+            Math.floor(d.position.x), Math.floor(d.position.y), Math.floor(d.position.z)))
         } catch (e) {}
-        await sleep(250)
+        goalKey = key
+        lastDist = dist
+        stall = 0
+      } else if (dist > lastDist - 0.15) {
+        // 同一个目标但没变近 -> 卡住了，放弃这个物品换下一个
+        stall++
+        if (stall >= 4) {
+          skip.add(d.id)
+          goalKey = ''
+          stall = 0
+        }
       } else {
-        // 已经在 1 格内：停下等原版吸附，别继续走（走反而会推远）
-        try { this.bot.pathfinder.setGoal(null) } catch (e) {}
-        await sleep(300)
+        lastDist = dist
+        stall = 0
       }
-      passes++
-      if (passes > 40) break       // 兜底，别无限转
+      await sleep(350)
     }
 
     try { this.bot.pathfinder.setGoal(null) } catch (e) {}
-    return passes
+    return true
   }
 
   // ---------------- 睡觉 ----------------

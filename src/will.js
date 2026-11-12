@@ -82,11 +82,20 @@ class Will {
     // 所以在 y=44 的地下挑"去砍树" —— 树在地表，必然失败。
     let place = ''
     try {
+      // isUnderground() 现在返回三态 true/false/null（null = 区块没加载/断线看不清）
+      // null 时不能说"地表"，那会让他在地洞里挑"去砍树"
       const ug = this.ctx.actions.isUnderground()
-      const depth = ug ? `你现在在**地下**（y=${Math.round(status.pos.y)}），头顶有石头，四周可能是矿道。` : `你现在在地表附近（y=${Math.round(status.pos.y)}）。`
+      let depth
+      if (ug === true) {
+        depth = `你现在在**地下**（y=${Math.round(status.pos.y)}），头顶有石头，四周可能是矿道。`
+      } else if (ug === false) {
+        depth = `你现在在地表附近（y=${Math.round(status.pos.y)}）。`
+      } else {
+        depth = `你现在在 y=${Math.round(status.pos.y)}，看不清周围是在洞里还是露天。`
+      }
       place = depth
       // 头顶离地表多远
-      if (ug) {
+      if (ug === true) {
         let blocks = 0
         for (let dy = 2; dy <= 60; dy++) {
           const b = this.ctx.actions.bot.blockAt(this.ctx.actions.pos().offset(0, dy, 0))
