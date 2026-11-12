@@ -1,0 +1,28 @@
+{
+  "bot": {
+    "username": "XJJ",
+    "host": "127.0.0.1",
+    "port": 25565,
+    "version": "1.21.11",
+    "auth": "offline"
+  },
+  "llm": {
+    "baseUrl": "https://api.example.com/v1",
+    "apiKey": "PUT_YOUR_KEY_HERE",
+    "model": "your-model-name",
+    "chatMaxTokens": 900,
+    "codeMaxTokens": 4000,
+    "thinkMaxTokens": 1200,
+    "temperature": 0.9
+  },
+  "behavior": {
+    "idleThinkSeconds": 60,
+    "chatDelayPerChar": 45,
+    "chatMinDelay": 900,
+    "chatMaxDelay": 5200,
+    "ignoreChanceWhenBusy": 0.55,
+    "autoRespawn": true,
+    "reconnectDelaySeconds": 15,
+    "taskTimeoutSeconds": 420
+  }
+}

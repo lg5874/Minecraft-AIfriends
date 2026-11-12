@@ -1,0 +1,264 @@
+'use strict'
+// L2 程序层：让模型自己写一小段 JS，在沙箱里跑，出错把报错喂回去重写。
+// 这是"能学任何东西"的核心 —— 能力不由我写死，由它自己长。
+
+const vm = require('vm')
+const { Vec3 } = require('vec3')
+
+// 禁词：沙箱外的任何东西都不许碰
+const FORBIDDEN = [
+  /\brequire\s*\(/, /\bimport\s+/, /\bprocess\b/, /\bglobalThis\b/, /\bglobal\b/,
+  /\b__dirname\b/, /\b__filename\b/, /\bmodule\b/, /\bexports\b/,
+  /\bFunction\s*\(/, /\beval\s*\(/, /\bfetch\s*\(/, /\bXMLHttpRequest\b/,
+  /\bsetTimeout\s*\(.*=>.*fetch/, /\bconstructor\s*\.\s*constructor/
+]
+
+function checkSafety (code) {
+  for (const re of FORBIDDEN) {
+    if (re.test(code)) return '代码里不能用 ' + re.source.replace(/\\b/g, '').replace(/\\/g, '')
+  }
+  return null
+}
+
+class Coder {
+  constructor (bot, actions, llm, skills, ctx) {
+    this.bot = bot
+    this.actions = actions
+    this.llm = llm
+    this.skills = skills
+    this.ctx = ctx
+    this.lastCode = null
+  }
+
+  // 主入口：写一段代码来完成 goal
+  async writeAndRun (goal, extraContext = '') {
+    const skillCatalog = this.skills.catalog(30)
+    // 先按这次要做的事，捞出最相关的几个技能代码，一起给它参考
+    const relevant = this.skills.search(goal, 3)
+    const relevantCode = relevant.map(sk =>
+      `### ${sk.name}（${sk.desc}）\n\`\`\`javascript\n${sk.code}\n\`\`\``
+    ).join('\n\n')
+    const apiDoc = this.apiDoc()
+    const status = JSON.stringify(this.actions.status())
+
+    let feedback = ''
+    const MAX = 4
+    for (let attempt = 0; attempt < MAX; attempt++) {
+      const messages = [
+        { role: 'system', content: this.systemPrompt(apiDoc, skillCatalog) },
+        {
+          role: 'user',
+          content: `当前状态：${status}\n\n${extraContext}\n\n要做的事：${goal}\n\n${relevantCode ? '以前做过类似的事，可以参考这些代码：\n' + relevantCode + '\n\n' : ''}${feedback ? '上一次失败了，原因：' + feedback + '\n\n重新写。' : ''}直接给代码，不要解释。`
+        }
+      ]
+
+      let res
+      try {
+        res = await this.llm.chat(messages, {
+          maxTokens: this.ctx.cfg.llm.codeMaxTokens,
+          temperature: 0.3
+        })
+      } catch (e) {
+        return { ok: false, error: '模型调用失败: ' + e.message }
+      }
+
+      const code = extractCode(res.text)
+      if (!code) {
+        feedback = '没有给出代码块'
+        continue
+      }
+
+      const bad = checkSafety(code)
+      if (bad) {
+        feedback = bad
+        continue
+      }
+
+      this.lastCode = code
+      if (this.ctx && this.ctx.dumpCode) this.ctx.dumpCode(goal, code, attempt)
+      const out = await this.run(code, goal)
+      if (out.ok) {
+        return { ok: true, code, output: out.output }
+      }
+      feedback = out.error + (out.output ? '\n输出：' + out.output : '')
+    }
+    return { ok: false, error: '试了 ' + MAX + ' 次都没成：' + feedback }
+  }
+
+  async run (code, goal) {
+    const bot = this.bot
+    const actions = this.actions
+    const ctx = this.ctx
+
+    // 沙箱里能用的东西，就这些
+    const api = {
+      Vec3,
+      actions,
+      bot: {
+        chat: (m) => ctx.say(m),
+        username: bot.username,
+        entity: bot.entity,
+        health: bot.health,
+        food: bot.food,
+        time: bot.time
+      },
+      log: (m) => ctx.log('[code] ' + m),
+      sleep: (ms) => new Promise(r => setTimeout(r, Math.min(ms, 5000))),
+      say: (m) => ctx.say(m),
+      memory: {
+        note: (name, t) => ctx.mem.note(name, t),
+        place: (n, pos, note) => ctx.mem.place(n, pos, note),
+        fact: (t) => ctx.mem.fact(t),
+        lesson: (t) => ctx.mem.lesson(t)
+      },
+      players: () => Object.keys(bot.players).filter(n => n !== bot.username)
+    }
+
+    const sandbox = {
+      ...api,
+      console: { log: (m) => ctx.log('[code] ' + m) },
+      Math, JSON, Date, Array, Object, String, Number, Boolean, Promise, Error,
+      parseInt, parseFloat, isNaN, isFinite
+    }
+    sandbox.globalThis = undefined
+
+    let output = ''
+    this.cancelFlag = false
+    const wrapped = `(async () => {
+${code}
+})()`
+
+    try {
+      const context = vm.createContext(sandbox)
+      const script = new vm.Script(wrapped, { filename: 'action.js' })
+      const result = await Promise.race([
+        script.runInContext(context, { timeout: (this.ctx.cfg.behavior.taskTimeoutSeconds || 300) * 1000 + 10000 }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('这次干太久了，算了')), (this.ctx.cfg.behavior.taskTimeoutSeconds || 300) * 1000))
+      ])
+      return { ok: true, output: result === undefined ? '' : String(result) }
+    } catch (e) {
+      return { ok: false, error: (e && e.message) || String(e), output }
+    }
+  }
+
+  systemPrompt (apiDoc, skillCatalog) {
+    return `你在给一个 Minecraft 玩家写一小段动作代码。这段代码会被执行，直接控制这个玩家。
+
+规则：
+1. 只输出一个 \`\`\`javascript 代码块，里面是一个 async 函数体（不用写函数声明，直接写语句）
+2. 只能用下面列出的 API，不能用 require、process、fs、fetch、eval
+3. 代码要能跑通。每一步都可能失败，用 try/catch 或检查返回值
+4. 循环里要留一点余地，别写死循环
+5. 需要的东西不在身上时，先想办法弄到（合成、去挖、去拿）
+6. 最后 return 一句话总结你干了什么
+7. 代码里的注释用中文
+
+## 能用的 API
+${apiDoc}
+
+## 已经会的技能（可以直接调用 actions 做类似的事，也可以组合）
+${skillCatalog}
+
+## 例子
+\`\`\`javascript
+// 砍三棵树，做成木板
+const n = await actions.chopTree(3)
+if (n < 1) return '没找到树'
+const logs = actions.countOf('oak_log') + actions.countOf('birch_log') + actions.countOf('spruce_log')
+if (logs > 0) {
+  const logType = actions.item('oak_log') ? 'oak_planks' : (actions.item('birch_log') ? 'birch_planks' : 'spruce_planks')
+  await actions.craft(logType, 8)
+  return '砍了' + n + '棵树，做了木板'
+}
+return '砍了树但没木头'
+\`\`\``
+  }
+
+  apiDoc () {
+    return `### 移动
+- actions.goto(x, y, z, range=1)  走到坐标，返回 true/false
+- actions.gotoPlayer(name, range=2)  走到某个玩家旁边
+- actions.follow(name, seconds)  跟着某玩家走一段时间
+- actions.wander(blocks)  随便走走
+- actions.stop()  停下
+
+### 看
+- actions.scan(radius=16)  返回 { blocks:{名字:数量}, entities:[{name,dist}], players:[{name,dist}] }
+- actions.pos()  当前位置 {x,y,z}
+- actions.status()  返回 {pos, health, food, time, dimension, weather, held, inventory}
+- actions.findBlock(name, maxDist=32)  找最近的某种方块，返回方块对象或 null
+- actions.nearestEntity(name, range=16)  找最近的实体
+
+### 挖
+- actions.mine(blockName, count, maxDist=32)  挖若干个，返回实际挖到几个
+- actions.chopTree(count)  砍树，返回砍了几棵
+- actions.digAt(block)  挖指定方块
+
+### 放
+- actions.place(blockName, x, y, z)  在坐标放一个方块
+
+### 合成与冶炼
+- actions.craft(itemName, count)  合成，自动找工作台（只做一步，缺材料会失败）
+- actions.craftSmart(itemName, count)  ★推荐用这个★ 智能合成：缺什么自动先做/去挖，依赖链自动补齐
+- actions.survey(半径)  评估这块地方：{trees,water,animals,hostiles,stone,score}
+- actions.findHome(走几段, 每段格数)  走几处挑最好的地方安家，返回 {survey,pos}
+- actions.travelToFind(() => 找东西的表达式, 最多几段, 每段多少格)  走远去找资源，边走边扫
+- actions.digStone(count)  ★挖圆石★ 直接往下挖到石头层，返回现有圆石数（用这个别自己写循环）
+- actions.ensureWood(count)  砍树直到有 count 个任意种类的原木（不挑品种），返回现有数量
+- actions.woodCount()  手上一共有多少原木（不分种类）
+- actions.anyPlanks(count)  把任意原木做成木板，返回木板数量
+- actions.myPlankKind()  我现在能做哪种木板（如 oak_planks）
+- actions.gather(itemName, count)  去弄原料（原木、石头、矿石这类能从世界上直接拿的）
+- actions.findAny([name1,name2,...], maxDist)  在多个名字里找最近的方块
+- actions.ensureChunks()  等区块加载（刚进服务器或走远之后要先调）
+- actions.placeNearby(blockName)  在脚边找个位置放方块，返回放好的方块
+- actions.smelt(inputName, fuelName, count)  烧东西，fuelName 可以是 null
+- actions.itemId(name)  拿物品 id
+
+### 背包
+- actions.item(name)  返回背包里的这个物品或 null
+- actions.countOf(name)  这个物品有多少个
+- actions.equip(name)  装备/手持
+- actions.autoArmor()  自动穿上最好的盔甲
+- actions.bestWeapon()  拿出最好的武器
+- actions.eat()  吃东西
+
+### 战斗
+- actions.attack(entityName, times=5)  打附近的怪
+
+### 容器
+- actions.openChest(x,y,z)  打开箱子，返回容器对象（要自己 close()）
+- actions.depositAll(x,y,z,except=[])  全部存进去
+- actions.withdraw(x,y,z,itemName,count)  取东西
+- actions.pickupNearby(radius)  捡地上的东西
+
+### 其他
+- actions.sleepInBed()  睡觉
+- actions.look(yaw, pitch)
+- actions.lookAtPlayer(name)
+- sleep(ms)  等待
+
+### 其他可用
+- say('文字')  在游戏里说一句话
+- log('文字')  写进日志
+- memory.note(玩家名, '记一笔')  记住关于某人的事
+- memory.place('名字', {x,y,z}, '备注')  记住一个地点
+- memory.fact('事实')  记住一件事
+- memory.lesson('教训')  记住一个教训
+- players()  当前服务器里的玩家名列表
+- bot.username  自己的名字
+- bot.health / bot.food  血量和饥饿度
+- Vec3  new Vec3(x,y,z)`
+  }
+}
+
+function extractCode (text) {
+  if (!text) return null
+  const m = text.match(/```(?:javascript|js)?\s*([\s\S]*?)```/)
+  if (m) return m[1].trim()
+  // 没有代码块，看看整段是不是像代码
+  if (/await |actions\.|const |let |function /.test(text)) return text.trim()
+  return null
+}
+
+module.exports = { Coder, extractCode, checkSafety }
