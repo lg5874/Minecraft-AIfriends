@@ -609,6 +609,59 @@ class Bot {
     this.log('主循环退出')
   }
 
+  /**
+   * 长期目标：扫一眼进度。
+   *
+   * 为什么单独抽出来：tick 每 4 秒一轮，但 observe 是纯同步的状态比对，
+   * 每轮都调也没问题；真正贵的 ensure()（要问模型"你想干哪个"）只在
+   * 没有目标时走一次，这里不碰。
+   *
+   * 返回 observe 的结果，调用方想用就用（现在只是记日志）。
+   */
+  observeGoals () {
+    if (!this.goals) return null
+    let res = null
+    try {
+      const st = this.actions ? this.actions.status() : null
+      if (!st) return null
+      // 30 秒一次就够 —— 进度是按背包/坐标算的，扫太勤没意义
+      const now = Date.now()
+      if (now - (this._lastGoalObserveAt || 0) < 30000) return null
+      this._lastGoalObserveAt = now
+
+      res = this.goals.observe(st)
+      if (res && res.goalCompleted) {
+        this.log('[goals] 长期目标做完了')
+        if (this.spont) this.spont.push(spontaneous.onGoalDone('长期目标', ''))
+      } else if (res && res.stageCompleted) {
+        const cur = this.goals.current()
+        this.log('[goals] 过了一步，下一步：' + (cur ? cur.text : '（没了）'))
+      } else if (res && res.abandoned) {
+        this.log('[goals] 放弃了这个目标，下一轮会重新想一个')
+      }
+    } catch (e) {
+      this.log('[goals] observe 出错: ' + e.message)
+    }
+    return res
+  }
+
+  /**
+   * 保证心里有个长期目标。没有就现在想一个（要问模型，所以是 async）。
+   *
+   * 调用点只有 tick 里"准备干活之前"那一处 —— 放在最前面会把自救饿死：
+   * 一次 LLM 调用要好几秒，血快没了的时候不能等它。
+   */
+  async ensureGoal () {
+    if (!this.goals) return null
+    try {
+      const st = this.actions ? this.actions.status() : null
+      return await this.goals.ensure(st)
+    } catch (e) {
+      this.log('[goals] ensure 出错: ' + e.message)
+      return null
+    }
+  }
+
   async tick () {
     const bot = this.bot
     if (!bot || !bot.entity) return
