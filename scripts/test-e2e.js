@@ -53,7 +53,15 @@ const argOf = (name, def) => {
 }
 const hasFlag = (name) => argv.includes('--' + name)
 
-const ACCOUNT = argOf('account', 'XJJ_E2E')
+const ACCOUNT_BASE = argOf('account', 'XJJ_E2E')
+// 关键：默认账号必须**每次唯一**。
+// 实测事故：两个进程同时跑本脚本，都用默认的 XJJ_E2E，
+// 第二个登进来把第一个踢了（multiplayer.disconnect.duplicate_login），
+// 前一个的 3 个任务直接变成"被踢，未执行"，整轮数据作废。
+// 加后缀后各跑各的，可以并行。
+const ACCOUNT = argOf('unique', '1') === '0'
+  ? ACCOUNT_BASE
+  : `${ACCOUNT_BASE}${Math.random().toString(36).slice(2, 6)}`.slice(0, 16)
 const ONLY = argOf('only', null)
 const VERBOSE = hasFlag('verbose')
 const TIMEOUT_SCALE = parseFloat(argOf('timeout', '1')) || 1
@@ -106,11 +114,14 @@ const FAIL_KINDS = {
   TIMEOUT: '超时',
   EXCEPTION: '抛异常',
   NO_OUTPUT: '产出为 0',
-  PRECONDITION: '前置条件不满足',
+  MATERIAL: '材料不足（做不出中间产物）',
   JUDGE_DISAGREE: '口径分歧（脚本成功/正式判定失败）',
   KICKED: '被踢下线',
   UNKNOWN: '未知'
 }
+
+/** 测不了的（不是他做不成，是测试夹具没搭起来）—— 不算进成功率 */
+const SKIP_KIND = '跳过（夹具没搭起来，不计入成功率）'
 
 const TASKS = [
   // ---------------- 1. 挖石头 ----------------
@@ -209,7 +220,7 @@ const TASKS = [
         if (a.countOf('wooden_pickaxe') > 0) {
           return {
             ok: false,
-            kind: FAIL_KINDS.PRECONDITION,
+            skip: true,
             detail: `开局有 ${pre} 把木镐且丢不掉，无法测"从零做木镐"`
           }
         }
@@ -251,7 +262,7 @@ const TASKS = [
         if (a.countOf('stone_pickaxe') > 0) {
           return {
             ok: false,
-            kind: FAIL_KINDS.PRECONDITION,
+            skip: true,
             detail: `开局有 ${pre} 把石镐且丢不掉，无法测"从零做石镐"`
           }
         }
@@ -307,7 +318,7 @@ const TASKS = [
       if (a.countOf('chest') === 0) {
         return {
           ok: false,
-          kind: FAIL_KINDS.PRECONDITION,
+          kind: FAIL_KINDS.MATERIAL,
           detail: `做不出箱子（木板 ${a.countOf('oak_planks') + a.countOf('birch_planks') + a.countOf('spruce_planks') + a.countOf('jungle_planks')} 张、原木 ${a.woodCount()} 个、工作台 ${a.countOf('crafting_table')}）`
         }
       }
@@ -350,8 +361,8 @@ const TASKS = [
       if (!pos) {
         return {
           ok: false,
-          kind: FAIL_KINDS.PRECONDITION,
-          detail: '没有可用的箱子（上一个任务没放出箱子）'
+          skip: true,
+          detail: '没有可用的箱子（上一个任务没放出箱子，级联跳过）'
         }
       }
       const p = { x: pos.x, y: pos.y, z: pos.z }
@@ -470,7 +481,7 @@ const TASKS = [
       if (dugDown < 3) {
         return {
           ok: false,
-          kind: FAIL_KINDS.PRECONDITION,
+          skip: true,
           detail: `造不出地下夹具：只挖下去 ${dugDown} 格（${fixture.join('；')}）`
         }
       }
@@ -524,7 +535,7 @@ const TASKS = [
       if (!undergroundBefore) {
         return {
           ok: false,
-          kind: FAIL_KINDS.PRECONDITION,
+          skip: true,
           detail: `夹具失败：${fixture.join('，')}，y=${yBefore} 仍被判为露天，无法验证`
         }
       }
@@ -576,7 +587,7 @@ function checkEnv () {
       .filter(l => /node\s+.*main\.js/.test(l) && !/grep/.test(l))
   } catch (e) {}
 
-  if (ACCOUNT === PROD_ACCOUNT) {
+  if (ACCOUNT === PROD_ACCOUNT || ACCOUNT.startsWith(PROD_ACCOUNT) && ACCOUNT.length <= PROD_ACCOUNT.length + 0) {
     console.error(`\n❌ 账号 ${ACCOUNT} 是正式 bot 的号，禁止使用。换 --account XJJ_E2E\n`)
     process.exit(2)
   }
@@ -610,6 +621,11 @@ async function main () {
   console.log('  端到端测试：他现在能做成事吗？')
   console.log('='.repeat(64))
   console.log(`账号      : ${ACCOUNT}`)
+  try {
+    const rev = execSync('git rev-parse --short HEAD', { cwd: ROOT, encoding: 'utf8' }).trim()
+    const dirty = execSync('git status --porcelain -- src main.js', { cwd: ROOT, encoding: 'utf8' }).trim()
+    console.log(`代码版本  : ${rev}${dirty ? ' ⚠️ src/main.js 有未提交改动' : ''}`)
+  } catch (e) {}
   console.log(`服务器    : ${cfg.bot.host}:${cfg.bot.port} (${cfg.bot.version})`)
   console.log(`任务      : ${list.map(t => t.name).join(' → ')}`)
   console.log(`总预算    : ${list.reduce((s, t) => s + t.budget, 0)}s（最坏情况）`)
@@ -784,55 +800,69 @@ async function main () {
       judge = { ok: null, why: 'judgeOutcome 抛错: ' + e.message }
     }
 
+    // 两个方向都要看，性质完全不同：
+    //   r.ok=true  但 judge=false -> 假成功（正式运行会记失败，但东西真做出来了）
+    //   r.ok=false 但 judge=true  -> 漏报（最危险：明明没做成，正式运行却记成功）
     const disagree = judge && judge.ok !== null && judge.ok !== r.ok
-    if (disagree && r.ok) {
-      // 脚本说成了，正式口径说没成 —— 这是假成功，必须显式标出来
-      r.kind = FAIL_KINDS.JUDGE_DISAGREE
-    }
+    const judgeMiss = disagree && !r.ok && judge.ok === true
+    const judgeFalseAlarm = disagree && r.ok && judge.ok === false
 
+    // skip = 测不了（夹具没搭起来），既不算成功也不算失败
+    const skipped = !!r.skip
     const row = {
       id: task.id,
       name: task.name,
-      ok: !!r.ok,
+      ok: skipped ? null : !!r.ok,
+      skipped,
       secs,
-      kind: r.ok ? null : (r.kind || FAIL_KINDS.UNKNOWN),
+      kind: skipped ? SKIP_KIND : (r.ok ? null : (r.kind || FAIL_KINDS.UNKNOWN)),
       detail: r.detail || '',
       judge,
-      disagree: !!disagree,
+      judgeMiss: skipped ? false : !!judgeMiss,
+      judgeFalseAlarm: skipped ? false : !!judgeFalseAlarm,
       log: taskLog
     }
     results.push(row)
 
-    const mark = r.ok ? '✅' : '❌'
-    const dis = disagree ? `  ⚠️口径分歧(${judge.why || 'judge 判失败'})` : ''
+    const mark = skipped ? '⏭️ ' : (r.ok ? '✅' : '❌')
+    let dis = ''
+    if (!skipped && judgeMiss) dis = '  🚨judge漏报(实际失败却判成功)'
+    else if (!skipped && judgeFalseAlarm) dis = `  ⚠️judge误报(${judge.why || 'judge 判失败'})`
     console.log(`${mark} ${String(secs).padStart(3)}s | ${r.detail}${dis}`)
 
     await sleep(1000)
   }
 
   // ---- 汇总 ----
-  const total = results.length
-  const ok = results.filter(r => r.ok).length
+  // 关键口径：跳过项不进分母。
+  // "开局有存货测不了从零合成"是他的问题吗？不是。混进失败率会失真。
+  const skippedList = results.filter(r => r.skipped)
+  const graded = results.filter(r => !r.skipped)
+  const total = graded.length
+  const ok = graded.filter(r => r.ok).length
   const rate = total ? Math.round(ok / total * 100) : 0
   const secsTotal = results.reduce((s, r) => s + r.secs, 0)
 
   // 失败分类统计
   const byKind = {}
-  for (const r of results) {
+  for (const r of graded) {
     if (r.ok) continue
     byKind[r.kind] = (byKind[r.kind] || 0) + 1
   }
-  const disagreeCount = results.filter(r => r.disagree).length
+  const disagreeCount = graded.filter(r => r.disagree).length
 
   console.log('\n' + '='.repeat(64))
   console.log('  结果')
   console.log('='.repeat(64))
-  console.log(`成功 ${ok} / ${total}    成功率 ${rate}%    总耗时 ${Math.round(secsTotal / 60)} 分 ${secsTotal % 60} 秒\n`)
+  console.log(`成功 ${ok} / ${total}（可评分）  成功率 ${rate}%  ` +
+    `${skippedList.length ? `跳过 ${skippedList.length} 项  ` : ''}` +
+    `总耗时 ${Math.round(secsTotal / 60)} 分 ${secsTotal % 60} 秒\n`)
 
   console.log('明细：')
   for (const r of results) {
     const t = `${String(r.secs).padStart(3)}s`
-    console.log(`  ${r.ok ? '✅' : '❌'} ${r.name.padEnd(8, '　')} ${t}  ${r.detail}`)
+    const mark = r.skipped ? '⏭️ ' : (r.ok ? '✅' : '❌')
+    console.log(`  ${mark} ${r.name.padEnd(8, '　')} ${t}  ${r.detail}`)
   }
 
   if (Object.keys(byKind).length) {
@@ -856,14 +886,27 @@ async function main () {
   }
 
   // ---- 落盘 ----
+  // 代码基线：同一份"成功率"必须能对应到某个 commit，
+  // 否则改动前后无法对比（TEAM.md 铁律 5：改前记基线）。
+  let codeRev = 'unknown'
+  let codeDirty = null
+  try {
+    codeRev = execSync('git rev-parse --short HEAD', { cwd: ROOT, encoding: 'utf8' }).trim()
+    const st = execSync('git status --porcelain -- src main.js', { cwd: ROOT, encoding: 'utf8' }).trim()
+    codeDirty = st ? st.split('\n') : []
+  } catch (e) {}
+
   const report = {
     runId,
     at: now(),
     account: ACCOUNT,
     server: `${cfg.bot.host}:${cfg.bot.port}`,
     version: cfg.bot.version,
+    codeRev,
+    codeDirty,
     durationSec: secsTotal,
     rate, ok, total,
+    skipped: skippedList.length,
     failureKinds: byKind,
     judgeDisagreements: disagreeCount,
     kicked: kicked || null,

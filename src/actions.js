@@ -901,8 +901,15 @@ class Actions {
    * @returns {Promise<string>} 镐子物品名
    */
   async ensurePickaxe (opts = {}) {
-    const budgetMs = opts.budgetMs || 120000
+    // 默认 200 秒。算过的账：
+    //   ensureWood(3) 内部最多两轮 chopTree(1)，单轮 chopTree 的 DEADLINE 是 85 秒，
+    //   所以一轮备料最坏 ~85 秒（成功则远快，实测 53~99 秒砍到）。
+    //   200 秒 = 两次完整机会 + 收尾；挖石头任务本身给 300 秒，
+    //   剩下的 100 秒留给真正的"挖 3 块石头"。
+    //   给到 240 秒以上就会把挖石头的时间吃掉，反而更差。
+    const budgetMs = opts.budgetMs || 200000
     const deadline = Date.now() + budgetMs
+    const left = () => deadline - Date.now()
 
     const pickUp = () => this.bot.inventory.items()
       .filter(i => /_pickaxe$/.test(i.name))
@@ -937,15 +944,29 @@ class Actions {
       return p ? this.countOf(p) : 0
     }
 
-    if (this.woodCount() * 4 + plankTotal() < PLANKS_NEEDED && Date.now() < deadline) {
-      if (this.isUnderground()) {
-        this.log('[tool] 在地下砍不到树，先上去')
-        try { await this.getToSurface() } catch (e) {}
-      }
+    // 备木头：反复试，直到够用或预算耗尽。
+    // chopTree 能不能砍到树跟地形强相关（实测同一位置有时 53 秒成功、
+    // 有时 380 秒都走不到），只给它一轮机会等于赌运气。
+    if (this.isUnderground()) {
+      this.log('[tool] 在地下砍不到树，先上去')
+      try { await this.getToSurface() } catch (e) {}
+    }
+    let woodRound = 0
+    // 只有剩 45 秒以上才开新一轮：一轮最坏 85 秒，开不了就别开，
+    // 否则会在超预算后还在跑，把调用方的任务预算烧穿。
+    while (this.woodCount() * 4 + plankTotal() < PLANKS_NEEDED &&
+           left() > 45000 && woodRound < 3) {
+      woodRound++
+      this.log(`[tool] 备木头第 ${woodRound} 轮（现有原木 ${this.woodCount()}、木板 ${plankTotal()}）`)
       try {
         await this.ensureWood(LOGS_NEEDED)
       } catch (e) {
         this.log('[tool] 砍树失败: ' + e.message)
+      }
+      // 这一轮没进展就短暂歇一下再试（可能刚走错方向）
+      if (this.woodCount() === 0 && woodRound < 4) {
+        try { await this.wander(10) } catch (e) {}
+        await this.ensureChunks(2500)
       }
     }
 
@@ -993,7 +1014,8 @@ class Actions {
       }
     }
 
-    throw new Error(`弄不到镐子（木板 ${plankTotal()}、木棍 ${this.countOf('stick')}、原木 ${this.woodCount()}）`)
+    throw new Error(`弄不到镐子（木板 ${plankTotal()}、木棍 ${this.countOf('stick')}、` +
+      `原木 ${this.woodCount()}，试了 ${woodRound} 轮砍树）`)
   }
 
   /**
@@ -2348,11 +2370,24 @@ class Actions {
       if (fillerCount() >= need) return true
       const t0 = Date.now()
       let round = 0
-      // 空手时挖石头一格料都不掉（实测：挖掉 granite 掉 3 个物品，全在地上没进包）。
-      // 这种情况下别硬攒 —— 攒不到还白花 30 秒，不如直接走挖台阶。
-      const hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
+
+      // 空手挖 stone/granite/andesite 一格料都不掉（实测：挖掉 granite
+      // 掉 3 个物品实体，全躺在地上，背包 0 增加）。
+      // 所以没镐又没料的时候，先想办法弄把镐 —— 有镐才有料，有料才塔升。
+      let hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
       if (!hasPick && fillerCount() === 0) {
-        this.log('[surface] 空手挖石头不掉料，跳过攒料')
+        this.log('[surface] 没镐没料，先弄把镐子')
+        try {
+          // 用现成的 ensurePickaxe（自带预算和优先级：石镐→木镐→砍树）
+          const got = await this.ensurePickaxe({ budgetMs: 120000 })
+          hasPick = !!got
+          if (hasPick) this.log(`[surface] 搞到镐子了：${got}`)
+        } catch (e) {
+          this.log('[surface] 做不出镐子：' + (e && e.message))
+        }
+      }
+      if (!hasPick && fillerCount() === 0) {
+        this.log('[surface] 还是没镐没料，跳过攒料，直接挖台阶')
         return false
       }
       while (fillerCount() < need && Date.now() - t0 < 20000 && round++ < 20) {

@@ -129,6 +129,23 @@ git remote set-url origin "https://github.com/lg5874/minecraft-AIfriend.git"
 
 **绝不把 token 写进 `.git/config` 长期保留，也绝不提交进仓库。**
 
+### 网络问题排查
+
+如果 `git push` 报 `GnuTLS recv error` 或 `Failed to connect to github.com port 443`：
+
+```bash
+# 先确认是网络问题还是 git 问题
+curl -s -o /dev/null -w "%{http_code}" https://api.github.com   # 通
+curl -s -o /dev/null -w "%{http_code}" https://github.com       # 超时 = 被挡
+
+# 解法：改用 HTTP/1.1（实测有效）
+git config --global http.version HTTP/1.1
+git config http.postBuffer 524288000
+```
+
+**实测记录**：2026-11-13 06:41，`api.github.com` 返回 200 但 `github.com` 超时，
+push 报 `GnuTLS recv error (-110)`。改 HTTP/1.1 后立刻成功。
+
 ---
 
 ## 四、还没做的
