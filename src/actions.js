@@ -8,6 +8,45 @@ const mcData = require('minecraft-data')('1.21.11')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
+/**
+ * 方块名 -> 挖掉后掉什么物品。
+ * 这是个大坑：mine('lapis_ore') 挖掉了方块，但背包里收到的是 lapis_lazuli，
+ * 所以 countOf('lapis_ore') 永远是 0，看起来像"挖到0块"。
+ */
+const BLOCK_DROPS = {
+  lapis_ore: 'lapis_lazuli',
+  coal_ore: 'coal',
+  deepslate_coal_ore: 'coal',
+  iron_ore: 'raw_iron',
+  deepslate_iron_ore: 'raw_iron',
+  copper_ore: 'raw_copper',
+  deepslate_copper_ore: 'raw_copper',
+  gold_ore: 'raw_gold',
+  deepslate_gold_ore: 'raw_gold',
+  diamond_ore: 'diamond',
+  deepslate_diamond_ore: 'diamond',
+  emerald_ore: 'emerald',
+  deepslate_emerald_ore: 'emerald',
+  redstone_ore: 'redstone',
+  deepslate_redstone_ore: 'redstone',
+  nether_quartz_ore: 'quartz',
+  nether_gold_ore: 'gold_nugget',
+  stone: 'cobblestone',
+  deepslate: 'cobbled_deepslate',
+  grass_block: 'dirt',
+  gravel: 'gravel',
+  clay: 'clay_ball',
+  // 原木就是原木
+  oak_log: 'oak_log', birch_log: 'birch_log', spruce_log: 'spruce_log',
+  jungle_log: 'jungle_log', acacia_log: 'acacia_log', dark_oak_log: 'dark_oak_log',
+  cherry_log: 'cherry_log', mangrove_log: 'mangrove_log', pale_oak_log: 'pale_oak_log'
+}
+
+/** 挖这个方块会掉什么（用于数数量） */
+function dropOf (blockName) {
+  return BLOCK_DROPS[blockName] || blockName
+}
+
 class Actions {
   constructor (bot, ctx) {
     this.bot = bot
@@ -122,43 +161,58 @@ class Actions {
     const goal = new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range)
     this.bot.pathfinder.setGoal(goal)
 
-    // 用 pathfinder 自己的到达事件，而不是自己算距离
-    let reached = false
-    const onReach = () => { reached = true }
-    this.bot.on('goal_reached', onReach)
-
     const t0 = Date.now()
     let stillSince = 0
     let lastP = this.pos().clone()
+    let lastStatus = ''
 
     try {
       while (Date.now() - t0 < timeoutMs) {
         this.check()
-        if (reached) return true
 
         const p = this.pos()
         const moved = p.distanceTo(lastP)
         lastP = p.clone()
 
-        // 到了判定：水平距离和高度都够近
+        // 1. 自己算距离：够近就算到了
         const dxz = Math.hypot(p.x - x, p.z - z)
-        if (dxz <= range + 1.5 && Math.abs(p.y - y) <= Math.max(3, range + 1)) {
+        if (dxz <= range + 2 && Math.abs(p.y - y) <= Math.max(4, range + 2)) {
           return true
         }
 
-        // 连续 8 秒没挪窝才算卡住（原来是 6 秒，太急）
+        // 2. pathfinder 说到了，就是到了（别等 goal_reached 事件，可能已错过）
+        try {
+          const pf = this.bot.pathfinder
+          if (pf.isMoving && !pf.isMoving()) {
+            // 没在走：可能到了，也可能走不通
+            // 再等一小会儿确认（用 500ms）
+            await sleep(200)
+            const p2 = this.pos()
+            if (p2.distanceTo(p) < 0.15) {
+              // 真的停住了
+              const d2 = Math.hypot(p2.x - x, p2.z - z)
+              if (d2 <= range + 3) return true       // 差不多到了
+              // 没到但也不走了 -> 走不通
+              this.log(`[goto] 走不通了（差 ${d2.toFixed(1)} 格）`)
+              return false
+            }
+            continue
+          }
+        } catch (e) {}
+
+        // 3. 卡住判定：连续 6 秒没挪窝
         if (moved < 0.1) stillSince += 180
         else stillSince = 0
-        if (stillSince > 8000) {
-          this.log('[goto] 卡住了，放弃')
+        if (stillSince > 6000) {
+          this.log(`[goto] 卡住（${stillSince / 1000}秒没动，差 ${Math.hypot(p.x - x, p.z - z).toFixed(1)} 格）`)
           return false
         }
 
         await sleep(180)
       }
+      this.log(`[goto] 超时（${Math.round(timeoutMs / 1000)}秒）`)
       return false
     } finally {
-      this.bot.off('goal_reached', onReach)
       try { this.bot.pathfinder.setGoal(null) } catch (e) {}
       for (const k of ['forward', 'back', 'left', 'right']) {
         try { this.bot.setControlState(k, false) } catch (e) {}
@@ -285,6 +339,32 @@ class Actions {
     return this.bot.findBlock({ matching: def.id, maxDistance: maxDist })
   }
 
+  /**
+   * 找最近的**能走到跟前**的某种方块。
+   * findBlock 只看距离，不管够不够得着；挖不到的东西等于没有。
+   */
+  findReachableBlock (name, maxDist = 32) {
+    const def = mcData.blocksByName[name]
+    if (!def) return null
+    const p = this.pos()
+    // 收集附近所有这个方块，按距离排序，挨个试
+    const cands = []
+    const r = Math.min(maxDist, 32)
+    for (let dx = -r; dx <= r; dx += 1) {
+      for (let dy = -8; dy <= 8; dy += 1) {
+        for (let dz = -r; dz <= r; dz += 1) {
+          const b = this.bot.blockAt(p.offset(dx, dy, dz))
+          if (!b || b.name !== name) continue
+          cands.push(b)
+        }
+      }
+    }
+    if (!cands.length) return null
+    cands.sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
+    // 返回最近的（能不能走到由 digAt 判断）
+    return cands[0]
+  }
+
   // 多个名字一起找（原木有八个品种）
   findAny (names, maxDist = 32) {
     for (const n of names) {
@@ -341,15 +421,35 @@ class Actions {
       const nb = this.bot.blockAt(block.position.offset(d[0], d[1], d[2]))
       if (nb && nb.name === 'lava') return false
     }
-    const p = this.pos()
-    const d = block.position.distanceTo(p)
-    if (d > 5) {
-      await this.goto(block.position.x, block.position.y, block.position.z, 2, 20000)
+    // ===== 关键：必须走到跟前才能挖 =====
+    // 距离超过约 4.5 格时，客户端以为挖到了，服务端直接忽略，不掉东西。
+    // 这就是"挖了但背包没涨"的真正原因。
+    const REACH = 4.2
+    let d = block.position.distanceTo(this.pos())
+    if (d > REACH) {
+      // 走过去，并且检查是不是真走到了
+      const ok = await this.goto(
+        block.position.x, block.position.y, block.position.z,
+        Math.max(1, Math.floor(REACH) - 2), 25000
+      )
+      d = block.position.distanceTo(this.pos())
+      if (!ok || d > REACH + 0.8) {
+        // 到不了就别挖 —— 挖了也是白挖
+        this.log(`[dig] 够不到（差 ${d.toFixed(1)} 格），不挖了`)
+        return false
+      }
     }
+
     // 走过去之后方块可能已经变了，再确认一次
     const again = this.bot.blockAt(block.position)
     if (!again || again.name === 'air' || again.name === 'cave_air') return false
     block = again
+
+    // 再确认一次距离（走的过程中可能被推开）
+    if (block.position.distanceTo(this.pos()) > REACH + 0.8) {
+      this.log('[dig] 距离又变远了，不挖')
+      return false
+    }
 
     // 选对工具
     await this.bestToolFor(block)
@@ -399,7 +499,9 @@ class Actions {
   // 挖若干块某种方块
   async mine (blockName, count = 1, maxDist = 32) {
     await this.ensureChunks()
-    const startCount = this.countOf(blockName)   // 挖之前的数量
+    // 关键：数的是掉落物，不是方块名
+    const itemName = dropOf(blockName)
+    const startCount = this.countOf(itemName)
     let got = 0
     let emptyTries = 0
     let guard = 0
@@ -444,7 +546,10 @@ class Actions {
       }
       await sleep(120)
     }
-    return got
+    // 返回真实增加的数量（不是"挖了几次"）
+    const gained = this.countOf(itemName) - startCount
+    if (gained > 0) return gained
+    return got   // 万一是掉别的东西（比如精准采集），返回挖的次数
   }
 
   // 砍树：找原木，挖掉整棵
@@ -1092,7 +1197,7 @@ class Actions {
   // 挖圆石：直接往下挖（最快，不绕路）
   async digStone (count = 3) {
     await this.ensureChunks()
-    const got = () => this.countOf('cobblestone') + this.countOf('stone') + this.countOf('cobbled_deepslate')
+    const got = () => this.countOf('cobblestone') + this.countOf('cobbled_deepslate')
     if (got() >= count) return got()
 
     // 没镐挖石头不掉东西，先弄一把
@@ -1949,4 +2054,4 @@ class Actions {
   }
 }
 
-module.exports = { Actions, sleep }
+module.exports = { Actions, sleep, BLOCK_DROPS, dropOf }

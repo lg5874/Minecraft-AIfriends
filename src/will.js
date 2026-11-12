@@ -18,6 +18,7 @@ class Will {
     this.ctx = ctx
     this.current = null      // { text, since, done }
     this.lastThink = 0
+    this.fallbackIndex = 0   // 兜底意愿的轮换下标（必须初始化，否则 undefined % 4 = NaN）
     this.recent = []         // 最近做过的事，避免车轱辘话
     this.lastSummary = null
     this.failStreak = {}     // 同类事情失败次数
@@ -87,8 +88,9 @@ ${this.mem.lastSummary() ? '上次下线前在：' + this.mem.lastSummary().text
 
     if (!text) {
       // 模型这次没给出想法：挑一个最基础的，并按顺序轮换（不是随机）
-      text = FALLBACK_WILLS[this.fallbackIndex % FALLBACK_WILLS.length]
-      this.fallbackIndex = (this.fallbackIndex || 0) + 1
+      const idx = (this.fallbackIndex || 0) % FALLBACK_WILLS.length
+      text = FALLBACK_WILLS[idx]
+      this.fallbackIndex = idx + 1
     }
 
     // 这块地方资源太差？去别处看看
@@ -123,6 +125,12 @@ ${this.mem.lastSummary() ? '上次下线前在：' + this.mem.lastSummary().text
         const alt = (r.text || '').split('\n')[0].trim().replace(/^["「『]|["」』]$/g, '')
         if (alt && alt.length <= 40 && !recentSig.includes(sig(alt))) text = alt
       } catch (e) {}
+    }
+
+    // 最后保险：绝对不能让 text 是空的
+    if (!text || typeof text !== 'string' || !text.trim()) {
+      text = FALLBACK_WILLS[0]
+      this.ctx.log('[will] 兜底：' + text)
     }
 
     this.current = { text, since: now, done: false }

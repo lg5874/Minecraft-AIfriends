@@ -197,7 +197,10 @@ return '砍了树但没木头'
 其他：dirt / grass_block / sand / gravel / water / lava / crafting_table / furnace / chest
 
 ### 挖
-- actions.mine(blockName, count, maxDist=32)  挖若干个，返回实际挖到几个
+- actions.mine(blockName, count, maxDist=32)  挖若干个，返回**背包里实际增加的数量**
+  注意：矿石挖掉后掉的不一定是同名物品！
+  lapis_ore → lapis_lazuli，iron_ore → raw_iron，stone → cobblestone
+  所以挖完要查 dropOf 的名字，不是方块名。mine() 内部已经处理了，直接看返回值就行。
 - actions.chopTree(count)  砍树，返回砍了几棵
 - actions.digAt(block)  挖指定方块
 
