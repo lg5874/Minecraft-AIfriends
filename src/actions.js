@@ -2715,15 +2715,37 @@ class Actions {
     return cands[0]
   }
 
+  /**
+   * 手上最多的是哪种木板。
+   *
+   * 老实现只认 9 种 `_planks`，漏了 crimson/warped/bamboo 三种，
+   * 而且没有木板时返回 null —— 上层（craftSmart 的 myPlankKind）看到 null
+   * 就以为"没木头可用"，直接跳过配方筛选，去凑樱桃木板这种弄不到的材料。
+   *
+   * 现在：有木板返回数量最多的那种；一块木板都没有但有原木时，
+   * 返回"这个原木能做出来的木板"（只是名字，countOf 仍是 0），
+   * 让上层知道"该往哪个方向备料"。
+   */
   bestPlank () {
     const planks = ['oak_planks', 'birch_planks', 'spruce_planks', 'jungle_planks',
-      'acacia_planks', 'dark_oak_planks', 'cherry_planks', 'mangrove_planks', 'pale_oak_planks']
+      'acacia_planks', 'dark_oak_planks', 'cherry_planks', 'mangrove_planks',
+      'pale_oak_planks', 'crimson_planks', 'warped_planks', 'bamboo_planks']
     let best = null; let n = 0
     for (const p of planks) {
       const c = this.countOf(p)
       if (c > n) { n = c; best = p }
     }
     return best
+  }
+
+  /** 木板总数（不分种类） */
+  plankTotal () {
+    const planks = ['oak_planks', 'birch_planks', 'spruce_planks', 'jungle_planks',
+      'acacia_planks', 'dark_oak_planks', 'cherry_planks', 'mangrove_planks',
+      'pale_oak_planks', 'crimson_planks', 'warped_planks', 'bamboo_planks']
+    let n = 0
+    for (const p of planks) n += this.countOf(p)
+    return n
   }
 
   // 这个东西我有没有办法弄到
