@@ -290,6 +290,22 @@ class Actions {
 
     // 目标跟自己不在同一层：先解决高度差，再水平走
     if (dy > 2) {
+      // ===== 垂直预判：明显够不到就别试了 =====
+      //
+      // gotoVertical 一次能磨 40 秒（guard<40 × 1 秒）。实测日志里
+      // 「[goto] 高度到不了」连着刷 6 次，每次白耗 20 秒以上，
+      // 整轮任务就烧在这上面了（目标 y=57 现在 y=63，那种是地下矿）。
+      //
+      // 判据：垂直差 > 8 格，且这一路往上/往下没有可挖的方块、也没有水 ——
+      // 那就不是"走两步能解决"的高度差，直接放弃，让调用方换目标。
+      // 往下走挖楼梯是可以的（挖石头），所以只对"往上"和"全是基岩"收紧。
+      if (dy > 8) {
+        const canFix = this._canCloseGap(Math.round(y), Math.round(p0.y))
+        if (!canFix) {
+          this.log(`[goto] 高度差 ${Math.round(dy)} 格，没路可挖，不试了（目标 y=${Math.round(y)}，现在 y=${Math.round(p0.y)}）`)
+          return false
+        }
+      }
       const reached = await this.gotoVertical(y, timeoutMs)
       if (!reached) {
         this.log(`[goto] 高度到不了（目标 y=${Math.round(y)}，现在 y=${Math.round(this.pos().y)}）`)
@@ -360,6 +376,53 @@ class Actions {
         try { this.bot.setControlState(k, false) } catch (e) {}
       }
     }
+  }
+
+  /**
+   * 高度差这么大，我有没有办法把它补上？
+   *
+   * 只回答"有没有可行的办法"，不保证成功率 —— 目的是在 gotoVertical
+   * 白磨 20~40 秒之前先判一次。
+   *
+   * 规则：
+   *   · 往下：挖竖井/楼梯总能下去，只要路上不是基岩、不是岩浆/水
+   *   · 往上：得有可挖的方块（挖出台阶），或者本来就有坡道（附近有可站的落脚点）
+   *   · 路上有岩浆/水 -> 不挖（会把自己灌了）
+   *
+   * @returns {boolean}
+   */
+  _canCloseGap (targetY, curY) {
+    const bot = this.bot
+    const p = this.pos()
+    const up = targetY > curY
+    const gap = Math.abs(targetY - curY)
+
+    // 最多扫这么多格；差得再远（比如地表 y=63 要下到 y=16）也只看这几十格
+    const span = Math.min(gap, 40)
+
+    if (!up) {
+      // ---- 往下：看这一列能不能挖 ----
+      for (let i = 1; i <= span; i++) {
+        const b = bot.blockAt(p.offset(0, -i, 0))
+        if (!b) return false                        // 看不见，别猜
+        if (/bedrock/.test(b.name)) return false    // 撞到基岩层，到底了
+        if (/lava|water/.test(b.name)) return false // 挖开会流过来
+      }
+      return true
+    }
+
+    // ---- 往上：得有能挖穿的方块 ----
+    let solid = 0
+    for (let i = 1; i <= span; i++) {
+      const b = bot.blockAt(p.offset(0, i, 0))
+      if (!b) return false
+      if (/lava|water/.test(b.name)) return false
+      if (b.boundingBox === 'block') solid++
+    }
+    // 全是实心：挖台阶上去是完全可行的（地表往地下矿走正是这种）
+    // 全是空气：那本来就是通的，pathfinder 能飞/搭，也算可行
+    // 只有"大部分实心但夹着岩浆/水"才是真无解，上面已经挡掉了
+    return solid >= 0
   }
 
   /**
@@ -764,21 +827,60 @@ class Actions {
    */
   checkTools () {
     const items = this.bot.inventory.items()
-    const has = (kind) => items.some(i => i.name.includes(kind))
+    const picks = items.filter(i => /_pickaxe$/.test(i.name))
+      .sort((a, b) => this._toolRank(b.name) - this._toolRank(a.name))
     const missing = []
-    if (!has('pickaxe')) missing.push('pickaxe')
-    return { has: missing.length === 0, missing }
+    if (!picks.length) missing.push('pickaxe')
+
+    // 顺带把"能不能现场造一把"的材料情况也报出来。
+    // 之前只回 {has:false}，上层（测试/决策）看到 false 就以为没救，
+    // 直接跳过挖石头 —— 其实手上 2 个原木就够做木镐了。
+    const planks = this.bestPlank()
+    const plankCount = planks ? this.countOf(planks) : 0
+    const sticks = this.countOf('stick')
+    const logs = this.woodCount()
+    // 木镐 = 3 木板 + 2 木棍；木棍 = 2 木板；工作台 = 4 木板
+    // 所以从零开始一共要 9 木板 = 3 原木（工作台可以反复用）
+    const canCraft = !!picks.length || (plankCount >= 5 && sticks >= 2) ||
+      (logs > 0) || (this.countOf('cobblestone') >= 3 && sticks >= 2)
+
+    return {
+      has: picks.length > 0,
+      missing,
+      pickaxe: picks.length ? picks[0].name : null,
+      planks: plankCount,
+      sticks,
+      logs,
+      canCraft
+    }
   }
 
   /**
    * 想办法弄一把镐子。
-   * 优先级：背包有现成的 → 有原木就做 → 有木板就做 → 什么都没有就砍树
+   * 优先级：背包有现成的 → 圆石+木棍做石镐 → 木板/原木做木镐 → 砍树再做
+   *
+   * 数量账（之前算错，导致"有木头也做不出镐"）：
+   *   木镐 = 3 木板 + 2 木棍
+   *   木棍 = 2 木板 → 4 木棍
+   *   工作台 = 4 木板（做木镐必须有工作台，3x3 配方）
+   *   合计 = 3 + 2 + 4 = 9 木板
+   *   1 原木 = 4 木板 → 至少 3 个原木
+   * 老代码只 anyPlanks(4)，做到一半就没木板了，然后 craftSmart 在里面
+   * 反复"缺材料 → 补料 → 又缺"，白烧时间。
+   *
+   * @param {{budgetMs?:number}} opts
+   * @returns {Promise<string>} 镐子物品名
    */
-  async ensurePickaxe () {
-    const items = this.bot.inventory.items()
-    // 1. 已经有
-    const have = items.filter(i => /_pickaxe$/.test(i.name))
+  async ensurePickaxe (opts = {}) {
+    const budgetMs = opts.budgetMs || 120000
+    const deadline = Date.now() + budgetMs
+
+    const pickUp = () => this.bot.inventory.items()
+      .filter(i => /_pickaxe$/.test(i.name))
       .sort((a, b) => this._toolRank(b.name) - this._toolRank(a.name))[0]
+
+    // 1. 已经有
+    let have = pickUp()
     if (have) {
       try { await this.bot.equip(have, 'hand') } catch (e) {}
       return have.name
@@ -786,54 +888,83 @@ class Actions {
 
     this.log('[tool] 没有镐子，得做一把')
 
-    // 2. 有原木 -> 做木板 -> 做木棍 -> 做镐
-    if (this.woodCount() > 0) {
+    // 2. 有圆石+木棍：石镐最省（不用木板），优先做
+    if (this.countOf('cobblestone') >= 3 && this.countOf('stick') >= 2) {
       try {
-        await this.anyPlanks(4)
-        await this.craftSmart('stick', 2)
+        await this.craftSmart('stone_pickaxe', 1)
+        have = pickUp()
+        if (have) { await this.bot.equip(have, 'hand'); this.log('[tool] 做了把石镐'); return have.name }
+      } catch (e) {
+        this.log('[tool] 石镐没做成: ' + e.message)
+      }
+    }
+
+    // 3. 备料：原木 -> 9 木板（3 原木），不够就砍树
+    const PLANKS_NEEDED = 12      // 9 够用，多备 3 块当余量
+    const LOGS_NEEDED = Math.ceil(PLANKS_NEEDED / 4)
+
+    const plankTotal = () => {
+      const p = this.bestPlank()
+      return p ? this.countOf(p) : 0
+    }
+
+    if (this.woodCount() * 4 + plankTotal() < PLANKS_NEEDED && Date.now() < deadline) {
+      if (this.isUnderground()) {
+        this.log('[tool] 在地下砍不到树，先上去')
+        try { await this.getToSurface() } catch (e) {}
+      }
+      try {
+        await this.ensureWood(LOGS_NEEDED)
+      } catch (e) {
+        this.log('[tool] 砍树失败: ' + e.message)
+      }
+    }
+
+    const needLogs = Math.max(0, Math.ceil((PLANKS_NEEDED - plankTotal()) / 4))
+    if (this.woodCount() < needLogs) {
+      this.log(`[tool] 原木不够（${this.woodCount()}/${needLogs}）`)
+    }
+
+    // 4. 原木 -> 木板，逐步做，每步核对增量
+    try { await this.anyPlanks(PLANKS_NEEDED) } catch (e) {
+      this.log('[tool] 做木板失败: ' + e.message)
+    }
+    this.log(`[tool] 木板 ${plankTotal()} / 木棍 ${this.countOf('stick')} / 原木 ${this.woodCount()}`)
+
+    // 5. 木板 -> 木棍（2 木板 = 4 木棍，够 2 个镐柄）
+    if (this.countOf('stick') < 2 && plankTotal() >= 2) {
+      try { await this.craftSmart('stick', 2) } catch (e) {
+        this.log('[tool] 做木棍失败: ' + e.message)
+      }
+    }
+
+    // 6. 木棍 -> 木镐（craftSmart 会自己处理工作台）
+    if (plankTotal() >= 3 && this.countOf('stick') >= 2) {
+      try {
         await this.craftSmart('wooden_pickaxe', 1)
-        const p = this.item('wooden_pickaxe')
-        if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 做了把木镐'); return 'wooden_pickaxe' }
+        have = pickUp()
+        if (have) { await this.bot.equip(have, 'hand'); this.log('[tool] 做了把木镐'); return have.name }
       } catch (e) {
         this.log('[tool] 做木镐失败: ' + e.message)
       }
     }
 
-    // 3. 有木板 -> 直接做木棍
-    const plank = this.bestPlank()
-    if (plank && this.countOf(plank) >= 3) {
+    // 7. 还是不行：再补一轮木头，最后再试一次（只在预算内）
+    if (Date.now() < deadline && this.woodCount() === 0) {
+      this.log('[tool] 再补一轮原木')
       try {
+        await this.ensureWood(LOGS_NEEDED)
+        await this.anyPlanks(PLANKS_NEEDED)
         await this.craftSmart('stick', 2)
         await this.craftSmart('wooden_pickaxe', 1)
-        const p = this.item('wooden_pickaxe')
-        if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 用木板做了把木镐'); return 'wooden_pickaxe' }
-      } catch (e) {}
+        have = pickUp()
+        if (have) { await this.bot.equip(have, 'hand'); this.log('[tool] 补料后做成了木镐'); return have.name }
+      } catch (e) {
+        this.log('[tool] 补料后还是失败: ' + e.message)
+      }
     }
 
-    // 4. 有圆石+木棍 -> 做石镐
-    if (this.countOf('cobblestone') >= 3 && this.countOf('stick') >= 2) {
-      try {
-        await this.craftSmart('stone_pickaxe', 1)
-        const p = this.item('stone_pickaxe')
-        if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 做了把石镐'); return 'stone_pickaxe' }
-      } catch (e) {}
-    }
-
-    // 5. 什么都没有 -> 得去砍树
-    this.log('[tool] 没有材料，得先砍树')
-    try {
-      if (this.isUnderground()) await this.getToSurface()
-      await this.ensureWood(3)
-      await this.anyPlanks(4)
-      await this.craftSmart('stick', 2)
-      await this.craftSmart('wooden_pickaxe', 1)
-      const p = this.item('wooden_pickaxe')
-      if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 砍树后做了把木镐'); return 'wooden_pickaxe' }
-    } catch (e) {
-      this.log('[tool] 还是弄不到镐子: ' + e.message)
-    }
-
-    throw new Error('弄不到镐子（没原木没木板没木棍）')
+    throw new Error(`弄不到镐子（木板 ${plankTotal()}、木棍 ${this.countOf('stick')}、原木 ${this.woodCount()}）`)
   }
 
   /**
@@ -914,9 +1045,22 @@ class Actions {
       // 结果：目标在封闭矿洞里 -> goto 失败 -> digAt 报"够不到" -> 试8个放弃。
       // 日志里 576 次"走不通"和 575 次"够不到"一一对应，就是这么来的。
       //
-      // 现在：先按距离排序，然后逐个检查是否真的能挖到（视线/相邻空位），
+      // 现在：先按【垂直加权距离】排序，然后逐个检查是否真的能挖到，
       // 挑第一个可达的。全不可达就换地方，不再硬试。
-      cands.sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
+      //
+      // 为什么垂直要加权：3D 欧氏距离把"y 差 10 格"和"水平差 10 格"当等价，
+      // 但实际难度天差地别 —— 水平 10 格走过去几秒，y 差 10 格要挖楼梯/搭柱子。
+      // 实测（目标「攒够垫脚的石头」）：他一直在挑 andesite，
+      // 那些生成在 y≈50-57，他在 y=63 地表，
+      // 日志里 [goto] 高度到不了（目标 y=57，现在 y=63）连着刷，
+      // [mine] 172 个 andesite 都够不到。
+      // 权重 4 是经验值：y 差 1 格 ≈ 水平 4 格（爬一格要挖/垫，够走四步）。
+      const vScore = (c) => {
+        const dxz = Math.hypot(c.position.x - p.x, c.position.z - p.z)
+        const dy = Math.abs(c.position.y - p.y)
+        return dxz + dy * 4
+      }
+      cands.sort((a, b) => vScore(a) - vScore(b))
 
       // ===== 可达性预筛 =====
       // 踩过的坑：只检查"周围有没有空气"是没用的 —— 石头里的矿周围本来就有空气
@@ -1873,17 +2017,20 @@ class Actions {
         if (!drops.length) return
         for (const d of drops) {
           try {
+            // 站在掉落物正上方就够了，别去追它的精确 y
+            // （掉落物可能卡在半空/方块里，追 y 会把寻路搞崩）
             bot.pathfinder.setGoal(new goals.GoalBlock(
-              Math.floor(d.position.x), Math.floor(d.position.y), Math.floor(d.position.z)))
-            for (let i = 0; i < 6; i++) {
-              await sleep(120)
-              const e2 = bot.entities[d.id]
-              if (!e2) break
+              Math.floor(d.position.x), Math.floor(p.y), Math.floor(d.position.z)))
+            for (let i = 0; i < 8; i++) {
+              await sleep(110)
+              if (!bot.entities[d.id]) break
+              // 已经贴上了就别再等，自动吸附会处理
+              if (d.position.distanceTo(this.pos()) < 1.2) break
             }
           } catch (e) {}
         }
         try { bot.pathfinder.setGoal(null) } catch (e) {}
-        await sleep(150)
+        await sleep(120)
       } catch (e) {}
     }
 
@@ -2121,23 +2268,51 @@ class Actions {
      *
      * 做法：原地往下挖几格（挖出来的东西自己就进包），够数就停。
      */
+    /**
+     * 这块空手挖会不会掉东西？
+     * stone 系（stone/deepslate/矿石/andesite 等）必须用镐，
+     * 空手挖掉只是"方块消失了"，不掉任何物品 —— 实测确认。
+     */
+    const hardBlockNoTool = (blk) => {
+      const hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
+      if (hasPick) return false
+      return /stone|deepslate|andesite|diorite|granite|tuff|calcite|_ore$|obsidian|basalt|blackstone/.test(blk.name)
+    }
+
     const stockFiller = async (need = 12) => {
       if (fillerCount() >= need) return true
       const t0 = Date.now()
       let round = 0
-      while (fillerCount() < need && Date.now() - t0 < 30000 && round++ < 20) {
+      // 空手时挖石头一格料都不掉（实测：挖掉 granite 掉 3 个物品，全在地上没进包）。
+      // 这种情况下别硬攒 —— 攒不到还白花 30 秒，不如直接走挖台阶。
+      const hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
+      if (!hasPick && fillerCount() === 0) {
+        this.log('[surface] 空手挖石头不掉料，跳过攒料')
+        return false
+      }
+      while (fillerCount() < need && Date.now() - t0 < 20000 && round++ < 20) {
         const p = this.pos()
 
-        // 优先挖头顶的石头（挖完正好给自己腾出上升空间，一举两得）。
+        // 优先挖头顶的方块（挖完正好给自己腾出上升空间，一举两得）。
         // 别挖脚下：挖掉脚下人就掉下去了，位置变了还得重新判断。
         const fs = firstSolidAbove(p, 6)
         if (fs > 0) {
           const before = fillerCount()
-          await digOne(p.offset(0, fs, 0))
-          await grabDrops(4)
+          const v = p.offset(0, fs, 0)
+          // 空手挖 stone 只掉"挖了但没进包"的结果 —— 必须跳过硬方块，
+          // 否则攒料会白转一圈（实测：石头挖掉 3 个掉落物全在原地没进包）。
+          const blk = bot.blockAt(v)
+          if (blk && hardBlockNoTool(blk)) {
+            // 这格挖了也不会有料，但挖掉仍然能腾空间，那就挖但不算失败
+            await digOne(v)
+            await sleep(180)
+            if (fillerCount() <= before && round > 6) break
+            continue
+          }
+          await digOne(v)
           await sleep(200)
-          // 一块都没多出来（空手挖石头不掉东西之类），别再耗
-          if (fillerCount() <= before && round > 3) break
+          // 连续挖两块都没多出料，说明这地形挖不出东西，别再耗
+          if (fillerCount() <= before && round > 2) break
           continue
         }
 
