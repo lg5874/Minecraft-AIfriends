@@ -1899,10 +1899,18 @@ class Actions {
     const p = bot.entity.position
 
     // 头顶 2 格就被挡 -> 肯定在洞里
+    //
+    // 但树叶/原木要排除：站在树底下（尤其丛林/深色橡木那种低垂树冠）
+    // 头顶 2 格就是树叶，这跟"在洞里"完全是两回事。
+    // 实测：站在 y=63 地表的一棵橡树下，被判成"在地下"，
+    // 于是 chopTree 先喊"[chop] 在地下，先回地面"，
+    // getToSurface 挖了半天什么都没挖（本来就在地面），
+    // 最后打出一行假成功"[surface] 出来了！y=63（上升 0 格）"。
+    const isCover = (b) => !!(b && b.boundingBox === 'block' && !/leaves|log/.test(b.name))
     const near = bot.blockAt(p.offset(0, 2, 0))
     const near2 = bot.blockAt(p.offset(0, 3, 0))
-    if (near && near.boundingBox === 'block') return true
-    if (near2 && near2.boundingBox === 'block') return true
+    if (isCover(near)) return true
+    if (isCover(near2)) return true
 
     // 往上找第一个遮挡。
     //
@@ -3050,6 +3058,25 @@ class Actions {
    *
    * 现在：一次一个原木地做，每做一次核对增量，做不动就换下一种原木。
    */
+  /**
+   * 原木 -> 木板，保证手上至少 n 张（不分种类）。
+   *
+   * 之前的三处硬伤，实测「放箱子」就是死在这：
+   *
+   *  1. **只做"刚好够"的量**：`use = min(logs, ceil(lack/4))`。
+   *     有 3 个原木、差 6 张木板时只肯用 2 个原木做 8 张，
+   *     而箱子要 8 张同色木板 —— 差一张就整条链断。
+   *  2. **一次 craft 多份**：`safeCraft(rs[0], use)` 里 use 是"次数"，
+   *     但 recipesFor 的 minResultCount 是"产出数"，两个概念混用，
+   *     中途材料断了整批失败，已经做出来的那部分也不认账。
+   *  3. **合成报成功但背包没变**没人核对，上层以为有木板了。
+   *
+   * 现在：按原木存量从多到少，一种一种全部转成木板，每做一次核对增量。
+   * 原木在早期只有"做木板"一个用途（木板还能反手做木棍/工作台），
+   * 所以多转化没有损失，反而让"8 张同色木板"这类配方凑得齐。
+   *
+   * @returns {Promise<number>} 完成后手上的木板总数
+   */
   async anyPlanks (n = 4) {
     const pairs = [
       ['oak_log', 'oak_planks'], ['birch_log', 'birch_planks'], ['spruce_log', 'spruce_planks'],
@@ -3057,43 +3084,66 @@ class Actions {
       ['cherry_log', 'cherry_planks'], ['mangrove_log', 'mangrove_planks'], ['pale_oak_log', 'pale_oak_planks'],
       ['crimson_stem', 'crimson_planks'], ['warped_stem', 'warped_planks'], ['bamboo_block', 'bamboo_planks']
     ]
-    const total = () => pairs.reduce((s, [, p]) => s + this.countOf(p), 0)
+    const total = () => this.plankTotal()
 
-    if (total() >= n) return total()
+    // 已经够了、而且手上没原木：直接返回（别为了"多备"去空转）
+    if (total() >= n && this.woodCount() === 0) return total()
 
-    for (const [l, p] of pairs) {
-      if (total() >= n) break
-      let logs = this.countOf(l)
-      if (logs <= 0) continue
+    // 原木按存量排序：箱子/工作台都要求"同一种木板 8/4 张"，
+    // 先把最多的那种全做成木板，才能凑够单一花色。
+    const stock = pairs
+      .map(([l, p]) => ({ l, p, have: this.countOf(l) }))
+      .filter(x => x.have > 0)
+      .sort((a, b) => b.have - a.have)
 
-      const id = this.itemId(p)
-      // 1 原木 = 4 木板，算出还差几个原木就够
-      const lack = n - total()
-      const use = Math.min(logs, Math.max(1, Math.ceil(lack / 4)))
+    if (!stock.length) {
+      if (total() < n) this.log(`[planks] 没有原木，只有 ${total()}/${n} 张木板`)
+      return total()
+    }
 
-      let rs = null
-      try { rs = this.bot.recipesFor(id, null, use, null) } catch (e) { rs = null }
-      if (!rs || !rs.length) {
-        // 合成格没同步：等一下重取
-        await sleep(200)
-        try { rs = this.bot.recipesFor(id, null, use, null) } catch (e) { rs = null }
+    // 目标：至少 n 张，并且尽量留 4 张余量（木棍/工作台/备用镐）
+    const target = n + 4
+
+    for (const { l, p } of stock) {
+      let id
+      try { id = this.itemId(p) } catch (e) { continue }
+
+      let made = 0
+      // 逐次合成：每次只做一个原木，做完核对背包
+      while (this.countOf(l) > 0 && total() < target) {
+        let rs = null
+        try { rs = this.bot.recipesFor(id, null, 1, null) } catch (e) { rs = null }
+        if (!rs || !rs.length) {
+          // 合成格没同步：等一下重取一次
+          await sleep(180)
+          try { rs = this.bot.recipesFor(id, null, 1, null) } catch (e) { rs = null }
+        }
+        if (!rs || !rs.length) {
+          this.log(`[planks] 取不到 ${p} 配方（${l} 剩 ${this.countOf(l)}）`)
+          break
+        }
+
+        const before = this.countOf(p)
+        try {
+          await this.safeCraft(rs[0], 1, null)
+        } catch (e) {
+          this.log(`[planks] ${p} 合成失败: ${e.message}`)
+          break
+        }
+        await sleep(60)
+        const gained = this.countOf(p) - before
+        if (gained <= 0) {
+          // 报成功但背包没变：别再空转
+          this.log(`[planks] ${p} 报成功但背包没变，停手`)
+          break
+        }
+        made += gained
       }
-      if (!rs || !rs.length) {
-        this.log(`[planks] 取不到 ${p} 配方（有 ${logs} 个 ${l}）`)
-        continue
-      }
-
-      try {
-        await this.safeCraft(rs[0], use, null)
-        this.log(`[planks] ${l} x${use} -> ${p}，现有 ${this.countOf(p)}`)
-      } catch (e) {
-        this.log(`[planks] ${p} 合成失败: ${e.message}`)
-        continue
-      }
+      if (made) this.log(`[planks] ${l} -> ${p} x${made}，总木板 ${total()}`)
     }
 
     const got = total()
-    if (got < n) this.log(`[planks] 只做出 ${got}/${n} 木板（原木 ${this.woodCount()} 个）`)
+    if (got < n) this.log(`[planks] 只做出 ${got}/${n} 木板（原木剩 ${this.woodCount()} 个）`)
     return got
   }
 
