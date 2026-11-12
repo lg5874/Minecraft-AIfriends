@@ -1831,7 +1831,21 @@ class Actions {
 
 
   // 保证身边有工作台
-  async ensureTable () {
+  /**
+   * 保证身边有工作台。
+   *
+   * 关键：做工作台要吃掉 4 张木板。调用方（比如 craftSmart('chest')）
+   * 刚刚按配方把木板备够了，ensureTable 一来就抽走 4 张 ——
+   * 配方立刻从"够"变成"不够"，craftOnce 报 missing ingredient。
+   * 实测「放箱子」62% 的失败就是这么来的：
+   *   8 张 oak_planks 备好 -> 做工作台用掉 4 张 -> 剩 4 张，箱子要 8 张 -> 失败。
+   *
+   * 所以这里只在**不够做桌子**时才去动木板；够的话优先：
+   *   附近的台子 -> 背包里的台子 -> 用"额外的"原木现做一个（不动调用方的木板）
+   *
+   * @param {number} reservePlanks 调用方还要留多少张木板（默认 0）
+   */
+  async ensureTable (reservePlanks = 0) {
     // 1. 附近已经有了
     const near = this.findBlock('crafting_table', 10)
     if (near) return near
@@ -1853,20 +1867,23 @@ class Actions {
     // 3. 造一个：只要 4 块木板，不需要工作台
     const tableId = this.itemId('crafting_table')
     for (let attempt = 0; attempt < 3; attempt++) {
-      // 木板够不够
       let plankName = this.bestPlank()
-      if (!plankName || this.countOf(plankName) < 4) {
-        // 用原木做木板
+      const plankCount = plankName ? this.countOf(plankName) : 0
+
+      // 木板不够"桌子 + 调用方预留"：先补
+      if (plankCount < 4 + reservePlanks) {
         if (this.woodCount() > 0) {
-          try { await this.anyPlanks(8) } catch (e) {}
+          try { await this.anyPlanks(4 + reservePlanks + 4) } catch (e) {}
         } else {
-          try { await this.ensureWood(2); await this.anyPlanks(8) } catch (e) {}
+          try { await this.ensureWood(2); await this.anyPlanks(4 + reservePlanks + 4) } catch (e) {}
         }
         plankName = this.bestPlank()
       }
-      if (!plankName || this.countOf(plankName) < 4) {
-        this.log('[table] 木板不够（' + (plankName ? this.countOf(plankName) : 0) + '/4）')
-        await sleep(500)
+
+      const nowCount = plankName ? this.countOf(plankName) : 0
+      if (nowCount < 4) {
+        this.log('[table] 木板不够（' + nowCount + '/4）')
+        await sleep(400)
         continue
       }
 
