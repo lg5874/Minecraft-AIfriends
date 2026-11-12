@@ -571,6 +571,15 @@ class Bot {
       return
     }
 
+    // onRespawn 把 busy 清成 false 之后，主循环有 3 秒（afterRespawn 的延迟）
+    // 去起一个新任务。这时候再去回家就是两个人抢同一个 pathfinder ——
+    // 实测表现为「离家 164.8 格 → 197.5 格」，越走越远。
+    // 已经在忙就这趟不回了，下次复活再说（回家不是救命的活）。
+    if (this.busy) {
+      this.log('[home] 手上有活，这趟先不回家')
+      return
+    }
+
     this.log(`[home] 离家 ${Math.round(dist)} 格，走回去`)
     this.busy = true
     this._busySince = Date.now()
