@@ -610,6 +610,42 @@ class Actions {
           await sleep(150)
           await this.pickupNearby(4)
         } catch (e2) {}
+
+        // ===== 记路：这一带有什么 =====
+        // 只在矿石上记 —— 挖泥土/石头也记的话，记忆里全是"那边有泥土"，
+        // 真正有用的"那儿有铁"会被冲掉。
+        // learnPlace(where, what) 落成一句「{where}那边有{what}」。
+        try {
+          const ORE_CN = {
+            coal_ore: '煤', deepslate_coal_ore: '煤',
+            iron_ore: '铁', deepslate_iron_ore: '铁',
+            copper_ore: '铜', deepslate_copper_ore: '铜',
+            gold_ore: '金', deepslate_gold_ore: '金',
+            redstone_ore: '红石', deepslate_redstone_ore: '红石',
+            lapis_ore: '青金石', deepslate_lapis_ore: '青金石',
+            diamond_ore: '钻石', deepslate_diamond_ore: '钻石',
+            emerald_ore: '绿宝石', deepslate_emerald_ore: '绿宝石',
+            nether_quartz_ore: '石英', ancient_debris: '远古残骸'
+          }
+          const what = ORE_CN[block.name]
+          const mem = this.ctx && this.ctx.mem
+          if (what && mem && typeof mem.learnPlace === 'function') {
+            const bp = block.position
+            // 同一种矿、同一片区域（16×16、8 格高一层）10 分钟只记一次。
+            // 不然一口气挖 20 块铁矿会写 20 条一模一样的记忆。
+            this._oreNotes = this._oreNotes || new Map()
+            const key = block.name + '@' +
+              Math.floor(bp.x / 16) + ',' + Math.floor(bp.z / 16) + ',' + Math.floor(bp.y / 8)
+            const last = this._oreNotes.get(key) || 0
+            if (!last || Date.now() - last > 10 * 60 * 1000) {
+              this._oreNotes.set(key, Date.now())
+              const where = '地下 y=' + Math.round(bp.y) + ' 那一带（' + Math.round(bp.x) + ', ' + Math.round(bp.z) + '）'
+              mem.learnPlace(where, what, { importance: 0.55 })
+              this.log('[dig] 记住了：' + where + '有' + what)
+            }
+          }
+        } catch (e3) {}
+
         return true
       } catch (e) {
         const msg = String(e && e.message || e)
@@ -1616,7 +1652,11 @@ class Actions {
    */
   isUnderground () {
     const bot = this.bot
-    const p = this.pos()
+    // 断线 / 还没复活：没有位置，就没有"我在哪"这回事。
+    // 按"还在下面"处理 —— 保守方向错只会白爬一趟，
+    // 乐观方向错会让调用方打出"出来了！"的假成功。
+    if (!bot || !bot.entity || !bot.entity.position) return true
+    const p = bot.entity.position
 
     // 头顶 2 格就被挡 -> 肯定在洞里
     const near = bot.blockAt(p.offset(0, 2, 0))
@@ -1624,11 +1664,23 @@ class Actions {
     if (near && near.boundingBox === 'block') return true
     if (near2 && near2.boundingBox === 'block') return true
 
-    // 往上找第一个遮挡
+    // 往上找第一个遮挡。
+    //
+    // 关键：blockAt 返回 null 有两种完全不同的意思 ——
+    //   · 那里确实是空气（区块加载了，我们看见了）
+    //   · 我们看不见（区块没加载 / 刚断线 / 死了还没复活）
+    // 原实现 `if (!b) break` 把"看不见"当成"一路通天"，
+    // 于是断线时判成露天 —— 调用方（getToSurface 最后一行）就报"出来了"。
+    // 现在连续 3 格看不见就不再猜，按"还在洞里"算。
     let firstBlockAt = -1
+    let blind = 0
     for (let dy = 4; dy <= 60; dy++) {
       const b = bot.blockAt(p.offset(0, dy, 0))
-      if (!b) break
+      if (!b) {
+        if (++blind >= 3) return true      // 看不清 -> 不下"露天"的结论
+        continue
+      }
+      blind = 0
       if (b.boundingBox === 'block' && !/leaves|log/.test(b.name)) {
         firstBlockAt = dy
         break
@@ -2105,7 +2157,11 @@ class Actions {
 
     const climbed = this.pos().y - startY
     this.log(`[surface] 挖了 ${maxSteps} 步，上升 ${Math.round(climbed)} 格，还没出去`)
-    return !this.isUnderground()
+    // isUnderground() 是三态：true 地下 / false 露天 / null 看不清。
+    // 写成 `!this.isUnderground()` 的话 null 会变成 true ——
+    // 断线或区块没加载时就打出"出来了！"的假成功日志，调用方也以为爬到地面了。
+    // 只认明确的 false 才算出去。
+    return this.isUnderground() === false
   }
 
   // ============================================================

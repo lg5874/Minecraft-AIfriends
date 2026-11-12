@@ -426,6 +426,8 @@ class Bot {
     this.log('断开: ' + reason)
     if (this.reflex) this.reflex.stop()
     if (this.selfState) this.selfState.stop()
+    // 家有个 1.5 秒的记路定时器，不解绑的话重连后会有两个在跑
+    if (this.home) { try { this.home.detach() } catch (e) {} this.home = null }
     if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null }
     try { this.mem.goOffline() } catch (e) {}
 
@@ -539,6 +541,54 @@ class Bot {
     } catch (e) {
       this.log('afterRespawn err ' + e.message)
     }
+
+    // 死了回出生点 —— 出生点周围的资源早挖光了。
+    // 走远了就自己走回去：这是"每次上线等于从零开始"的解法。
+    await this.tryGoHomeAfterRespawn()
+  }
+
+  /**
+   * 复活后如果离得太远，自己走回家。
+   *
+   * 96 格是"再挖下去也是荒的"的经验线：
+   * 出生点附近的东西早被他自己挖干净了，回家才有存货和工具。
+   *
+   * 不能放在 onRespawn 里直接 await —— 那会把 3 秒后的 afterRespawn
+   * 整段拖住，而回家最坏要 150 秒。
+   */
+  async tryGoHomeAfterRespawn () {
+    if (!this.home || !this.bot || !this.bot.entity) return
+    let far = false
+    let dist = null
+    try {
+      dist = this.home.hDistanceFromHome()
+      far = this.home.isFarFromHome(96)
+    } catch (e) {
+      return
+    }
+    if (!far) {
+      if (Number.isFinite(dist)) this.log(`[home] 复活点离家 ${Math.round(dist)} 格，不用回去`)
+      return
+    }
+
+    this.log(`[home] 离家 ${Math.round(dist)} 格，走回去`)
+    this.busy = true
+    this._busySince = Date.now()
+    this.taskDesc = '走回家'
+    try {
+      const r = await this.home.goHome({ timeoutMs: 150000 })
+      if (r && r.ok) {
+        this.log(`[home] 到家了（${r.seconds}s）`)
+        if (this.events) this.events.push('found_something', { home: true }, '你走回家了')
+      } else {
+        this.log(`[home] 没走回去：${(r && r.reason) || '不知道为啥'}`)
+      }
+    } catch (e) {
+      this.log('[home] 回家出错: ' + e.message)
+    } finally {
+      this.busy = false
+      this.taskDesc = ''
+    }
   }
 
   /** 急件来了：立刻有反应 */
@@ -610,6 +660,41 @@ class Bot {
   }
 
   /**
+   * 把自我状态里"他自己注意到的变化"转进事件队列。
+   *
+   * selfstate.js 自己只推了三种（工具没了 / 背包满 / 血骤降），
+   * 而工具拿到、换了、快用坏了这三种只写进 changes 数组，没人读。
+   * 结果：他"知道了"却从来不会因为这个改变行为。
+   *
+   * 这里不动 selfstate.js（那是 perception-owner 的交付），
+   * 在 main.js 侧把漏掉的三种转发成 inventory_change。
+   * 用 lastChangeAt 游标，同一条只转一次。
+   */
+  pumpSelfChanges () {
+    if (!this.selfState || !this.events) return 0
+    const list = this.selfState.changes
+    if (!Array.isArray(list) || !list.length) return 0
+
+    // 已经由 selfstate 自己推过的三种，别重复
+    const OWNED = { tool_broke: 1, inv_full: 1, health_drop: 1 }
+    let n = 0
+    for (const c of list) {
+      if (!c || !c.at) continue
+      if (c.at <= (this._lastSelfChangeAt || 0)) continue
+      this._lastSelfChangeAt = c.at
+      if (OWNED[c.kind]) continue
+      try {
+        this.events.push('inventory_change', { kind: c.kind }, c.what, {
+          cooldown: 8000,
+          dedupeKey: 'self:' + c.kind
+        })
+        n++
+      } catch (e) {}
+    }
+    return n
+  }
+
+  /**
    * 长期目标：扫一眼进度。
    *
    * 为什么单独抽出来：tick 每 4 秒一轮，但 observe 是纯同步的状态比对，
@@ -662,6 +747,27 @@ class Bot {
     }
   }
 
+  /**
+   * 把一次任务的结果回报给长期目标。
+   *
+   * 为什么单独抽出来：成功/失败/异常三个分支都要调，而且每一处都不能
+   * 因为 goals 挂了把主循环带崩 —— 统一在这里吞异常。
+   */
+  reportTaskResult (ok, text, outText) {
+    if (!this.goals) return null
+    try {
+      const st = this.actions ? this.actions.status() : null
+      const res = this.goals.onTaskResult({ ok: !!ok, text, status: st })
+      if (res && res.abandoned) this.log('[goals] 这个阶段反复不成，换条路')
+      else if (res && res.goalCompleted) this.log('[goals] 长期目标做完了')
+      else if (res && res.stageCompleted) this.log('[goals] 过了一步')
+      return res
+    } catch (e) {
+      this.log('[goals] onTaskResult 出错: ' + e.message)
+      return null
+    }
+  }
+
   async tick () {
     const bot = this.bot
     if (!bot || !bot.entity) return
@@ -669,6 +775,8 @@ class Bot {
     // 0. 长期目标：先扫一眼进度（同步、很便宜，不会挡住自救）
     //    这一步只更新"当前阶段完成到几成"，不跟模型说话。
     this.observeGoals()
+    // 0.5 他自己注意到的变化（工具换了/快坏了）进事件队列
+    this.pumpSelfChanges()
 
     // 0. 处理事件队列：攒够了就交给模型看
     if (this.events) {
@@ -754,6 +862,10 @@ class Bot {
     }
 
     // 8. 没有别的事，就问自己想干什么
+    //    问之前先保证心里有个长期目标 —— will.think() 第一件事就是看它。
+    //    放这里而不是 tick 开头：ensure() 没有目标时要问模型（几秒），
+    //    不能让自救/躲夜排队等它。
+    await this.ensureGoal()
     if (!want) want = await this.will.think()
     if (!want) return
 
@@ -837,6 +949,8 @@ class Bot {
         if (this.mood) this.mood.onEvent('task_done', 1)
         // 干完了：攒个念头，让主动层决定说不说
         if (this.spont) this.spont.push(spontaneous.onGoalDone(want.text, outText))
+        // 告诉长期目标"这一下算数"
+        this.reportTaskResult(true, want.text, outText)
       } else {
         const why = result.error || verdict.why || outText
         this.log(`<<< 失败（${secs}s）：${why}`)
@@ -847,6 +961,8 @@ class Bot {
         })
         this.will.finish()
         if (this.mood) this.mood.onEvent('task_fail', 1)
+        // 告诉长期目标"这趟没成" —— 同一个阶段失败太多次它会自己换路
+        this.reportTaskResult(false, want.text, why)
         const others = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
         if (this.spont) {
           const err = String(result.error || outText || '')
@@ -861,6 +977,9 @@ class Bot {
     } catch (e) {
       this.log('任务异常: ' + e.message)
       this.will.finish()
+      // 异常也算一次失败：不回报的话，长期目标那边会以为"还没试过"，
+      // 同一阶段会因为异常无限重试。
+      this.reportTaskResult(false, want.text, e.message)
     } finally {
       if (stallCheck) clearInterval(stallCheck)
       this._taskProgress = null
@@ -1033,7 +1152,17 @@ class Bot {
       this.log('[self] ' + e.message)
     }
 
-    return (selfBlock ? selfBlock + '\n\n' : '') + world + '\n' + extra.join('\n') + (pluginHint ? '\n' + pluginHint : '')
+    // 家在哪：他得知道"走远了该往回走"，而不是就地开荒
+    let homeBlock = ''
+    try {
+      homeBlock = this.home ? this.home.summary() : ''
+    } catch (e) {
+      this.log('[home] ' + e.message)
+    }
+
+    return (selfBlock ? selfBlock + '\n\n' : '') +
+      (homeBlock ? '## 家\n' + homeBlock + '\n\n' : '') +
+      world + '\n' + extra.join('\n') + (pluginHint ? '\n' + pluginHint : '')
   }
 
   dumpCode (goal, code, attempt) {
