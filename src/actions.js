@@ -2,7 +2,7 @@
 // L1 原子动作。所有能力的底座。
 // 每个动作都是 async，失败抛错或返回 false，绝不静默成功。
 
-const { goals } = require('mineflayer-pathfinder')
+const { goals, Movements } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
 const mcData = require('minecraft-data')('1.21.11')
 
@@ -1386,16 +1386,28 @@ class Actions {
    *
    * 这样每走一步上升一格，形成台阶。
    */
-  async getToSurface (maxSteps = 60) {
+  /**
+   * 从地下出来。
+   *
+   * 关键设计（跟真人挖矿道一样）：
+   *   挖一条 **2 格高、1 格宽的斜梯**，每前进 1 格上升 1 格。
+   *
+   * 之前失败的原因：
+   *   - 只挖自己头顶，脚下没变，跳上去还是原地
+   *   - 前方挖开了但没台阶踩，跳上去会掉下来
+   *
+   * 正确做法：每步挖【前方 y+0 y+1 y+2】三格，然后往前走 + 跳。
+   * 前方 y+0 挖空了也不要紧，因为跳的瞬间会踩到新挖出来的地面。
+   */
+  async getToSurface (maxSteps = 80) {
     const bot = this.bot
     if (!this.isUnderground()) return true
 
     const startY = this.pos().y
-    this.log('[surface] 在地下（y=' + Math.round(startY) + '），挖阶梯上去')
+    this.log('[surface] 在地下（y=' + Math.round(startY) + '），往上开一条路')
 
     const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]]
-    // 记下「在这个格子、这个方向」已经试过且失败，别再原地打转
-    const bad = new Set()
+    const bad = new Set()          // 「格子|方向」试过且失败，别原地打转
 
     const filler = () => ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
       .map(n => this.item(n)).find(Boolean)
@@ -1432,39 +1444,37 @@ class Actions {
     /**
      * 站到脚下方块的正中心。
      *
-     * 这是之前"台阶垫不上"的真凶：人站在格子边上（比如 x=73.77），
+     * 这是「台阶垫不上」的真凶：人站在格子边上（比如 x=73.77），
      * 身体（半宽 0.3）已经探进了前面那格，服务端直接拒绝放置，
-     * 报 "the block is still air"。日志里看到的就是这个。
+     * 报 "the block is still air"。实测居中到 0.09 格之后就放得上了。
      */
     const recenter = async () => {
-      const cx = Math.floor(this.pos().x) + 0.5
-      const cz = Math.floor(this.pos().z) + 0.5
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 12; i++) {
         const p = this.pos()
-        const dx = cx - p.x
-        const dz = cz - p.z
+        const dx = Math.floor(p.x) + 0.5 - p.x
+        const dz = Math.floor(p.z) + 0.5 - p.z
         if (Math.hypot(dx, dz) < 0.12) return true
         try {
           await bot.look(Math.atan2(-dx, -dz), 0, true)
           bot.setControlState('forward', true)
-          await sleep(Math.min(220, 70 + Math.hypot(dx, dz) * 300))
+          await sleep(Math.max(60, Math.min(240, Math.hypot(dx, dz) * 400)))
           bot.setControlState('forward', false)
-          await sleep(90)
+          await sleep(110)
         } catch (e) { break }
       }
       const p = this.pos()
-      return Math.hypot(cx - p.x, cz - p.z) < 0.3
+      return Math.hypot(Math.floor(p.x) + 0.5 - p.x, Math.floor(p.z) + 0.5 - p.z) < 0.3
     }
 
     /**
      * 上到指定那一格。
      * 一格台阶优先交给 pathfinder（实测 0.4 秒就上去了），
-     * 手动 jump+forward 在矮通道里经常起不来，只当兜底。
+     * 手动 jump+forward 在矮通道里起不来，只当兜底。
      */
     const stepUpTo = async (x, y, z) => {
       try {
         bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z))
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 12; i++) {
           await sleep(180)
           if (this.pos().y >= y - 0.15) break
         }
@@ -1485,57 +1495,101 @@ class Actions {
       return this.pos().y >= y - 0.15
     }
 
-    for (let step = 0; step < maxSteps; step++) {
-      this.check()
+    // ===== 塔升：真人在洞里最直接的走法，1 格宽也管用 =====
+    // 实测：打开 allow1by1towers 后，pathfinder 1.2 秒能把自己顶上 3 格。
+    // main.js 里这个开关是关的（怕乱搭），这里临时打开，做完在 finally 里恢复。
+    // 之前没有这一步，只能"挖台阶 + 跳"，矮通道里跳不起来，40 步一格没升。
+    const prevMoves = bot.pathfinder.movements
+    let towerOk = false
+    try {
+      const tm = new Movements(bot)
+      tm.canDig = true
+      tm.digCost = 20
+      tm.allow1by1towers = true
+      tm.scafoldingBlocks = ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
+        .map(n => bot.registry.itemsByName[n])
+        .filter(Boolean)
+        .map(it => it.id)
+      tm.canOpenDoors = true
+      tm.liquidCost = 200
+      tm.maxDropDown = 4
+      bot.pathfinder.setMovements(tm)
+      towerOk = true
+    } catch (e) {
+      this.log('[surface] 塔升配置失败：' + (e && e.message))
+    }
 
-      if (!this.isUnderground()) {
-        const climbed = Math.round(this.pos().y - startY)
-        this.log(`[surface] 出来了！y=${Math.round(this.pos().y)}（上升 ${climbed} 格）`)
-        return true
-      }
-
+    // 原地上顶一格。成功返回 true。
+    const tryPillar = async () => {
+      if (!towerOk) return false
+      if (!filler()) return false                 // 没有垫脚方块就顶不上去
       const p = this.pos()
       const F = Math.floor(p.y)
-      const here = `${Math.floor(p.x)},${F},${Math.floor(p.z)}`
 
-      // ===== 先给自己留出跳跃空间 =====
-      // 2 格高的通道里跳只能抬 0.5 格，够不到 1 格台阶。
-      // 必须把头顶挖到 3 格以上，跳才起得来。
-      for (const dy of [2, 3]) {
+      // 头顶 8 格里有水/岩浆就别直着上（会淹死/烧死）
+      for (let dy = 2; dy <= 8; dy++) {
+        if (/water|lava/.test(nameAt(p.offset(0, dy, 0)))) return false
+      }
+      // 挖出站人和起跳的空间
+      for (let dy = 2; dy <= 4; dy++) {
         if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
       }
-
-      // ===== 挑方向：必须真的能形成「一格台阶」=====
-      // 台阶成立 = 前方 (dx,F) 实心（脚踩的台面）+ (dx,F+1)/(dx,F+2) 空（身体和头）。
-      // 原来是随机挑方向，所以老是往"下方悬空"那边跳，跳进去只会平走，一格都不升。
-      const cands = []
-      for (const [dx, dz] of DIRS) {
-        if (bad.has(`${here}|${dx},${dz}`)) continue
-
-        const stepV = p.offset(dx, 0, dz)
-        const bodyV = p.offset(dx, 1, dz)
-        const headV = p.offset(dx, 2, dz)
-        const supV = p.offset(dx, -1, dz)
-
-        // 基岩/岩浆/水挡路就不要这个方向
-        const blocked = (v) => /bedrock|lava|water/.test(nameAt(v))
-        if (blocked(bodyV) || blocked(headV)) continue
-
-        if (isSolid(stepV)) {
-          cands.push({ dx, dz, score: 10 })       // 天然台阶，最省事
-        } else if (isSolid(supV)) {
-          cands.push({ dx, dz, score: 5 })        // 下方有支撑，可以垫一块
+      try {
+        bot.pathfinder.setGoal(new goals.GoalBlock(Math.floor(p.x), F + 1, Math.floor(p.z)))
+        for (let i = 0; i < 18; i++) {
+          await sleep(200)
+          if (this.pos().y >= F + 0.9) break
         }
-        // 既不实心、下方也没支撑 -> 走进去只会平走/掉落，直接排除
-      }
+      } catch (e) {}
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+      return this.pos().y >= F + 0.9
+    }
 
-      if (!cands.length) {
-        // 四个方向都构不成台阶：平走一格换个地方再看
-        this.log('[surface] 这一步四个方向都挖不成台阶，挪一格再看')
-        let moved = false
+    try {
+      for (let step = 0; step < maxSteps; step++) {
+        this.check()
+
+        if (!this.isUnderground()) {
+          const climbed = Math.round(this.pos().y - startY)
+          this.log(`[surface] 出来了！y=${Math.round(this.pos().y)}（上升 ${climbed} 格）`)
+          return true
+        }
+
+        // ===== 主策略：原地往上顶一格 =====
+        if (await tryPillar()) continue
+
+        // ===== 兜底：挖台阶（头顶有水/岩浆、或者没垫脚方块时才走这里）=====
+        const p = this.pos()
+        const F = Math.floor(p.y)
+        const here = `${Math.floor(p.x)},${F},${Math.floor(p.z)}`
+
+        // 先给自己留出跳跃空间：2 格高的通道里跳只抬 0.5 格，够不到 1 格台阶
+        for (const dy of [2, 3]) {
+          if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+        }
+
+        // 挑方向：必须真能形成「一格台阶」
+        // 台阶成立 = 前方 (dx,F) 实心（踩的台面）+ (dx,F+1)/(dx,F+2) 空。
+        // 原来随机挑方向，老是往"下方悬空"那边跳，跳进去只会平走，一格不升。
+        const cands = []
         for (const [dx, dz] of DIRS) {
-          if (!isSolid(p.offset(dx, 0, dz)) && !isSolid(p.offset(dx, 1, dz)) &&
-              !isSolid(p.offset(dx, 2, dz)) && isSolid(p.offset(dx, -1, dz))) {
+          if (bad.has(`${here}|${dx},${dz}`)) continue
+          const stepV = p.offset(dx, 0, dz)
+          const bodyV = p.offset(dx, 1, dz)
+          const headV = p.offset(dx, 2, dz)
+          const supV = p.offset(dx, -1, dz)
+          const blocked = (v) => /bedrock|lava|water/.test(nameAt(v))
+          if (blocked(bodyV) || blocked(headV)) continue
+          if (isSolid(stepV)) cands.push({ dx, dz, score: 10 })
+          else if (isSolid(supV)) cands.push({ dx, dz, score: 5 })
+        }
+
+        if (!cands.length) {
+          this.log('[surface] 这一步四个方向都挖不成台阶，挪一格再看')
+          let moved = false
+          for (const [dx, dz] of DIRS) {
+            if (isSolid(p.offset(dx, 0, dz)) || isSolid(p.offset(dx, 1, dz)) ||
+                isSolid(p.offset(dx, 2, dz)) || !isSolid(p.offset(dx, -1, dz))) continue
             try {
               const tx = Math.floor(p.x) + dx
               const tz = Math.floor(p.z) + dz
@@ -1550,68 +1604,70 @@ class Actions {
             moved = this.pos().distanceTo(p) > 0.6
             if (moved) break
           }
-        }
-        if (!moved) {
-          // 彻底走不动：把头顶一路挖开，垫脚往上顶
-          this.log('[surface] 挪不动了，挖头顶往上顶')
-          for (const dy of [2, 3, 4]) await digOne(p.offset(0, dy, 0))
-        }
-        await sleep(200)
-        continue
-      }
-
-      cands.sort((a, b) => b.score - a.score)
-      const { dx, dz } = cands[0]
-
-      // ===== 挖出身体和头的空间 =====
-      const bodyOk = await digOne(p.offset(dx, 1, dz))
-      const headOk = await digOne(p.offset(dx, 2, dz))
-      if (!bodyOk || !headOk) {
-        bad.add(`${here}|${dx},${dz}`)
-        this.log(`[surface] (${dx},${dz}) 挖不开，换方向`)
-        continue
-      }
-
-      // ===== 台阶面：没有就自己垫一块 =====
-      if (!isSolid(p.offset(dx, 0, dz))) {
-        const fill = filler()
-        if (!fill) {
-          bad.add(`${here}|${dx},${dz}`)
-          this.log('[surface] 手上没有能垫的方块，换方向')
+          if (!moved) {
+            this.log('[surface] 挪不动了，把头顶一路挖开')
+            for (const dy of [2, 3, 4, 5]) await digOne(p.offset(0, dy, 0))
+          }
+          await sleep(200)
           continue
         }
-        const sup = bot.blockAt(p.offset(dx, -1, dz))
-        if (!sup) {
+
+        cands.sort((a, b) => b.score - a.score)
+        const { dx, dz } = cands[0]
+
+        // 挖出身体和头的空间
+        const bodyOk = await digOne(p.offset(dx, 1, dz))
+        const headOk = await digOne(p.offset(dx, 2, dz))
+        if (!bodyOk || !headOk) {
           bad.add(`${here}|${dx},${dz}`)
+          this.log(`[surface] (${dx},${dz}) 挖不开，换方向`)
           continue
         }
-        try {
-          await recenter()                       // 不站中心，放方块必被拒
-          await bot.equip(fill, 'hand')
-          await bot.lookAt(sup.position.offset(0.5, 1.0, 0.5), true)
-          await sleep(140)
-          await bot.placeBlock(sup, new Vec3(0, 1, 0))
-          await sleep(220)
-        } catch (e) {}
+
+        // 台阶面：没有就自己垫一块
         if (!isSolid(p.offset(dx, 0, dz))) {
-          bad.add(`${here}|${dx},${dz}`)
-          this.log(`[surface] (${dx},${dz}) 台阶垫不上，换方向`)
-          continue
+          const fill = filler()
+          const sup = bot.blockAt(p.offset(dx, -1, dz))
+          if (!fill || !sup) {
+            bad.add(`${here}|${dx},${dz}`)
+            this.log('[surface] 没有垫脚方块或下方没支撑，换方向')
+            continue
+          }
+          try {
+            await recenter()                      // 不站中心，放方块必被拒
+            await bot.equip(fill, 'hand')
+            await bot.lookAt(sup.position.offset(0.5, 1.0, 0.5), true)
+            await sleep(140)
+            await bot.placeBlock(sup, new Vec3(0, 1, 0))
+            await sleep(220)
+          } catch (e) {}
+          if (!isSolid(p.offset(dx, 0, dz))) {
+            bad.add(`${here}|${dx},${dz}`)
+            this.log(`[surface] (${dx},${dz}) 台阶垫不上，换方向`)
+            continue
+          }
         }
-      }
 
-      // ===== 上去，并且验证真的上去了 =====
-      const targetY = F + 1
-      const tx = Math.floor(p.x) + dx
-      const tz = Math.floor(p.z) + dz
-      await stepUpTo(tx, targetY, tz)
+        // 上去，并且验证真的上去了
+        const tx = Math.floor(p.x) + dx
+        const tz = Math.floor(p.z) + dz
+        await stepUpTo(tx, F + 1, tz)
 
-      const nowY = this.pos().y
-      if (nowY < F + 0.9) {
-        bad.add(`${here}|${dx},${dz}`)
-        this.log(`[surface] 方向 (${dx},${dz}) 上不去（y=${nowY.toFixed(1)}），换方向`)
+        const nowY = this.pos().y
+        if (nowY < F + 0.9) {
+          bad.add(`${here}|${dx},${dz}`)
+          this.log(`[surface] 方向 (${dx},${dz}) 上不去（y=${nowY.toFixed(1)}），换方向`)
+        }
+        await sleep(150)
       }
-      await sleep(150)
+    } finally {
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+      if (prevMoves) {
+        try { bot.pathfinder.setMovements(prevMoves) } catch (e) {}
+      }
+      for (const k of ['forward', 'back', 'left', 'right', 'jump']) {
+        try { bot.setControlState(k, false) } catch (e) {}
+      }
     }
 
     const climbed = this.pos().y - startY
