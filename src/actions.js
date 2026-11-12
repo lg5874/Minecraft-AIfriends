@@ -1496,53 +1496,80 @@ class Actions {
     }
 
     // ===== 塔升：真人在洞里最直接的走法，1 格宽也管用 =====
-    // 实测：打开 allow1by1towers 后，pathfinder 1.2 秒能把自己顶上 3 格。
-    // main.js 里这个开关是关的（怕乱搭），这里临时打开，做完在 finally 里恢复。
-    // 之前没有这一步，只能"挖台阶 + 跳"，矮通道里跳不起来，40 步一格没升。
-    const prevMoves = bot.pathfinder.movements
-    let towerOk = false
-    try {
-      const tm = new Movements(bot)
-      tm.canDig = true
-      tm.digCost = 20
-      tm.allow1by1towers = true
-      tm.scafoldingBlocks = ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
-        .map(n => bot.registry.itemsByName[n])
-        .filter(Boolean)
-        .map(it => it.id)
-      tm.canOpenDoors = true
-      tm.liquidCost = 200
-      tm.maxDropDown = 4
-      bot.pathfinder.setMovements(tm)
-      towerOk = true
-    } catch (e) {
-      this.log('[surface] 塔升配置失败：' + (e && e.message))
+    // 实测：allow1by1towers 打开后，pathfinder 0.25 秒就能把自己顶上 1 格，
+    //       1 格宽的竖井里也管用。这是整条路的主力。
+    //
+    // main.js 全局已经配好 towers + scafoldingBlocks，但这里不依赖它：
+    // 直接就地补齐当前 movements 对象上的几个开关（缺哪个补哪个），
+    // 做完在 finally 里还原。这样不管 main.js 怎么改都不会塌。
+    const SCAFFOLD = ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
+    const moves = bot.pathfinder.movements
+    const saved = {}
+    const restore = []
+    if (moves) {
+      for (const k of ['allow1by1towers', 'canDig', 'digCost', 'canOpenDoors', 'liquidCost', 'maxDropDown']) {
+        saved[k] = moves[k]
+        restore.push(k)
+      }
+      try {
+        moves.allow1by1towers = true
+        moves.canDig = true
+        if (!moves.scafoldingBlocks || !moves.scafoldingBlocks.length) {
+          saved.scafoldingBlocks = moves.scafoldingBlocks
+          restore.push('scafoldingBlocks')
+          moves.scafoldingBlocks = SCAFFOLD
+            .map(n => bot.registry.itemsByName[n])
+            .filter(Boolean)
+            .map(it => it.id)
+        }
+      } catch (e) {
+        this.log('[surface] 塔升开关设置失败：' + (e && e.message))
+      }
     }
+    const towerOk = !!(moves && moves.allow1by1towers)
 
     // 原地上顶一格。成功返回 true。
-    const tryPillar = async () => {
-      if (!towerOk) return false
-      if (!filler()) return false                 // 没有垫脚方块就顶不上去
+    const tryPillar = async (dbg) => {
+      if (!towerOk) { this.log('[dbg] 塔升不可用 towerOk=false'); return false }
+      if (!filler()) { this.log('[dbg] 没有垫脚方块'); return false }
       const p = this.pos()
       const F = Math.floor(p.y)
 
       // 头顶 8 格里有水/岩浆就别直着上（会淹死/烧死）
       for (let dy = 2; dy <= 8; dy++) {
-        if (/water|lava/.test(nameAt(p.offset(0, dy, 0)))) return false
+        const n = nameAt(p.offset(0, dy, 0))
+        if (/water|lava/.test(n)) { this.log(`[dbg] 头顶 +${dy} 是 ${n}，不直上`); return false }
       }
       // 挖出站人和起跳的空间
+      const dug = []
       for (let dy = 2; dy <= 4; dy++) {
-        if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+        if (isSolid(p.offset(0, dy, 0))) {
+          const ok = await digOne(p.offset(0, dy, 0))
+          dug.push(`+${dy}:${ok ? 'ok' : 'FAIL'}:${nameAt(p.offset(0, dy, 0))}`)
+        }
       }
+      if (dbg && dug.length) this.log('[dbg] 挖头顶 ' + dug.join(' '))
       try {
+        let st = '?'
+        const onUpd = (r) => { st = r.status }
+        bot.on('path_update', onUpd)
+        if (dbg) this.log(`[dbg] 配置 towers=${moves && moves.allow1by1towers} scaff=${moves && moves.scafoldingBlocks && moves.scafoldingBlocks.length} canDig=${moves && moves.canDig} moving=${(() => { try { return bot.pathfinder.isMoving() } catch (e) { return 'err' } })()}`)
         bot.pathfinder.setGoal(new goals.GoalBlock(Math.floor(p.x), F + 1, Math.floor(p.z)))
         for (let i = 0; i < 18; i++) {
           await sleep(200)
           if (this.pos().y >= F + 0.9) break
         }
-      } catch (e) {}
+        bot.removeListener('path_update', onUpd)
+        if (dbg) this.log('[dbg] path_update 最后状态 = ' + st)
+      } catch (e) {
+        this.log('[dbg] setGoal 异常 ' + e.message)
+      }
       try { bot.pathfinder.setGoal(null) } catch (e) {}
-      return this.pos().y >= F + 0.9
+      const rose = this.pos().y >= F + 0.9
+      if (dbg && !rose) {
+        this.log(`[dbg] 塔升失败 F=${F} y=${this.pos().y.toFixed(2)} 头顶=${[0,1,2,3,4].map(d => nameAt(p.offset(0, d, 0))).join(',')}`)
+      }
+      return rose
     }
 
     try {
@@ -1556,7 +1583,7 @@ class Actions {
         }
 
         // ===== 主策略：原地往上顶一格 =====
-        if (await tryPillar()) continue
+        if (await tryPillar(true)) continue
 
         // ===== 兜底：挖台阶（头顶有水/岩浆、或者没垫脚方块时才走这里）=====
         const p = this.pos()
@@ -1662,8 +1689,11 @@ class Actions {
       }
     } finally {
       try { bot.pathfinder.setGoal(null) } catch (e) {}
-      if (prevMoves) {
-        try { bot.pathfinder.setMovements(prevMoves) } catch (e) {}
+      // 把临时补的寻路开关还原，别影响别的动作
+      if (moves) {
+        for (const k of restore) {
+          try { moves[k] = saved[k] } catch (e) {}
+        }
       }
       for (const k of ['forward', 'back', 'left', 'right', 'jump']) {
         try { bot.setControlState(k, false) } catch (e) {}
