@@ -35,6 +35,8 @@ class Talk {
     this.pendingDemand = null
     this.persuasion = new persuasion.Persuasion(ctx.dataDir || '/tmp')
     this.recentSaid = []      // 最近说过的话，用于语气疲劳判断
+    this.botChain = []        // 检测 bot 之间的对话链
+    this.lastReplyTo = null   // 上一条是回给谁的
   }
 
   /**
@@ -200,6 +202,44 @@ ${this.fatigueHint()}`
   /** 收到别人的话 */
   async onChat (username, message) {
     if (username === this.bot.username) return
+
+    // ===== 防 bot 之间无限对答 =====
+    // 判断对方是不是"另一个 AI 玩家"：名字像 bot、或者说话风格像
+    const isBotLike = this.looksLikeBot(username)
+
+    if (isBotLike) {
+      // 1. 连续跟同一个 bot 对话太多次 -> 断开
+      const now = Date.now()
+      this.botChain = (this.botChain || []).filter(c => now - c.at < 120000)   // 只留 2 分钟内的
+      const withThisBot = this.botChain.filter(c => c.who === username)
+
+      if (withThisThisBotTooMany(withThisBot)) {
+        this.ctx.log(`[chain] 跟 ${username} 已经聊了 ${withThisBot.length} 轮，先不接了`)
+        return
+      }
+
+      // 2. 记录这次
+      this.botChain.push({ who: username, at: now })
+
+      // 3. 只有明确提到我、或者问句，才回。不主动接话
+      const mentioned = message.includes(this.bot.username) ||
+        (this.mem.people[username] && message.includes(this.mem.people[username].callMe || '\u0000'))
+      const isQuestion = /[?？]/.test(message)
+
+      if (!mentioned && !isQuestion) {
+        this.ctx.log(`[chain] ${username} 说的话没指向我，不接`)
+        return
+      }
+
+      // 4. 就算回，也大概率回得短或者不回
+      if (Math.random() < 0.5) {
+        this.ctx.log(`[chain] ${username} 虽然在跟我说话，但这次先不回`)
+        return
+      }
+    }
+
+    // ===== 普通玩家 =====
+    this.lastReplyTo = username
 
     // 记人
     const isNew = !this.mem.people[username]
@@ -494,6 +534,33 @@ function cleanLine (out, maxLen) {
   if (!t) return ''
   if (t.length > maxLen) t = t.slice(0, maxLen)
   return t
+}
+
+
+/**
+ * 判断一个玩家是不是"另一个 AI"。
+ * 这纯粹是程序层的自我保护：防止两个 bot 无限对答把服务器聊天刷爆。
+ * 注意：徐俊杰本人不会觉得对方是 AI，这只是代码层面的防护。
+ */
+Talk.prototype.looksLikeBot = function (username) {
+  const name = String(username || '')
+  if (/^(bot|ai|npc|_bot|bot_|XJJ\d+|Test\d*)/i.test(name)) return true
+  if (this.ctx.botNames && this.ctx.botNames.includes(name)) return true
+  return false
+}
+
+/** 判断这句话属于哪种语气（语气疲劳用） */
+function detectSayKind (text) {
+  const t = String(text || '')
+  if (!t) return 'empty'
+  if (/^(嗯|行|哦|在|好|可以|ok)[。！？.!?]?$/i.test(t)) return 'minimal'
+  if (/(草|妈的|卧槽|操|艹|靠|我靠)/.test(t)) return 'swear'
+  if (/(又|第三次|第[一二三四五]次)/.test(t)) return 'repeat-complain'
+  if (/[？?]/.test(t)) return 'ask'
+  if (/(可以|成了|搞定|行了|弄完)/.test(t)) return 'done'
+  if (/(不知道|不懂|不清楚)/.test(t)) return 'dunno'
+  if (t.length <= 6) return 'short'
+  return 'normal'
 }
 
 module.exports = Talk

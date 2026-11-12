@@ -29,7 +29,11 @@ const Mood = require('./src/mood')
 const { Impulse, classify, judgeFeeling } = require('./src/impulse')
 
 const ROOT = __dirname
-const DATA = path.join(ROOT, 'data', 'runtime')
+// 数据目录：多实例时每个实例独立（记忆/品味/心情/技能互不干扰）
+// 用环境变量 AIFRIEND_DATA 指定，不指定就用默认
+const DATA = process.env.AIFRIEND_DATA
+  ? path.resolve(ROOT, process.env.AIFRIEND_DATA)
+  : path.join(ROOT, 'data', 'runtime')
 
 function loadConfig () {
   const p = path.join(ROOT, process.env.AIFRIEND_CONFIG || 'config.json')
@@ -248,6 +252,7 @@ class Bot {
       mood: this.mood,
       taste: this.taste,
       perceive: this.perceive,
+      botNames: (this.cfg.behavior && this.cfg.behavior.botNames) || [],
       // 他答应了别人要干的事：插队执行
       onComply: (who, task) => {
         this.log('[comply] 答应 ' + who + ' 去干：' + task)
@@ -549,10 +554,15 @@ class Bot {
         this.log(`[events] 处理 ${evs.length} 条（${r.reason}）`)
         for (const e of evs) this.log('  · ' + e.what)
         // 急件里的"有人叫我"：立刻回应
+        // 注意：onChat 已经处理过一遍了，这里只处理"当时在忙没回"的
         const chats = evs.filter(e => e.type === 'chat_me')
         if (chats.length && this.talk && !this.busy) {
           const last = chats[chats.length - 1]
-          this.talk.reply(last.data.who, last.data.message).catch(() => {})
+          // 别重复回同一条
+          if (this.talk.lastReplyTo !== last.data.who || this.talk.lastRepliedMsg !== last.data.message) {
+            this.talk.lastRepliedMsg = last.data.message
+            this.talk.reply(last.data.who, last.data.message).catch(() => {})
+          }
         }
       }
     }
