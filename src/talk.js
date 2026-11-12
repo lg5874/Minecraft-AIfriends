@@ -18,6 +18,7 @@
 
 const persona = require('./persona')
 const secretsMod = require('./secrets')
+const persuasion = require('./persuasion')
 const realtime = require('./realtime')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -31,6 +32,8 @@ class Talk {
     this.history = []
     this.lastSpoke = 0
     this.lastSpokeAt = 0
+    this.pendingDemand = null
+    this.persuasion = new persuasion.Persuasion(ctx.dataDir || '/tmp')
   }
 
   /** 直接说一句（已经有内容了） */
@@ -93,7 +96,9 @@ class Talk {
     const recalled = this.mem.remember(situation, { people: opts.people || [], limit: 5 })
 
     const msgs = [
-      { role: 'system', content: persona.systemPrompt(this.mem, stateLine, recalled, { secrets: this.mem.secrets }) },
+      { role: 'system', content: persona.systemPrompt(this.mem, stateLine, recalled, {
+        secrets: this.mem.secrets, taste: this.ctx.taste, mood: this.ctx.mood
+      }) },
       {
         role: 'system',
         content: `现在发生了一件事，你要在游戏公屏上说一句。
@@ -177,6 +182,9 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
       this.ctx.log('[secret] ' + username + ' 托付了件事')
     }
 
+    // 是不是在要他做事（说服系统）
+    const demand = this.detectDemand(message, username)
+
     // 是不是在套某个秘密
     const probing = this.detectProbe(message)
 
@@ -238,6 +246,38 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
     const callMe = (this.mem.people[username] || {}).callMe
     const nameHint = callMe ? `\n你平时叫他"${callMe}"。` : ''
 
+    // 说服：他愿不愿意干
+    let demandHint = ''
+    if (this.pendingDemand) {
+      const d = this.pendingDemand
+      const verdict = this.persuasion.ask({
+        who: username,
+        task: d.task,
+        what: message,
+        effort: d.effort,
+        ctx: {
+          moodState: this.ctx.mood ? this.ctx.mood.state() : 'normal',
+          trust: (this.mem.people[username] || {}).trust || 0
+        }
+      })
+      this.ctx.log(`[persuade] ${username} ${verdict.approach} -> ${verdict.style} (${verdict.reason})`)
+
+      // 心情影响
+      if (this.ctx.mood) {
+        if (verdict.irritation > 0.2) this.ctx.mood.irritation = Math.min(1, this.ctx.mood.irritation + verdict.irritation)
+        if (verdict.warmth) this.ctx.mood.spirit = Math.max(0, Math.min(1, this.ctx.mood.spirit + verdict.warmth))
+      }
+
+      // 答应了就真的去做
+      if (verdict.comply) {
+        this.persuasion.resolved(username)
+        this.pendingDemand = null
+        if (this.ctx.onComply) this.ctx.onComply(username, d.task)
+      }
+
+      demandHint = '\n' + this.persuasion.hint(verdict, username, d.task)
+    }
+
     // 这个人能问到的秘密（已经跟他说过的不再重复）
     const askable = this.mem.getSecrets(username)
     // 判断他会不会说漏
@@ -268,10 +308,13 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
     }
 
     const msgs = [
-      { role: 'system', content: persona.systemPrompt(this.mem, stateLine, recalled, { secrets: this.mem.secrets, viewer: username }) },
+      { role: 'system', content: persona.systemPrompt(this.mem, stateLine, recalled, {
+        secrets: this.mem.secrets, viewer: username,
+        taste: this.ctx.taste, mood: this.ctx.mood
+      }) },
       {
         role: 'system',
-        content: `${persona.chatHint({ maxLen: 50 })}${nameHint}${secretHint}
+        content: `${persona.chatHint({ maxLen: 50 })}${nameHint}${secretHint}${demandHint}
 
 另外：如果对方在这句话里告诉了你该怎么称呼他（比如"叫我老王""我叫XX"），
 你要自然地接受，并在回复里用上。`
@@ -315,6 +358,33 @@ ${opts.extraHint ? '- ' + opts.extraHint : ''}
 
     await this.say(out)
   }
+}
+
+/** 判断对方是不是在要求他做事 */
+Talk.prototype.detectDemand = function (message, username) {
+  const m = String(message || '')
+  // 已经是同一件事的后续追问
+  if (this.pendingDemand) return this.pendingDemand
+
+  // 新要求：出现"帮我/去/给我/过来/来"这类祈使
+  const isDemand = /(帮我|帮忙|去|过来|来|给我|带我|陪我|一起|快点|赶紧|挖|砍|盖|打|找)/.test(m) &&
+    /(呗|吧|啊|嘛|吗|好不好|行不行|[!！]|$)/.test(m) &&
+    m.length >= 4
+
+  if (!isDemand) return null
+
+  // 猜这件事有多麻烦
+  let effort = 0.4
+  if (/(一箱|一堆|很多|大量|全部|所有)/.test(m)) effort = 0.8
+  if (/(远处|很远|跑一趟|跑过去|去.*那边)/.test(m)) effort += 0.15
+  if (/(马上|现在|立刻)/.test(m)) effort += 0.1
+  effort = Math.min(1, effort)
+
+  const task = m.replace(/^(帮我|帮忙|你去|去)/, '').trim() || m
+
+  this.pendingDemand = { task, effort, from: username, at: Date.now() }
+  this.ctx.log('[demand] ' + username + ' 要他：' + task + '（麻烦度 ' + effort.toFixed(2) + '）')
+  return this.pendingDemand
 }
 
 /** 判断对方是不是在套话 */

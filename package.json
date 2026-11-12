@@ -9,9 +9,17 @@
     "start": "node main.js",
     "check": "node scripts/check-syntax.js",
     "test:memory": "node scripts/test-memory.js",
-    "test:decay": "node scripts/test-decay.js"
+    "test:decay": "node scripts/test-decay.js",
+    "test:persona": "node scripts/test-persona.js",
+    "test": "node scripts/test-memory.js && node scripts/test-decay.js && node scripts/test-persona.js"
   },
-  "keywords": ["minecraft", "mineflayer", "llm", "agent", "paper"],
+  "keywords": [
+    "minecraft",
+    "mineflayer",
+    "llm",
+    "agent",
+    "paper"
+  ],
   "license": "MIT",
   "dependencies": {
     "minecraft-data": "^3.119.0",

@@ -221,7 +221,10 @@ return '砍了树但没木头'
 - actions.equip(name)  装备/手持
 - actions.autoArmor()  自动穿上最好的盔甲
 - actions.bestWeapon()  拿出最好的武器
-- actions.eat()  吃东西
+- actions.eat()  吃（自动挑最好的，熟食优先）
+- actions.foodList()  背包里所有能吃的：[{name,count,points}]，按好坏排
+- actions.findFood()  完整的找食流程：打猎/摘果/抓鱼，有熔炉会烤
+- actions.tryCook(rawName)  把生肉烤熟（没熔炉现做，没燃料去砍）
 
 ### 战斗
 - actions.attack(entityName, times=5)  打附近的怪

@@ -21,6 +21,9 @@ const Will = require('./src/will')
 const persona = require('./src/persona')
 const knowledge = require('./src/knowledge')
 const spontaneous = require('./src/spontaneous')
+const { Taste } = require('./src/taste')
+const Mood = require('./src/mood')
+const { Impulse, classify, judgeFeeling } = require('./src/impulse')
 
 const ROOT = __dirname
 const DATA = path.join(ROOT, 'data', 'runtime')
@@ -59,6 +62,9 @@ class Bot {
     this.clockTimer = null
     this.spont = null
     this.lastInventory = {}
+    this.taste = null
+    this.mood = null
+    this.impulse = null
   }
 
   log (s) {
@@ -159,7 +165,9 @@ class Bot {
 
     // 寻路配置
     const moves = new Movements(bot)
-    moves.canDig = false
+    // 允许挖方块：卡在坑里的时候，能挖出来比干等着强
+    moves.canDig = true
+    moves.digCost = 20
     moves.allow1by1towers = false
     moves.scafoldingBlocks = []
     moves.canOpenDoors = true
@@ -172,10 +180,12 @@ class Bot {
     this.startClock()
 
     // 组件
+    const self = this
     this.actions = new Actions(bot, {
       log: (s) => this.log(s),
       cfg: this.cfg,
-      mem: this.mem
+      mem: this.mem,
+      get reflex () { return self.reflex }
     })
     this.coder = new Coder(bot, this.actions, this.llm, this.skills, {
       log: (s) => this.log(s),
@@ -189,7 +199,17 @@ class Bot {
       cfg: this.cfg,
       busy: () => this.busy,
       currentTaskDesc: () => this.taskDesc ? `你现在正在${this.taskDesc}。` : '你现在没什么事干。',
-      actions: this.actions
+      actions: this.actions,
+      dataDir: DATA,
+      mood: this.mood,
+      taste: this.taste,
+      // 他答应了别人要干的事：插队执行
+      onComply: (who, task) => {
+        this.log('[comply] 答应 ' + who + ' 去干：' + task)
+        if (this.impulse) {
+          this.pendingTask = { text: '帮 ' + who + ' ' + task, from: who, at: Date.now() }
+        }
+      }
     })
     this.will = new Will(this.llm, this.mem, this.skills, {
       log: (s) => this.log(s),
@@ -206,6 +226,15 @@ class Bot {
       onEvent: (kind, data) => this.onReflexEvent(kind, data)
     })
     this.reflex.start()
+
+    // 品味（自己长出来的）和心情（会影响判断）
+    this.taste = this.taste || new Taste(DATA)
+    this.mood = this.mood || new Mood(DATA)
+    this.impulse = new Impulse({
+      log: (s) => this.log(s),
+      llm: this.llm,
+      actions: this.actions
+    })
 
     this.spont = new spontaneous.Spontaneity({
       log: (s) => this.log(s),
@@ -282,6 +311,7 @@ class Bot {
     this.sheltered = false
     if (this.actions) { this.actions.cancel = true; this.actions.stop() }
     if (this.will) this.will.finish()
+    if (this.mood) this.mood.onEvent('death', 1)
   }
 
   async onRespawn () {
@@ -341,6 +371,7 @@ class Bot {
 
   onReflexEvent (kind, data) {
     if (!this.talk) return
+    if (this.mood && kind === 'hurt_repeat') this.mood.onEvent('hurt', 1)
     if (kind === 'hurt_confused') {
       // 头一两次被打：还没搞清状况
       this.talk.speak(
@@ -408,10 +439,13 @@ class Bot {
       return
     }
 
-    // 4. 检查背包有没有新收获，攒个"想说话"的念头
+    // 4. 心情和品味随时间变化
+    this.tickInnerState()
+
+    // 5. 检查背包有没有新收获，攒个"想说话"的念头
     this.checkNewLoot()
 
-    // 5. 有攒着的念头就问他要不要说
+    // 6. 有攒着的念头就问他要不要说
     if (this.spont && this.talk) {
       await this.spont.tick(this.talk).catch(() => {})
     }
@@ -419,14 +453,32 @@ class Bot {
     // 6. 正在干活不打断
     if (this.busy) return
 
-    // 7. 决定干什么
-    const want = await this.will.think()
+    // 7. 有答应别人的事就先做（答应了要做到）
+    let want = null
+    if (this.pendingTask) {
+      want = this.pendingTask
+      this.pendingTask = null
+      this.log('[comply] 去做答应的事：' + want.text)
+    } else {
+      // 看看有没有冲动想干别的
+      if (this.impulse && this.taste && this.mood) {
+        const whim = await this.impulse.maybe(this.taste, this.mood, this.will.pending() || '')
+        if (whim) {
+          want = { text: whim, since: Date.now(), done: false }
+          this.log('[impulse] 临时改主意：' + whim)
+        }
+      }
+    }
+
+    // 8. 没有别的事，就问自己想干什么
+    if (!want) want = await this.will.think()
     if (!want) return
 
     this.busy = true
     this.taskDesc = want.text
     if (this.actions) { this.actions.cancel = false; this.actions.stop() }
     const t0 = Date.now()
+    if (this.impulse) this.impulse.taskStarted()
     this.log(`>>> 开始：${want.text}`)
 
     try {
@@ -454,6 +506,10 @@ class Bot {
           importance: 0.4,
           emotion: 0.3
         })
+
+        // 做完之后，问自己爽不爽 —— 这是他品味的来源
+        this.judgeAndGrow(want.text, outText).catch(() => {})
+        if (this.mood) this.mood.onEvent('task_done', 1)
         // 干完了：攒个念头，让主动层决定说不说
         if (this.spont) this.spont.push(spontaneous.onGoalDone(want.text, outText))
       } else {
@@ -464,6 +520,7 @@ class Bot {
           importance: 0.65
         })
         this.will.finish()
+        if (this.mood) this.mood.onEvent('task_fail', 1)
         const others = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
         if (this.spont) this.spont.push({
           situation: `你想${want.text}，但是没成。原因：${String(result.error || outText).slice(0, 50)}。`,
@@ -531,9 +588,13 @@ ${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
     }
     if (blocks(feetB) || blocks(headB)) return 'suffocate'
 
+    // in_wall/cramming 只有当血真的在掉、而且周围确实有方块时才算
     if (this.lastDamageKind === 'in_wall' || this.lastDamageKind === 'cramming') {
       this.lastDamageKind = null
-      return 'suffocate'
+      if (this.busy) return null          // 正在干活，多半是挖掘产生的误报
+      if (bot.health > (this._lastHealth || 20) - 0.5) return null  // 没掉血，不是真卡
+      if (blocks(feetB) || blocks(headB)) return 'suffocate'
+      return null
     }
 
     if (bot.entity.onFire) return 'fire'
@@ -550,9 +611,58 @@ ${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
     }
     this._lastHealth = bot.health
 
-    if (bot.health <= 8) return 'lowhp'
-    if (bot.health <= 14 && bot.food < 18) return 'lowhp'
+    // 只有真的快死了才算紧急。饱食度低但血还够，让他自己去干活顺便找吃的
+    if (bot.health <= 6) return 'lowhp'
     return null
+  }
+
+  /**
+   * 做完一件事：问他爽不爽，然后长进品味里。
+   * 这是偏好"自己长出来"的唯一来源。
+   */
+  async judgeAndGrow (task, outcome) {
+    if (!this.taste || !this.mood) return
+    const kinds = classify(task)
+    if (!kinds.length) return   // 归不了类的不记
+
+    const v = await judgeFeeling(this.llm, {
+      what: task,
+      outcome,
+      mood: this.mood.describe(),
+      tasted: this.taste.likes().concat(this.taste.dislikes)
+    })
+    if (!v) return
+
+    this.taste.record({
+      what: `${task}（${v.why || outcome}）`,
+      kinds,
+      feeling: v.feeling,
+      now: this.mem.clock.now()
+    })
+    this.log(`[taste] ${task} -> 感觉 ${v.feeling.toFixed(2)} ${v.why || ''}`)
+
+    // 记住这次体验（重要的才记）
+    if (Math.abs(v.feeling) > 0.6) {
+      this.mem.add({
+        text: `${task}，感觉${v.feeling > 0 ? '挺爽' : '有点烦'}${v.why ? '：' + v.why : ''}`,
+        kind: 'fact',
+        importance: 0.6,
+        emotion: Math.abs(v.feeling)
+      })
+    }
+  }
+
+  /** 心情/品味随时间推进 */
+  tickInnerState () {
+    const now = Date.now()
+    if (!this._lastInnerTick) this._lastInnerTick = now
+    const deltaMin = (now - this._lastInnerTick) / 60000
+    if (deltaMin < 0.5) return
+    this._lastInnerTick = now
+    try {
+      if (this.mood) this.mood.tick(deltaMin)
+      if (this.taste) this.taste.decay(this.mem.clock.now())
+    } catch (e) {}
   }
 
   /** 背包快照 */
@@ -579,7 +689,9 @@ ${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
   }
 
   async doSurvive (why) {
-    if (this.actions) this.actions.cancel = true
+    // 找吃的本身需要动作能力，不能把 cancel 设成 true
+    const needCancel = why !== 'lowhp'
+    if (needCancel && this.actions) this.actions.cancel = true
     this.busy = false
     try {
       await this._survive(why)
@@ -660,10 +772,23 @@ ${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
     }
 
     if (why === 'lowhp') {
+      // 饱食度够（>=18）就会自然回血，只要没怪，等着就行
+      if (bot.food >= 18 && bot.health > 0) {
+        const near0 = this.reflex ? this.reflex.nearestHostile(10) : null
+        if (near0) {
+          this.reflex.flee(near0)
+          await sleep(4000)
+          return
+        }
+        this.log('[survive] 吃饱了，等回血（' + Math.round(bot.health) + '/20）')
+        // 找个安全地方待着
+        await sleep(15000)
+        return
+      }
       if (this.actions.hasFood()) {
         const ate = await this.actions.eat().catch(() => null)
         if (ate) {
-          this.log('[survive] 吃了 ' + ate)
+          this.log('[survive] 吃了 ' + ate + '，饱食度 ' + Math.round(bot.food))
           await sleep(2500)
           return
         }
@@ -675,20 +800,31 @@ ${s.health < 10 ? '注意：血很低，先保证安全' : ''}`
         await sleep(5000)
         return
       }
-      if (!this.seekingFood) {
+      // 找吃的加冷却，别 4 秒一次狂刷
+      const now = Date.now()
+      if (!this._foodCooldownUntil) this._foodCooldownUntil = 0
+      if (now >= this._foodCooldownUntil && !this.seekingFood) {
         this.seekingFood = true
         this.log('[survive] 没吃的，去找点吃的')
         try {
-          const got = await this.actions.findFood()
-          this.log('[survive] 找吃的：' + (got || '附近真没有'))
+          // 先在附近找，找不到就走远一点再找
+          let got = await this.actions.findFood()
+          if (!got) {
+            this.log('[survive] 附近没有，走远点')
+            try { await this.actions.wander(40) } catch (e) {}
+            await this.actions.ensureChunks(4000)
+            got = await this.actions.findFood()
+          }
+          this.log('[survive] 找吃的：' + (got || '还是没有'))
         } catch (e) {
           this.log('[survive] 找吃的出错: ' + e.message)
         }
         this.seekingFood = false
+        this._foodCooldownUntil = Date.now() + 30000   // 30 秒内不再试
         return
       }
       this.log('[survive] 血少，原地歇会儿')
-      await sleep(8000)
+      await sleep(10000)
     }
   }
 

@@ -109,29 +109,128 @@ class Actions {
   async goto (x, y, z, range = 1, timeoutMs = 30000) {
     this.check()
     this.current = `走到 ${Math.round(x)},${Math.round(y)},${Math.round(z)}`
+
+    const p0 = this.pos()
+    const dy = Math.abs(y - p0.y)
+
+    // 目标跟自己不在同一层：先解决高度差，再水平走
+    if (dy > 3) {
+      const reached = await this.gotoVertical(y, timeoutMs)
+      if (!reached) return false
+    }
+
     const goal = new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range)
     this.bot.pathfinder.setGoal(goal)
+
+    // 用 pathfinder 自己的到达事件，而不是自己算距离
+    let reached = false
+    const onReach = () => { reached = true }
+    this.bot.on('goal_reached', onReach)
+
     const t0 = Date.now()
-    while (Date.now() - t0 < timeoutMs) {
+    let stillSince = 0
+    let lastP = this.pos().clone()
+
+    try {
+      while (Date.now() - t0 < timeoutMs) {
+        this.check()
+        if (reached) return true
+
+        const p = this.pos()
+        const moved = p.distanceTo(lastP)
+        lastP = p.clone()
+
+        // 到了判定：水平距离和高度都够近
+        const dxz = Math.hypot(p.x - x, p.z - z)
+        if (dxz <= range + 1.5 && Math.abs(p.y - y) <= Math.max(3, range + 1)) {
+          return true
+        }
+
+        // 连续 8 秒没挪窝才算卡住（原来是 6 秒，太急）
+        if (moved < 0.1) stillSince += 180
+        else stillSince = 0
+        if (stillSince > 8000) {
+          this.log('[goto] 卡住了，放弃')
+          return false
+        }
+
+        await sleep(180)
+      }
+      return false
+    } finally {
+      this.bot.off('goal_reached', onReach)
+      try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+      for (const k of ['forward', 'back', 'left', 'right']) {
+        try { this.bot.setControlState(k, false) } catch (e) {}
+      }
+    }
+  }
+
+  /**
+   * 解决高度差。
+   * 往上：找斜坡/楼梯走，找不到就挖一条台阶上去。
+   * 往下：找路下去，找不到就挖个竖井（小心别挖穿到岩浆）。
+   */
+  async gotoVertical (targetY, timeoutMs = 40000) {
+    const bot = this.bot
+    const t0 = Date.now()
+    let guard = 0
+
+    while (Date.now() - t0 < timeoutMs && guard++ < 40) {
       this.check()
       const p = this.pos()
-      const d = p.distanceTo(new Vec3(x, y, z))
-      if (d <= range + 1.5) {
-        this.bot.pathfinder.setGoal(null)
-        for (const k of ['forward', 'back', 'left', 'right']) {
-          try { this.bot.setControlState(k, false) } catch (e) {}
+      const diff = targetY - p.y
+      if (Math.abs(diff) <= 2) return true
+
+      const up = diff > 0
+
+      // 1. 先试走：pathfinder 自己会找坡道
+      const tx = p.x + (Math.random() - 0.5) * 6
+      const tz = p.z + (Math.random() - 0.5) * 6
+      try {
+        this.bot.pathfinder.setGoal(new goals.GoalNear(
+          Math.floor(tx), Math.floor(targetY), Math.floor(tz), 2))
+        await sleep(1200)
+      } catch (e) {}
+
+      const p2 = this.pos()
+      if (Math.abs(p2.y - p.y) >= 1) continue   // 高度变了，继续
+
+      // 2. 走不动：自己挖
+      this.bot.pathfinder.setGoal(null)
+      if (up) {
+        // 往上挖台阶：挖头顶，然后跳上去
+        const head = bot.blockAt(p.offset(0, 2, 0))
+        const above = bot.blockAt(p.offset(0, 1, 0))
+        if (head && head.name !== 'air' && head.name !== 'cave_air' && !/bedrock/.test(head.name)) {
+          try {
+            await this.bestToolFor(head)
+            await bot.dig(head, true)
+            await sleep(200)
+          } catch (e) {}
         }
-        return true
+        // 挖出一个能站的地方后跳上去
+        try {
+          await bot.look(0, 0, true)
+          bot.setControlState('jump', true)
+          bot.setControlState('forward', true)
+          await sleep(700)
+          bot.setControlState('jump', false)
+          bot.setControlState('forward', false)
+        } catch (e) {}
+      } else {
+        // 往下挖
+        const below = bot.blockAt(p.offset(0, -1, 0))
+        if (below && below.name !== 'air' && !/bedrock|lava|water/.test(below.name)) {
+          try {
+            await this.bestToolFor(below)
+            await bot.dig(below, true)
+            await sleep(300)
+          } catch (e) {}
+        }
       }
-      // 完全没在动，且已经过了一段时间 -> 提前放弃
-      if (!this.bot.pathfinder.isMoving() && Date.now() - t0 > 6000) {
-        this.bot.pathfinder.setGoal(null)
-        return false
-      }
-      await sleep(180)
     }
-    this.bot.pathfinder.setGoal(null)
-    return false
+    return Math.abs(this.pos().y - targetY) <= 3
   }
 
   async gotoPlayer (name, range = 2) {
@@ -1081,101 +1180,331 @@ class Actions {
 
   // ---------------- 吃 ----------------
 
-  async eat () {
-    const order = ['cooked_beef', 'cooked_porkchop', 'cooked_mutton', 'cooked_chicken', 'cooked_salmon',
-      'cooked_cod', 'bread', 'baked_potato', 'apple', 'carrot', 'golden_apple',
-      'beef', 'porkchop', 'mutton', 'chicken', 'cod', 'salmon',
-      'sweet_berries', 'glow_berries', 'melon_slice', 'cookie', 'potato', 'beetroot',
-      'dried_kelp', 'honey_bottle', 'mushroom_stew', 'rabbit', 'tropical_fish']
-    for (const n of order) {
-      const it = this.item(n)
-      if (it) {
-        try {
-          await this.bot.equip(it, 'hand')
-          await this.bot.consume()
-          return n
-        } catch (e) { continue }
-      }
+  /**
+   * 吃。用 minecraft-data 的食物表，按"吃了能回多少"排序。
+   * 生的先吃也没事 —— 真人饿急了不会挑。
+   */
+  async eat ({ preferCooked = true } = {}) {
+    const items = this.bot.inventory.items()
+    const foods = []
+
+    for (const it of items) {
+      const f = mcData.foodsByName[it.name]
+      if (!f || !f.foodPoints) continue
+      // 毒土豆、河豚、蜘蛛眼这些吃了有害的，不碰
+      if (/poisonous_potato|pufferfish|spider_eye|suspicious_stew/.test(it.name)) continue
+      // 腐肉：只有实在没别的才吃
+      const bad = /rotten_flesh/.test(it.name)
+      const cooked = /^cooked_|baked_|bread|golden_apple|golden_carrot|stew/.test(it.name)
+      let score = f.foodPoints + (f.saturationRatio || 0) / 10
+      if (cooked && preferCooked) score += 6
+      if (bad) score -= 20
+      foods.push({ it, score, name: it.name })
+    }
+
+    if (!foods.length) return null
+    foods.sort((a, b) => b.score - a.score)
+
+    for (const f of foods) {
+      try {
+        await this.bot.equip(f.it, 'hand')
+        await this.bot.consume()
+        return f.name
+      } catch (e) { continue }
     }
     return null
   }
 
-  // 就地找吃的（不用 AI 决策，直接用反射层搞定）
+  /**
+   * 找吃的。按"最快拿到"的顺序试：
+   *   1. 背包里有就直接吃
+   *   2. 附近有动物就打死，捡肉，有熔炉就烤
+   *   3. 摘浆果
+   *   4. 打瓜
+   *   5. 水边抓鱼
+   *   6. 走远再找一轮
+   */
   async findFood () {
     const bot = this.bot
-    // 1. 背包里有就直接吃
+
+    // 0. 先确认自己能走动。困在坑里的话什么都干不了
+    if (!(await this.canMoveAround())) {
+      this.log('[food] 动不了，先挖出去')
+      if (this.ctx && this.ctx.reflex) await this.ctx.reflex.digOut().catch(() => {})
+      else await this.digOutSelf()
+    }
+
+    // 1. 背包里有
     if (this.hasFood()) {
       const ate = await this.eat()
       if (ate) return '吃了背包里的 ' + ate
     }
 
-    // 2. 打动物
+    // 2. 打动物 -> 捡肉 -> 能烤就烤（动物经常在几十格外，得走过去）
     const animals = ['cow', 'pig', 'chicken', 'sheep', 'rabbit']
     for (const a of animals) {
-      const e = this.nearestEntity(a, 24)
-      if (e) {
-        try {
-          await this.attack(a, 6)
-          await this.pickupNearby(10)
-          if (this.hasFood()) {
-            const ate = await this.eat()
-            if (ate) return '打了' + a + '吃掉了'
+      const e = this.nearestEntity(a, 96)
+      if (!e) continue
+      try {
+        // 太远就先追过去（用 GoalFollow，动物会动）
+        const dist = e.position.distanceTo(this.pos())
+        if (dist > 8) {
+          this.log('[food] ' + a + ' 在 ' + Math.round(dist) + ' 格外，追过去')
+          try {
+            await this.chase(a, 45000)
+          } catch (err) {
+            this.log('[food] 追不上: ' + err.message)
           }
-          return '打了' + a + '，捡到东西了'
-        } catch (err) {}
-      }
+        }
+        await this.attack(a, 8)
+        await this.pickupNearby(12)
+        // 打到生肉了吗
+        const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') || this.item('chicken') || this.item('rabbit')
+        if (raw) {
+          // 有熔炉和燃料就烤，没有就直接吃
+          const cooked = await this.tryCook(raw.name).catch(() => null)
+          if (cooked) return '打了' + a + '，烤熟了吃'
+          const ate = await this.eat()
+          if (ate) return '打了' + a + '，吃了' + ate
+        }
+        if (this.hasFood()) {
+          const ate = await this.eat()
+          if (ate) return '打了' + a + '，吃了' + ate
+        }
+      } catch (err) {}
     }
 
-    // 3. 找浆果丛
-    for (const bush of ['sweet_berry_bush', 'cave_vines']) {
-      const b = this.findBlock(bush, 40)
-      if (b) {
-        try {
-          await this.digAt(b)
-          await this.pickupNearby(6)
-          if (this.hasFood()) { const ate = await this.eat(); if (ate) return '摘了浆果吃了' }
-          return '摘了浆果'
-        } catch (e) {}
-      }
+    // 3. 浆果
+    for (const bush of ['sweet_berry_bush', 'cave_vines', 'cave_vines_plant']) {
+      const b = this.findBlock(bush, 48)
+      if (!b) continue
+      try {
+        await this.digAt(b)
+        await this.pickupNearby(6)
+        if (this.hasFood()) {
+          const ate = await this.eat()
+          if (ate) return '摘了浆果吃了'
+        }
+      } catch (e) {}
     }
 
-    // 4. 打西瓜/南瓜
+    // 4. 瓜
     for (const crop of ['melon', 'pumpkin']) {
-      const b = this.findBlock(crop, 40)
-      if (b) {
-        try {
-          await this.digAt(b)
-          await this.pickupNearby(6)
-          if (this.hasFood()) { const ate = await this.eat(); if (ate) return '弄了' + crop + '吃了' }
-          return '弄了' + crop
-        } catch (e) {}
-      }
+      const b = this.findBlock(crop, 48)
+      if (!b) continue
+      try {
+        await this.digAt(b)
+        await this.pickupNearby(6)
+        if (this.hasFood()) {
+          const ate = await this.eat()
+          if (ate) return '弄了' + crop + '吃了'
+        }
+      } catch (e) {}
     }
 
-    // 5. 打水里的鱼
+    // 5. 抓鱼
     for (const fish of ['cod', 'salmon']) {
-      const e = this.nearestEntity(fish, 20)
-      if (e) {
-        try { await this.attack(fish, 5); await this.pickupNearby(8); return '抓了鱼' } catch (err) {}
-      }
+      const e = this.nearestEntity(fish, 24)
+      if (!e) continue
+      try {
+        await this.attack(fish, 6)
+        await this.pickupNearby(10)
+        const raw = this.item('cod') || this.item('salmon')
+        if (raw) {
+          const cooked = await this.tryCook(raw.name).catch(() => null)
+          if (cooked) return '抓了鱼，烤熟了吃'
+          const ate = await this.eat()
+          if (ate) return '抓了鱼吃'
+        }
+      } catch (err) {}
     }
 
-    // 6. 实在没有，走远一点再试一次
+    // 6. 走远再找一轮
     try {
-      await this.wander(24)
-      const b = this.findBlock('sweet_berry_bush', 32) || this.findBlock('melon', 32)
-      if (b) { await this.digAt(b); await this.pickupNearby(6); if (this.hasFood()) { const ate = await this.eat(); if (ate) return '走远找到吃的了' } }
-      const e = this.nearestEntity('cow', 24) || this.nearestEntity('pig', 24) || this.nearestEntity('chicken', 24)
-      if (e) { await this.attack(e.name, 6); await this.pickupNearby(8); if (this.hasFood()) { const ate = await this.eat(); if (ate) return '走远打到猎物' } }
+      this.log('[food] 附近没有，走远找')
+      await this.wander(48)
+      await this.ensureChunks(4000)
+      const e = this.nearestEntity('cow', 96) || this.nearestEntity('pig', 96) ||
+        this.nearestEntity('chicken', 96) || this.nearestEntity('sheep', 96)
+      if (e) {
+        await this.attack(e.name, 8)
+        await this.pickupNearby(12)
+        const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') || this.item('chicken')
+        if (raw) {
+          const cooked = await this.tryCook(raw.name).catch(() => null)
+          if (cooked) return '走远打了' + e.name + '，烤熟了吃'
+        }
+        if (this.hasFood()) {
+          const ate = await this.eat()
+          if (ate) return '走远打到猎物吃了'
+        }
+      }
+      const b = this.findBlock('sweet_berry_bush', 40)
+      if (b) {
+        await this.digAt(b)
+        await this.pickupNearby(6)
+        if (this.hasFood()) {
+          const ate = await this.eat()
+          if (ate) return '走远摘到浆果'
+        }
+      }
     } catch (err) {}
 
     return null
   }
 
-  // 背包里有没有吃的
+  /** 试一下能不能走动（四个方向都试，不是只往前走） */
+  async canMoveAround () {
+    const p0 = this.pos()
+    const dirs = [
+      { yaw: -Math.PI / 2, key: 'forward' },   // +X
+      { yaw: Math.PI / 2, key: 'forward' },    // -X
+      { yaw: 0, key: 'forward' },              // +Z
+      { yaw: Math.PI, key: 'forward' }         // -Z
+    ]
+    for (const d of dirs) {
+      try {
+        await this.bot.look(d.yaw, 0, true)
+        this.bot.setControlState(d.key, true)
+        await sleep(450)
+        this.bot.setControlState(d.key, false)
+      } catch (e) {}
+      await sleep(120)
+      if (p0.distanceTo(this.pos()) > 0.6) return true
+    }
+    return false
+  }
+
+  /** 朝某个方向走（会先转向） */
+  async walkToward (dx, dz, ms = 900) {
+    // yaw 约定：0 = +Z，-PI/2 = +X
+    const yaw = Math.atan2(-dx, dz)
+    try {
+      await this.bot.look(yaw, 0, true)
+      await sleep(120)
+      this.bot.setControlState('forward', true)
+      await sleep(ms)
+      this.bot.setControlState('forward', false)
+    } catch (e) {
+      try { this.bot.setControlState('forward', false) } catch (e2) {}
+    }
+  }
+
+  /** 自己挖一条路出来（不依赖 reflex） */
+  async digOutSelf () {
+    const bot = this.bot
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]].sort(() => Math.random() - 0.5)
+    for (const [dx, dz] of dirs) {
+      try {
+        for (let step = 1; step <= 3; step++) {
+          const p = bot.entity.position
+          const base = p.offset(dx * step, 0, dz * step)
+          for (const off of [0, 1]) {
+            const b = bot.blockAt(base.offset(0, off, 0))
+            if (!b || b.name === 'air' || b.name === 'cave_air') continue
+            if (/bedrock|water|lava/.test(b.name)) break
+            try {
+              await this.bestToolFor(b)
+              await bot.dig(b, true)
+              await sleep(200)
+            } catch (e) { break }
+          }
+        }
+        await this.walkToward(dx, dz, 1100)
+        if (await this.canMoveAround()) {
+          this.log('[digout] 出来了')
+          return true
+        }
+      } catch (e) {}
+    }
+    return false
+  }
+
+  /**
+   * 把生肉烤成熟肉。
+   * 没熔炉就现做一个（8 个圆石），没燃料就砍点木头。
+   */
+  async tryCook (rawName) {
+    if (!rawName) return null
+    const cookedName = rawName.replace(/^beef$/, 'cooked_beef')
+      .replace(/^porkchop$/, 'cooked_porkchop')
+      .replace(/^mutton$/, 'cooked_mutton')
+      .replace(/^chicken$/, 'cooked_chicken')
+      .replace(/^rabbit$/, 'cooked_rabbit')
+      .replace(/^cod$/, 'cooked_cod')
+      .replace(/^salmon$/, 'cooked_salmon')
+    if (cookedName === rawName) return null
+    if (this.item(cookedName)) return cookedName
+
+    // 有熔炉吗
+    let furnace = this.findBlock('furnace', 20)
+    if (!furnace) {
+      // 现做一个：需要 8 个圆石
+      if (this.countOf('furnace') > 0) {
+        furnace = await this.placeNearby('furnace')
+      } else {
+        let stone = this.countOf('cobblestone') + this.countOf('cobbled_deepslate')
+        if (stone < 8) {
+          this.log('[cook] 圆石不够（' + stone + '/8），挖点')
+          try { stone = await this.digStone(8) } catch (e) {}
+        }
+        if (stone < 8) {
+          this.log('[cook] 挖不到圆石，只能吃生的')
+          return null
+        }
+        try {
+          await this.craftSmart('furnace', 1)
+          furnace = await this.placeNearby('furnace')
+        } catch (e) {
+          this.log('[cook] 做熔炉失败: ' + e.message)
+          return null
+        }
+      }
+    }
+    if (!furnace) return null
+
+    // 有燃料吗
+    const fuel = ['coal', 'charcoal', 'oak_planks', 'birch_planks', 'spruce_planks',
+      'oak_log', 'birch_log', 'spruce_log', 'stick']
+      .map(n => this.item(n)).find(Boolean)
+    if (!fuel) {
+      this.log('[cook] 没燃料，砍点木头')
+      try { await this.ensureWood(2); await this.anyPlanks(2) } catch (e) {}
+      const f2 = ['oak_planks', 'birch_planks', 'oak_log', 'stick'].map(n => this.item(n)).find(Boolean)
+      if (!f2) return null
+      return await this.smelt(rawName, f2.name, 2).then(() => this.item(cookedName) ? cookedName : null).catch(() => null)
+    }
+
+    try {
+      await this.smelt(rawName, fuel.name, 2)
+      if (this.item(cookedName)) {
+        this.log('[cook] 烤好了 ' + cookedName)
+        return cookedName
+      }
+    } catch (e) {
+      this.log('[cook] 烤失败: ' + e.message)
+    }
+    return null
+  }
+
+  // 背包里有没有能吃的（用游戏自己的食物表）
   hasFood () {
-    return this.bot.inventory.items().some(i =>
-      /bread|cooked_|apple|carrot|potato|beef|porkchop|mutton|chicken|melon|baked|stew|berries|cod|salmon/.test(i.name))
+    return this.bot.inventory.items().some(i => {
+      const f = mcData.foodsByName[i.name]
+      if (!f || !f.foodPoints) return false
+      return !/poisonous_potato|pufferfish|spider_eye/.test(i.name)
+    })
+  }
+
+  /** 背包里所有能吃的东西，按好坏排 */
+  foodList () {
+    const out = []
+    for (const it of this.bot.inventory.items()) {
+      const f = mcData.foodsByName[it.name]
+      if (!f || !f.foodPoints) continue
+      out.push({ name: it.name, count: it.count, points: f.foodPoints, raw: f.displayName })
+    }
+    return out.sort((a, b) => b.points - a.points)
   }
 
   // ---------------- 打 ----------------
@@ -1192,10 +1521,45 @@ class Actions {
     return best
   }
 
+  /** 追一个会动的目标 */
+  async chase (name, timeoutMs = 30000, stopDist = 3) {
+    const bot = this.bot
+    const t0 = Date.now()
+    let lastDist = 1e9
+    let stillSince = 0
+
+    while (Date.now() - t0 < timeoutMs) {
+      this.check()
+      const e = this.nearestEntity(name, 96)
+      if (!e) return false
+      const d = e.position.distanceTo(this.pos())
+      if (d <= stopDist) {
+        try { bot.pathfinder.setGoal(null) } catch (err) {}
+        return true
+      }
+      // 追
+      try {
+        bot.pathfinder.setGoal(new goals.GoalFollow(e, Math.max(1, stopDist - 1)), true)
+      } catch (err) {}
+      await sleep(300)
+
+      if (Math.abs(d - lastDist) < 0.3) stillSince += 300
+      else stillSince = 0
+      lastDist = d
+      if (stillSince > 10000) {
+        this.log('[chase] 追不上 ' + name)
+        try { bot.pathfinder.setGoal(null) } catch (err) {}
+        return false
+      }
+    }
+    try { bot.pathfinder.setGoal(null) } catch (err) {}
+    return false
+  }
+
   async attack (name, times = 5) {
     this.check()
     await this.bestWeapon()
-    const e = this.nearestEntity(name, 20)
+    const e = this.nearestEntity(name, 96)
     if (!e) throw new Error('附近没有 ' + name)
     for (let i = 0; i < times; i++) {
       this.check()

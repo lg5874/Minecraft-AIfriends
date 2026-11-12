@@ -209,6 +209,71 @@ class Reflex {
     }
   }
 
+  /**
+   * 真的挖出去。
+   * 卡在坑里 / 被围住的时候，pathfinder 算不出路，只能自己开一条。
+   */
+  async digOut () {
+    const bot = this.bot
+    this.ctx.log('[digout] 挖一条路出去')
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+    // 打乱方向，别总往一个方向挖
+    dirs.sort(() => Math.random() - 0.5)
+
+    for (const [dx, dz] of dirs) {
+      try {
+        const p = bot.entity.position
+        // 往这个方向挖两格，同时把头顶挖开
+        for (let step = 1; step <= 2; step++) {
+          const base = p.offset(dx * step, 0, dz * step)
+          const feet = bot.blockAt(base)
+          const head = bot.blockAt(base.offset(0, 1, 0))
+
+          // 脚下如果是空的，往下垫一下（别掉下去）
+          const below = bot.blockAt(base.offset(0, -1, 0))
+          if (below && (below.name === 'air' || below.name === 'cave_air')) {
+            const fill = ['dirt', 'cobblestone', 'stone', 'gravel']
+              .map(n => bot.inventory.items().find(i => i.name === n)).find(Boolean)
+            if (fill) {
+              try {
+                await bot.equip(fill, 'hand')
+                await bot.placeBlock(below, new Vec3(0, 1, 0))
+              } catch (e) {}
+            }
+          }
+
+          for (const b of [feet, head]) {
+            if (!b) continue
+            if (b.name === 'air' || b.name === 'cave_air') continue
+            if (b.name === 'bedrock' || b.name === 'water' || b.name === 'lava') break
+            try {
+              await bot.dig(b, true)
+              await new Promise(r => setTimeout(r, 250))
+            } catch (e) { break }
+          }
+        }
+        // 挖通了就朝那个方向走过去（先转向，不然是撞墙）
+        const yaw = Math.atan2(-dx, dz)
+        try {
+          await bot.look(yaw, 0, true)
+          await new Promise(r => setTimeout(r, 120))
+        } catch (e) {}
+        bot.setControlState('forward', true)
+        await new Promise(r => setTimeout(r, 1100))
+        bot.setControlState('forward', false)
+
+        // 出来了？
+        const now = bot.entity.position
+        if (this.lastPos && now.distanceTo(this.lastPos) > 1.5) {
+          this.ctx.log('[digout] 出来了')
+          return true
+        }
+      } catch (e) {}
+    }
+    this.ctx.log('[digout] 没挖出去，再试')
+    return false
+  }
+
   nearestHostile (range) {
     const ents = Object.values(this.bot.entities).filter(e =>
       e !== this.bot.entity && e.name && HOSTILE.has(e.name) &&
@@ -243,15 +308,32 @@ class Reflex {
     this.lastUnstuck = now
     const bot = this.bot
     this.ctx.log('[unstuck]')
+
+    // 先试最简单的：跳一下 + 随便走
+    // 如果连续几次都没用，就真的挖出去
+    this.unstuckTries = (this.unstuckTries || 0) + 1
+    if (this.unstuckTries >= 3) {
+      this.unstuckTries = 0
+      await this.digOut()
+      return
+    }
     try {
       bot.setControlState('jump', true)
       await new Promise(r => setTimeout(r, 350))
       bot.setControlState('jump', false)
-      const dirs = ['forward', 'back', 'left', 'right']
-      const d = dirs[Math.floor(Math.random() * dirs.length)]
-      bot.setControlState(d, true)
-      await new Promise(r => setTimeout(r, 600))
-      bot.setControlState(d, false)
+      // 朝四个方向各试一下（先转再走）
+      const yaws = [-Math.PI / 2, Math.PI / 2, 0, Math.PI]
+      for (const y of yaws) {
+        try {
+          await bot.look(y, 0, true)
+          await new Promise(r => setTimeout(r, 80))
+          bot.setControlState('forward', true)
+          await new Promise(r => setTimeout(r, 500))
+          bot.setControlState('forward', false)
+        } catch (e) {}
+        const p2 = bot.entity.position
+        if (this.lastPos && p2.distanceTo(this.lastPos) > 0.8) break
+      }
     } catch (e) {}
   }
 }

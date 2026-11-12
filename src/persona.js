@@ -60,6 +60,8 @@ function fallbackLine () {
  */
 function systemPrompt (mem, stateLine, recalled, opts) {
   opts = opts || {}
+  const tasteBlock = opts.taste ? opts.taste.prompt() : ''
+  const moodBlock = opts.mood ? opts.mood.prompt() : ''
   const people = mem.peopleDigest()
   const places = mem.placesDigest()
   const recent = mem.recentSession(10)
@@ -129,6 +131,10 @@ ${opts.secrets ? secrets.secretsPrompt(opts.secrets, opts.viewer) : ''}
 
 ## 现在几点
 ${realtime.timePrompt(realtime.realTime())}
+
+${tasteBlock}
+
+${moodBlock}
 ${lastBlock}
 ## 你现在
 ${stateLine || '（刚上线）'}
