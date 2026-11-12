@@ -369,6 +369,12 @@ function main () {
     return
   }
 
+  if (opt.quiet) {
+    console.log(outPath)
+    if (gz.length > 5 * 1024 * 1024) process.exitCode = 4
+    return
+  }
+
   say('')
   say('打包完成')
   say('  产物   ' + outPath)

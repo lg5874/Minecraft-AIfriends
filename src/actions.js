@@ -1816,8 +1816,9 @@ class Actions {
     const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]]
     const bad = new Set()          // 「格子|方向」试过且失败，别原地打转
 
-    const filler = () => ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
-      .map(n => this.item(n)).find(Boolean)
+    const FILL_NAMES = ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
+    const filler = () => FILL_NAMES.map(n => this.item(n)).find(Boolean)
+    const fillerCount = () => FILL_NAMES.reduce((n, name) => n + this.countOf(name), 0)
 
     const isSolid = (v) => {
       const b = bot.blockAt(v)
@@ -2082,6 +2083,36 @@ class Actions {
 
       return this.pos().y >= F + 0.9
     }
+
+    /**
+     * 先攒够垫脚料再往上走。
+     *
+     * 为什么必须有这一步：塔升一格只要 0.2 秒，但每格要消耗 1 块方块。
+     * 背包空的时候只能退回"挖台阶"，实测 50 秒/格 —— 6 格就要 300 秒。
+     * 有料的话 18 格 4 秒就上去了。差 75 倍。
+     *
+     * 做法：原地往下挖几格（挖出来的东西自己就进包），够数就停。
+     */
+    const stockFiller = async (need = 12) => {
+      if (fillerCount() >= need) return true
+      const t0 = Date.now()
+      while (fillerCount() < need && Date.now() - t0 < 25000) {
+        const p = this.pos()
+        const below = p.offset(0, -1, 0)
+        if (!isSolid(below)) break
+        if (/bedrock|lava|water/.test(nameAt(below))) break
+        const before = fillerCount()
+        await digOne(below)
+        await sleep(260)
+        if (fillerCount() <= before && !isSolid(p.offset(0, -1, 0))) {
+          // 挖了但没进包（可能是空手挖石头），别再耗时间
+          if (fillerCount() === 0) break
+        }
+      }
+      this.log(`[surface] 攒料：${fillerCount()} 块`)
+      return fillerCount() > 0
+    }
+    await stockFiller(12)
 
     try {
       for (let step = 0; step < maxSteps; step++) {

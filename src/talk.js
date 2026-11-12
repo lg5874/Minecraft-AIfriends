@@ -51,9 +51,11 @@ class Talk {
 
     const kinds = recent.map(r => r.kind).filter(Boolean)
     const same = kinds.length >= 2 && kinds.every(k => k === kinds[0])
-    // 开头字重复也算
+    // 开头字重复也算。注意是**相邻两句**就算 —— 日志里的真实序列是
+    // 「嗯，好」「回来了，刚爬上来做石镐呢」「回来了，问第三遍了」，
+    // 三句全同的要求永远等不到，等于这个机制从来没生效过。
     const heads = recent.map(r => String(r.text || '').slice(0, 2))
-    const sameHead = heads.length >= 2 && heads.every(h => h === heads[0])
+    const sameHead = heads.length >= 2 && heads.some((h, i) => i > 0 && h === heads[i - 1])
 
     if (!same && !sameHead) return ''
 
@@ -324,6 +326,11 @@ ${this.fatigueHint()}`
     }
   }
 
+  /** 撤销标记（这次其实没说出来，下次还得有机会回） */
+  unmarkReplied (who, msg) {
+    this.repliedMsgIds.delete(this.msgId(who, msg))
+  }
+
   /** 记下一条"等会儿再回"的话 */
   defer (who, msg) {
     // 同一人同一句不重复记
@@ -388,8 +395,14 @@ ${item.who} 刚才说的是：${item.msg}
 
     this.history.push({ who: item.who, msg: item.msg })
     this.history.push({ who: '我', msg: out })
-    await this.say(out)
-    this.markReplied(username, message)   // 标记这条回过了，防止其他路径重复
+    const said = await this.say(out)
+    // 回头接的话也要进疲劳记录，不然疲劳机制看不见这一句
+    if (said) {
+      this.recentSaid.push({ text: out, at: Date.now(), kind: detectSayKind(out) })
+      if (this.recentSaid.length > 10) this.recentSaid.shift()
+    }
+    // 标记这条回过了，防止其他路径重复（这里是 item.who / item.msg，不是 username/message）
+    this.markReplied(item.who, item.msg)
     return true
   }
 
@@ -430,6 +443,23 @@ ${item.who} 刚才说的是：${item.msg}
       this.ctx.log(`[chat] 这条已经回过了，跳过：${message.slice(0, 20)}`)
       return
     }
+    // **先占位再干活**。
+    // 只靠开头这次 hasReplied 是不够的：延迟回复、事件队列、回头接话是三条
+    // 并发路径，它们会在 await 模型的时候同时通过检查，然后各发一条 ——
+    // 日志里那四句就是这么来的。先占位，后面任何路径再进来都会被挡掉。
+    this.markReplied(username, message)
+    let committed = false
+    try {
+      committed = await this._replyInner(username, message, opts)
+    } finally {
+      // 没真的说出口（模型不理、被拦、报错）就撤销占位，下次还有机会
+      if (!committed) this.unmarkReplied(username, message)
+    }
+    return committed
+  }
+
+  /** reply 的本体。返回 true 表示真的说出去了 */
+  async _replyInner (username, message, opts = {}) {
     const busyReply = !!opts.busy
     const doing = this.describeDoing()
     let world = ''
@@ -533,19 +563,19 @@ ${item.who} 刚才说的是：${item.msg}
       out = (r.text || '').trim()
     } catch (e) {
       this.ctx.log('[chat] llm fail ' + e.message)
-      return
+      return false
     }
 
     if (!out || out.includes('[不理]')) {
       this.ctx.log('[chat] 选择不理 ' + username)
-      return
+      return false
     }
 
     out = cleanLine(out, 60)
-    if (!out) return
+    if (!out) return false
     if (persona.isLeak(out)) {
       this.ctx.log('[leak blocked] ' + out)
-      return
+      return false
     }
 
     this.history.push({ who: username, msg: message })
@@ -562,7 +592,9 @@ ${item.who} 刚才说的是：${item.msg}
 
     this.mem.maybeRemember('我说：' + out, { who: [username], hasNewInfo: false })
 
-    await this.say(out)
+    // 真的说出去了才算回过（say 可能被 isLeak / isMachineTalk 拦下）
+    const said = await this.say(out)
+    return !!said
   }
 }
 

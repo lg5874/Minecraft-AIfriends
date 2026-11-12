@@ -54,12 +54,12 @@ node scripts/package.js
 ```
 打包完成
   产物   /root/workspace/minecraft-AIfriend/dist/minecraft-aifriend-0.1.0-20261113-054257.tar.gz
-  大小   179.5 KB（tar 546.0 KB 压缩后）
+  大小   186.9 KB（tar 566.5 KB 压缩后）
   文件   37 个
   build  9e5ad9d50aba048c
 ```
 
-> **179 KB**。不含 `node_modules`（500MB 那坨由服务器装），不含 `config.json`（key 绝不进包）。
+> **187 KB**。不含 `node_modules`（500MB 那坨由服务器装），不含 `config.json`（key 绝不进包）。
 > 打包脚本会自己扫一遍：发现疑似 key 就直接拒绝打包并报出是哪一行。
 
 想先看会打进去什么：
@@ -119,7 +119,7 @@ cd /root/workspace/mcplugin
 [XJJ] bot 已启动 pid=12345 node=v20.x.x
 ```
 
-第一次启动会在 `npm install` 停一会儿（装 mineflayer，通常 1–3 分钟，看网络）。
+第一次启动会在 `npm install` 停一会儿（装 mineflayer，通常 1–3 分钟，看网络；本机实测 25 秒）。
 控制台这时候没动静是**正常的**，别以为卡死了。
 
 ---
@@ -323,7 +323,7 @@ java -cp build/classes com.xjj.runner.SelfTest \
   /root/workspace/minecraft-AIfriend/dist/minecraft-aifriend-0.1.0-*.tar.gz
 ```
 
-验四件事：真包能解开、日志轮转正确、进程能起、崩了会重启。
+验四件事：真包能解开（含 UTF-8 中文）、日志轮转正确、进程能起、崩了会重启。
 
 ### 9.2 全流程部署验证
 
@@ -336,9 +336,27 @@ java -cp build/classes com.xjj.runner.DeployCheck \
 
 模拟一台干净服务器：建 `plugins/XJJBot/upload/` → 放包 → 解包 → **真跑 npm install** → 生成 config.json → 起进程 → `kill -9` 验证重启 → 优雅停止。
 
-当前实测结果：**34 项全过**，npm install 25 秒（本机），包解开 66ms。
+加 `--npm` 才会真装依赖（约 25 秒）；不加就跳过，秒出结果。
 
-### 9.3 只在本地验证包本身
+### 9.3 边界验证
+
+```bash
+java -cp build/classes com.xjj.runner.EdgeCheck /tmp/xjj-edge
+```
+
+验的是主流程没覆盖、但线上会踩到的：`maxRestarts` 到上限会停在 `FAILED`、`node.args` 真的传给子进程、日志洪水被轮转兜住、`bot/` 被删空后补包能恢复、重新解包不冲掉 `config.json`。
+
+### 9.4 打包与兼容性
+
+```bash
+cd /root/workspace/mcplugin && ./build.sh
+```
+
+`build.sh` 除了编译打包，还会跑 `tools/PaperCompat.java`：用真实的 Bukkit API 加载插件类，确认主类继承关系、命令签名、依赖类完整、jar 里没混进自检类或 paper-api。
+
+**当前实测：插件兼容 23 项 + 单元自检 31 项 + 部署验证 28 项 + 边界 21 项 = 103 项全过。**
+
+### 9.5 只在本地验证包本身
 
 ```bash
 cd /tmp && rm -rf pkgtest && mkdir pkgtest && cd pkgtest
@@ -392,7 +410,7 @@ tail -200 plugins/XJJBot/logs/bot/bot.log     # 他的视角
 
 上服务器前对照这个：
 
-- [ ] `node scripts/package.js` 跑过，产物 ≤ 5MB（实际 179KB）
+- [ ] `node scripts/package.js` 跑过，产物 ≤ 5MB（实际 187KB）
 - [ ] `./build.sh` 跑过，`XJJBot.jar` 有 48KB
 - [ ] jar 在 `plugins/XJJBot.jar`
 - [ ] 包在 `plugins/XJJBot/upload/`
