@@ -3796,22 +3796,39 @@ class Actions {
     return null
   }
 
-  // 背包里有没有能吃的（用游戏自己的食物表）
+  /**
+   * 背包里有没有能吃的。
+   *
+   * 口径统一到一处：`_edible(name)`。
+   * 之前 hasFood 排除 spider_eye，foodList 不排除；
+   * eat 又额外排除 suspicious_stew —— 三处口径不一致，
+   * 会出现"hasFood 说没有、foodList 说有一堆、eat 一个都不吃"的死循环。
+   */
+  _edible (name) {
+    const f = mcData.foodsByName[name]
+    if (!f || !f.foodPoints) return null
+    if (/poisonous_potato|pufferfish|spider_eye|suspicious_stew/.test(name)) return null
+    return f
+  }
+
   hasFood () {
-    return this.bot.inventory.items().some(i => {
-      const f = mcData.foodsByName[i.name]
-      if (!f || !f.foodPoints) return false
-      return !/poisonous_potato|pufferfish|spider_eye/.test(i.name)
-    })
+    return this.bot.inventory.items().some(i => !!this._edible(i.name))
   }
 
   /** 背包里所有能吃的东西，按好坏排 */
   foodList () {
     const out = []
     for (const it of this.bot.inventory.items()) {
-      const f = mcData.foodsByName[it.name]
-      if (!f || !f.foodPoints) continue
-      out.push({ name: it.name, count: it.count, points: f.foodPoints, raw: f.displayName })
+      const f = this._edible(it.name)
+      if (!f) continue
+      out.push({
+        name: it.name,
+        count: it.count,
+        points: f.foodPoints,
+        raw: f.displayName,
+        // 生肉也标出来：调用方可能想先烤
+        isRaw: /^(beef|porkchop|mutton|chicken|rabbit|cod|salmon)$/.test(it.name)
+      })
     }
     return out.sort((a, b) => b.points - a.points)
   }
