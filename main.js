@@ -24,6 +24,7 @@ const spontaneous = require('./src/spontaneous')
 const { Perception } = require('./src/perceive')
 const { PluginAdapter } = require('./src/plugin')
 const { EventQueue } = require('./src/events')
+const SelfState = require('./src/selfstate')
 const { Taste } = require('./src/taste')
 const Mood = require('./src/mood')
 const { Impulse, classify, judgeFeeling } = require('./src/impulse')
@@ -75,6 +76,7 @@ class Bot {
     this.perceive = null
     this.events = null
     this.plugin = null
+    this.selfState = null
   }
 
   log (s) {
@@ -287,6 +289,13 @@ class Bot {
     this.events = this.events || new EventQueue({ log: (m) => this.log(m) })
     this.events.onWake((ev) => this.onUrgentEvent(ev))
 
+    // 自我状态：让他"一直在场"（知道自己的镐子还在不在）
+    this.selfState = new SelfState(bot, {
+      log: (m) => this.log(m),
+      events: this.events
+    })
+    this.selfState.start()
+
     // 感知层：把世界翻译成人能看懂的话
     this.perceive = new Perception(bot, {
       mem: this.mem,
@@ -358,6 +367,7 @@ class Bot {
   onEnd (reason) {
     this.log('断开: ' + reason)
     if (this.reflex) this.reflex.stop()
+    if (this.selfState) this.selfState.stop()
     if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null }
     try { this.mem.goOffline() } catch (e) {}
 
@@ -897,7 +907,15 @@ class Bot {
       pluginHint = this.plugin ? this.plugin.prompt() : ''
     } catch (e) {}
 
-    return world + '\n' + extra.join('\n') + (pluginHint ? '\n' + pluginHint : '')
+    // 自我状态：永远是第一优先（镐子还在不在比地形更重要）
+    let selfBlock = ''
+    try {
+      selfBlock = this.selfState ? this.selfState.prompt() : ''
+    } catch (e) {
+      this.log('[self] ' + e.message)
+    }
+
+    return (selfBlock ? selfBlock + '\n\n' : '') + world + '\n' + extra.join('\n') + (pluginHint ? '\n' + pluginHint : '')
   }
 
   dumpCode (goal, code, attempt) {

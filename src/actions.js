@@ -584,8 +584,15 @@ class Actions {
       return false
     }
 
-    // 选对工具
-    await this.bestToolFor(block)
+    // 选对工具（挖不动就明确报错，不拿泥土硬挖石头）
+    const toolResult = await this.bestToolFor(block)
+    if (!toolResult.ok) {
+      this.log(`[dig] 挖不了 ${block.name}：${toolResult.reason}`)
+      return false
+    }
+    if (toolResult.tool) {
+      this.log(`[dig] 用 ${toolResult.tool} 挖 ${block.name}`)
+    }
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.bot.dig(block, true)
@@ -606,32 +613,199 @@ class Actions {
   }
 
   // 用最合适的工具
+  /**
+   * 换最合适的工具。
+   *
+   * 之前的实现是坏的：一堆 `null : null` 的死代码，而且只看 material 字段，
+   * 遇到 "mineable/pickaxe" 这种格式就匹配不上，结果拿着泥土去挖石头。
+   *
+   * 现在用 mineflayer 自带的 bestHarvestTool —— 它知道每个方块需要什么工具等级。
+   *
+   * @returns {Promise<{ok:boolean, tool:string|null, reason:string}>}
+   */
   async bestToolFor (block) {
+    const bot = this.bot
+    if (!block) return { ok: false, tool: null, reason: '没有方块' }
+
     try {
-      const tools = this.bot.pathfinder.movements ? null : null
-      const items = this.bot.inventory.items()
-      const tool = this.bot.pathfinder.bestHarvestTool
-        ? null : null
-      const best = this.bot.pathfinder && this.bot.pathfinder.movements
-        ? null : null
-      // 直接按名字找
-      const want = []
-      const mat = block.material || ''
-      if (mat.includes('pickaxe')) want.push('netherite_pickaxe', 'diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe')
-      else if (mat.includes('axe')) want.push('netherite_axe', 'diamond_axe', 'iron_axe', 'stone_axe', 'wooden_axe')
-      else if (mat.includes('shovel')) want.push('netherite_shovel', 'diamond_shovel', 'iron_shovel', 'stone_shovel', 'wooden_shovel')
-      else if (mat.includes('hoe')) want.push('netherite_hoe', 'diamond_hoe', 'iron_hoe', 'stone_hoe', 'wooden_hoe')
-      else if (block.name.includes('leaves') || block.name.includes('wool')) want.push('shears')
-      for (const w of want) {
-        const it = items.find(i => i.name === w)
-        if (it) { await this.bot.equip(it, 'hand'); return }
+      // mineflayer 的 bot.pathfinder.bestHarvestTool 会返回最优工具（可能为 null）
+      const best = bot.pathfinder && bot.pathfinder.bestHarvestTool
+        ? bot.pathfinder.bestHarvestTool(block)
+        : null
+
+      if (best) {
+        // 已经拿在手上就不换
+        if (bot.heldItem && bot.heldItem.name === best.name) {
+          return { ok: true, tool: best.name, reason: '已经在手上' }
+        }
+        await bot.equip(best, 'hand')
+        return { ok: true, tool: best.name, reason: '换上了' }
       }
     } catch (e) {}
+
+    // 兜底：按方块需要的工具类型自己找
+    const need = this._toolKindFor(block)
+    if (need) {
+      const found = bot.inventory.items()
+        .filter(i => i.name.includes(need))
+        .sort((a, b) => this._toolRank(b.name) - this._toolRank(a.name))[0]
+      if (found) {
+        try {
+          await bot.equip(found, 'hand')
+          return { ok: true, tool: found.name, reason: '按类型找到 ' + need }
+        } catch (e) {}
+      }
+      // 需要工具但没有
+      const canDigBare = this._canDigByHand(block)
+      if (!canDigBare) {
+        return {
+          ok: false,
+          tool: null,
+          reason: `需要${need === 'pickaxe' ? '镐子' : need === 'axe' ? '斧头' : need === 'shovel' ? '铲子' : '工具'}，但身上没有`
+        }
+      }
+    }
+
+    // 空手也能挖的（泥土、沙子、木头）
+    return { ok: true, tool: null, reason: '空手可以挖' }
   }
 
-  // 挖若干块某种方块
+  /** 这个方块需要什么类型的工具 */
+  _toolKindFor (block) {
+    const mat = String(block.material || '')
+    const name = block.name || ''
+    if (mat.includes('pickaxe')) return 'pickaxe'
+    if (mat.includes('axe')) return 'axe'
+    if (mat.includes('shovel')) return 'shovel'
+    if (mat.includes('hoe')) return 'hoe'
+    if (mat.includes('shears') || /leaves|wool/.test(name)) return 'shears'
+    // 兜底：按方块名判断
+    if (/stone|ore|deepslate|cobble|andesite|diorite|granite|obsidian|netherrack|brick|concrete|terracotta/.test(name)) return 'pickaxe'
+    if (/_log$|_planks$|_wood$|crafting_table|chest|furnace|door|fence/.test(name)) return 'axe'
+    if (/dirt|sand|gravel|clay|snow|soul_soil/.test(name)) return 'shovel'
+    return null
+  }
+
+  /** 工具等级（数字越大越好） */
+  _toolRank (name) {
+    if (/netherite/.test(name)) return 6
+    if (/diamond/.test(name)) return 5
+    if (/iron/.test(name)) return 4
+    if (/stone/.test(name)) return 3
+    if (/golden/.test(name)) return 2
+    if (/wooden/.test(name)) return 1
+    return 0
+  }
+
+  /** 空手能不能挖 */
+  _canDigByHand (block) {
+    const name = block.name || ''
+    // 石头类空手挖不掉
+    if (/stone|ore|deepslate|cobble|andesite|diorite|granite|obsidian/.test(name)) return false
+    return true
+  }
+
+  /**
+   * 检查关键工具还在不在。镐子会坏，坏了就挖不了石头。
+   * @returns {{has:boolean, missing:string[]}}
+   */
+  checkTools () {
+    const items = this.bot.inventory.items()
+    const has = (kind) => items.some(i => i.name.includes(kind))
+    const missing = []
+    if (!has('pickaxe')) missing.push('pickaxe')
+    return { has: missing.length === 0, missing }
+  }
+
+  /**
+   * 想办法弄一把镐子。
+   * 优先级：背包有现成的 → 有原木就做 → 有木板就做 → 什么都没有就砍树
+   */
+  async ensurePickaxe () {
+    const items = this.bot.inventory.items()
+    // 1. 已经有
+    const have = items.filter(i => /_pickaxe$/.test(i.name))
+      .sort((a, b) => this._toolRank(b.name) - this._toolRank(a.name))[0]
+    if (have) {
+      try { await this.bot.equip(have, 'hand') } catch (e) {}
+      return have.name
+    }
+
+    this.log('[tool] 没有镐子，得做一把')
+
+    // 2. 有原木 -> 做木板 -> 做木棍 -> 做镐
+    if (this.woodCount() > 0) {
+      try {
+        await this.anyPlanks(4)
+        await this.craftSmart('stick', 2)
+        await this.craftSmart('wooden_pickaxe', 1)
+        const p = this.item('wooden_pickaxe')
+        if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 做了把木镐'); return 'wooden_pickaxe' }
+      } catch (e) {
+        this.log('[tool] 做木镐失败: ' + e.message)
+      }
+    }
+
+    // 3. 有木板 -> 直接做木棍
+    const plank = this.bestPlank()
+    if (plank && this.countOf(plank) >= 3) {
+      try {
+        await this.craftSmart('stick', 2)
+        await this.craftSmart('wooden_pickaxe', 1)
+        const p = this.item('wooden_pickaxe')
+        if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 用木板做了把木镐'); return 'wooden_pickaxe' }
+      } catch (e) {}
+    }
+
+    // 4. 有圆石+木棍 -> 做石镐
+    if (this.countOf('cobblestone') >= 3 && this.countOf('stick') >= 2) {
+      try {
+        await this.craftSmart('stone_pickaxe', 1)
+        const p = this.item('stone_pickaxe')
+        if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 做了把石镐'); return 'stone_pickaxe' }
+      } catch (e) {}
+    }
+
+    // 5. 什么都没有 -> 得去砍树
+    this.log('[tool] 没有材料，得先砍树')
+    try {
+      if (this.isUnderground()) await this.getToSurface()
+      await this.ensureWood(3)
+      await this.anyPlanks(4)
+      await this.craftSmart('stick', 2)
+      await this.craftSmart('wooden_pickaxe', 1)
+      const p = this.item('wooden_pickaxe')
+      if (p) { await this.bot.equip(p, 'hand'); this.log('[tool] 砍树后做了把木镐'); return 'wooden_pickaxe' }
+    } catch (e) {
+      this.log('[tool] 还是弄不到镐子: ' + e.message)
+    }
+
+    throw new Error('弄不到镐子（没原木没木板没木棍）')
+  }
+
+  /**
+   * 挖之前检查工具，挖不动就明确报错，别拿着泥土硬挖。
+   */
+  async ensureToolFor (block) {
+    const r = await this.bestToolFor(block)
+    if (!r.ok) {
+      throw new Error(`挖不了 ${block.name}：${r.reason}`)
+    }
+    return r
+  }
+
   async mine (blockName, count = 1, maxDist = 32) {
     await this.ensureChunks()
+
+    // 挖石头类的东西之前，先确保有镐子（没镐子挖了不掉东西）
+    const needPick = /stone|ore|deepslate|cobble|andesite|diorite|granite|obsidian/.test(blockName)
+    if (needPick) {
+      const t = this.checkTools()
+      if (!t.has) {
+        this.log(`[mine] 没有镐子，挖 ${blockName} 不会掉东西，先做一把`)
+        await this.ensurePickaxe()
+      }
+    }
     // 关键：数的是掉落物，不是方块名
     const itemName = dropOf(blockName)
     const startCount = this.countOf(itemName)
@@ -1219,13 +1393,97 @@ class Actions {
     const startY = this.pos().y
     this.log('[surface] 在地下（y=' + Math.round(startY) + '），挖阶梯上去')
 
-    const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]]
-    let dirIdx = Math.floor(Math.random() * 4)
-    let noProgress = 0
+    const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]]
+    // 记下「在这个格子、这个方向」已经试过且失败，别再原地打转
+    const bad = new Set()
 
-    // 找填充用的方块
     const filler = () => ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
       .map(n => this.item(n)).find(Boolean)
+
+    const isSolid = (v) => {
+      const b = bot.blockAt(v)
+      return !!(b && b.boundingBox === 'block')
+    }
+    const isFree = (v) => {
+      const b = bot.blockAt(v)
+      return !b || b.boundingBox !== 'block'
+    }
+    const nameAt = (v) => {
+      const b = bot.blockAt(v)
+      return b ? b.name : 'null'
+    }
+
+    // 挖掉一格。返回 true 表示这一格现在是空的（本来就空也算成功）
+    const digOne = async (v) => {
+      const b = bot.blockAt(v)
+      if (!b) return false
+      if (b.boundingBox !== 'block') return true
+      if (/bedrock|lava|water/.test(b.name)) return false
+      try {
+        await this.bestToolFor(b)
+        await bot.dig(b, true)
+        await sleep(130)
+      } catch (e) {
+        // 挖一半被打断很常见，看最终结果说话
+      }
+      return isFree(v)
+    }
+
+    /**
+     * 站到脚下方块的正中心。
+     *
+     * 这是之前"台阶垫不上"的真凶：人站在格子边上（比如 x=73.77），
+     * 身体（半宽 0.3）已经探进了前面那格，服务端直接拒绝放置，
+     * 报 "the block is still air"。日志里看到的就是这个。
+     */
+    const recenter = async () => {
+      const cx = Math.floor(this.pos().x) + 0.5
+      const cz = Math.floor(this.pos().z) + 0.5
+      for (let i = 0; i < 8; i++) {
+        const p = this.pos()
+        const dx = cx - p.x
+        const dz = cz - p.z
+        if (Math.hypot(dx, dz) < 0.12) return true
+        try {
+          await bot.look(Math.atan2(-dx, -dz), 0, true)
+          bot.setControlState('forward', true)
+          await sleep(Math.min(220, 70 + Math.hypot(dx, dz) * 300))
+          bot.setControlState('forward', false)
+          await sleep(90)
+        } catch (e) { break }
+      }
+      const p = this.pos()
+      return Math.hypot(cx - p.x, cz - p.z) < 0.3
+    }
+
+    /**
+     * 上到指定那一格。
+     * 一格台阶优先交给 pathfinder（实测 0.4 秒就上去了），
+     * 手动 jump+forward 在矮通道里经常起不来，只当兜底。
+     */
+    const stepUpTo = async (x, y, z) => {
+      try {
+        bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z))
+        for (let i = 0; i < 10; i++) {
+          await sleep(180)
+          if (this.pos().y >= y - 0.15) break
+        }
+      } catch (e) {}
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+      if (this.pos().y >= y - 0.15) return true
+
+      try {
+        const p = this.pos()
+        await bot.look(Math.atan2(-(x - p.x), -(z - p.z)), 0, true)
+        bot.setControlState('jump', true)
+        bot.setControlState('forward', true)
+        await sleep(420)
+        bot.setControlState('jump', false)
+        bot.setControlState('forward', false)
+        await sleep(450)
+      } catch (e) {}
+      return this.pos().y >= y - 0.15
+    }
 
     for (let step = 0; step < maxSteps; step++) {
       this.check()
@@ -1237,87 +1495,123 @@ class Actions {
       }
 
       const p = this.pos()
-      const [dx, dz] = dirs[dirIdx]
+      const F = Math.floor(p.y)
+      const here = `${Math.floor(p.x)},${F},${Math.floor(p.z)}`
 
-      // ===== 步骤0：先挖自己头顶 =====
-      // 关键！不挖这个，跳起来头会撞到天花板，永远上不去。
-      // （之前只挖前方，所以 40 步一格都没升）
-      const ownCeiling = bot.blockAt(p.offset(0, 2, 0))
-      if (ownCeiling && ownCeiling.boundingBox === 'block' && !/bedrock/.test(ownCeiling.name)) {
-        try {
-          await this.bestToolFor(ownCeiling)
-          await bot.dig(ownCeiling, true)
-          await sleep(150)
-        } catch (e) {}
-      }
-      // 再挖头顶上面那格，给自己留出跳跃空间
-      const ownCeiling2 = bot.blockAt(p.offset(0, 3, 0))
-      if (ownCeiling2 && ownCeiling2.boundingBox === 'block' && !/bedrock/.test(ownCeiling2.name)) {
-        try {
-          await this.bestToolFor(ownCeiling2)
-          await bot.dig(ownCeiling2, true)
-          await sleep(150)
-        } catch (e) {}
+      // ===== 先给自己留出跳跃空间 =====
+      // 2 格高的通道里跳只能抬 0.5 格，够不到 1 格台阶。
+      // 必须把头顶挖到 3 格以上，跳才起得来。
+      for (const dy of [2, 3]) {
+        if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
       }
 
-      // ===== 步骤1：挖前方 y+1 和 y+2（身体和头的位置）=====
-      for (const dy of [1, 2]) {
-        const b = bot.blockAt(p.offset(dx, dy, dz))
-        if (!b) continue
-        if (b.name === 'air' || b.name === 'cave_air') continue
-        if (/bedrock|lava|water/.test(b.name)) continue
-        try {
-          await this.bestToolFor(b)
-          await bot.dig(b, true)
-          await sleep(130)
-        } catch (e) {}
+      // ===== 挑方向：必须真的能形成「一格台阶」=====
+      // 台阶成立 = 前方 (dx,F) 实心（脚踩的台面）+ (dx,F+1)/(dx,F+2) 空（身体和头）。
+      // 原来是随机挑方向，所以老是往"下方悬空"那边跳，跳进去只会平走，一格都不升。
+      const cands = []
+      for (const [dx, dz] of DIRS) {
+        if (bad.has(`${here}|${dx},${dz}`)) continue
+
+        const stepV = p.offset(dx, 0, dz)
+        const bodyV = p.offset(dx, 1, dz)
+        const headV = p.offset(dx, 2, dz)
+        const supV = p.offset(dx, -1, dz)
+
+        // 基岩/岩浆/水挡路就不要这个方向
+        const blocked = (v) => /bedrock|lava|water/.test(nameAt(v))
+        if (blocked(bodyV) || blocked(headV)) continue
+
+        if (isSolid(stepV)) {
+          cands.push({ dx, dz, score: 10 })       // 天然台阶，最省事
+        } else if (isSolid(supV)) {
+          cands.push({ dx, dz, score: 5 })        // 下方有支撑，可以垫一块
+        }
+        // 既不实心、下方也没支撑 -> 走进去只会平走/掉落，直接排除
       }
 
-      // ===== 步骤2：确保前方 y+0 有实体方块当台阶 =====
-      const stepBlock = bot.blockAt(p.offset(dx, 0, dz))
-      if (!stepBlock || stepBlock.boundingBox !== 'block') {
-        // 需要在"前方 y-1"上面放一块
-        const support = bot.blockAt(p.offset(dx, -1, dz))
+      if (!cands.length) {
+        // 四个方向都构不成台阶：平走一格换个地方再看
+        this.log('[surface] 这一步四个方向都挖不成台阶，挪一格再看')
+        let moved = false
+        for (const [dx, dz] of DIRS) {
+          if (!isSolid(p.offset(dx, 0, dz)) && !isSolid(p.offset(dx, 1, dz)) &&
+              !isSolid(p.offset(dx, 2, dz)) && isSolid(p.offset(dx, -1, dz))) {
+            try {
+              const tx = Math.floor(p.x) + dx
+              const tz = Math.floor(p.z) + dz
+              bot.pathfinder.setGoal(new goals.GoalBlock(tx, F, tz))
+              for (let i = 0; i < 8; i++) {
+                await sleep(160)
+                const q = this.pos()
+                if (Math.floor(q.x) === tx && Math.floor(q.z) === tz) break
+              }
+              bot.pathfinder.setGoal(null)
+            } catch (e) {}
+            moved = this.pos().distanceTo(p) > 0.6
+            if (moved) break
+          }
+        }
+        if (!moved) {
+          // 彻底走不动：把头顶一路挖开，垫脚往上顶
+          this.log('[surface] 挪不动了，挖头顶往上顶')
+          for (const dy of [2, 3, 4]) await digOne(p.offset(0, dy, 0))
+        }
+        await sleep(200)
+        continue
+      }
+
+      cands.sort((a, b) => b.score - a.score)
+      const { dx, dz } = cands[0]
+
+      // ===== 挖出身体和头的空间 =====
+      const bodyOk = await digOne(p.offset(dx, 1, dz))
+      const headOk = await digOne(p.offset(dx, 2, dz))
+      if (!bodyOk || !headOk) {
+        bad.add(`${here}|${dx},${dz}`)
+        this.log(`[surface] (${dx},${dz}) 挖不开，换方向`)
+        continue
+      }
+
+      // ===== 台阶面：没有就自己垫一块 =====
+      if (!isSolid(p.offset(dx, 0, dz))) {
         const fill = filler()
-        if (support && support.boundingBox === 'block' && fill) {
-          try {
-            await bot.equip(fill, 'hand')
-            await bot.lookAt(support.position.offset(0.5, 0.5, 0.5), true)
-            await sleep(100)
-            await bot.placeBlock(support, new Vec3(0, 1, 0))
-            await sleep(200)
-          } catch (e) {}
-        } else if (!fill) {
-          // 没方块可垫：换个方向挖（可能那边有天然台阶）
-          dirIdx = (dirIdx + 1) % 4
+        if (!fill) {
+          bad.add(`${here}|${dx},${dz}`)
+          this.log('[surface] 手上没有能垫的方块，换方向')
+          continue
+        }
+        const sup = bot.blockAt(p.offset(dx, -1, dz))
+        if (!sup) {
+          bad.add(`${here}|${dx},${dz}`)
+          continue
+        }
+        try {
+          await recenter()                       // 不站中心，放方块必被拒
+          await bot.equip(fill, 'hand')
+          await bot.lookAt(sup.position.offset(0.5, 1.0, 0.5), true)
+          await sleep(140)
+          await bot.placeBlock(sup, new Vec3(0, 1, 0))
+          await sleep(220)
+        } catch (e) {}
+        if (!isSolid(p.offset(dx, 0, dz))) {
+          bad.add(`${here}|${dx},${dz}`)
+          this.log(`[surface] (${dx},${dz}) 台阶垫不上，换方向`)
           continue
         }
       }
 
-      // ===== 步骤3：走上去 =====
-      try {
-        await bot.look(Math.atan2(-dx, dz), 0, true)
-        await sleep(90)
-        bot.setControlState('jump', true)
-        bot.setControlState('forward', true)
-        await sleep(700)
-        bot.setControlState('jump', false)
-        bot.setControlState('forward', false)
-      } catch (e) {}
-      await sleep(300)
+      // ===== 上去，并且验证真的上去了 =====
+      const targetY = F + 1
+      const tx = Math.floor(p.x) + dx
+      const tz = Math.floor(p.z) + dz
+      await stepUpTo(tx, targetY, tz)
 
-      // ===== 检查进度 =====
       const nowY = this.pos().y
-      if (nowY > p.y + 0.4) {
-        noProgress = 0
-      } else {
-        noProgress++
-        if (noProgress >= 3) {
-          dirIdx = (dirIdx + 1) % 4
-          noProgress = 0
-          this.log(`[surface] 方向 (${dx},${dz}) 走不通，换方向`)
-        }
+      if (nowY < F + 0.9) {
+        bad.add(`${here}|${dx},${dz}`)
+        this.log(`[surface] 方向 (${dx},${dz}) 上不去（y=${nowY.toFixed(1)}），换方向`)
       }
+      await sleep(150)
     }
 
     const climbed = this.pos().y - startY
@@ -1603,6 +1897,11 @@ class Actions {
   // 挖圆石：直接往下挖（最快，不绕路）
   async digStone (count = 3) {
     await this.ensureChunks()
+    // 没镐子挖石头不掉东西
+    if (!this.checkTools().has) {
+      this.log('[digStone] 没有镐子，先做一把')
+      await this.ensurePickaxe()
+    }
     const got = () => this.countOf('cobblestone') + this.countOf('cobbled_deepslate')
     if (got() >= count) return got()
 
