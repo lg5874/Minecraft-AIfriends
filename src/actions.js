@@ -1360,36 +1360,139 @@ class Actions {
         [1, 0, 1], [-1, 0, -1], [1, 0, -1], [-1, 0, 1],
         [2, 0, 0], [-2, 0, 0], [0, 0, 2], [0, 0, -2]
       ]
+
+      /**
+       * 这个格子能不能站 —— 分两种：
+       *   'ok'    现在就空着能站
+       *   'dig'   挖掉 1~2 格就能站（树叶 / 矮草 / 雪层）
+       *   false   挖也白搭（脚下没实体、或者要挖 3 格以上）
+       *
+       * 为什么要允许 'dig'：实测那棵橡树树干底格 y=72 四周**全是 oak_leaves**，
+       * 连脚下都是树叶，纯 standable() 一个候选都选不出来。
+       * 于是只能跑到树冠顶上（y=76/77）站着，而那里距树干 5.2 格，
+       * 超过 digAt 的 4.2 格上限 —— 日志里「走不到这棵（差 6.0 格）」就是这么来的。
+       * 真人遇到这种树会直接把树叶挖开站过去，不会绕到树顶。
+       */
+      const spotInfo = (pos) => {
+        const below = this.bot.blockAt(pos.offset(0, -1, 0))
+        const at = this.bot.blockAt(pos)
+        const up = this.bot.blockAt(pos.offset(0, 1, 0))
+        if (!below || !at || !up) return false
+        // 脚下必须是实体（树叶、草方块都算；空气不行）
+        if (!this.solidBlock(below)) return false
+        const soft = (b) => b && (/leaves/.test(b.name) || b.name === 'short_grass' ||
+          b.name === 'tall_grass' || b.name === 'fern' || b.name === 'snow' ||
+          b.name === 'vine' || b.boundingBox === 'empty')
+        let need = 0
+        if (this.solidBlock(at)) { if (!soft(at)) return false; need++ }
+        if (this.solidBlock(up)) {
+          // 头顶那格也得能挖开，否则站进去抬不起头
+          if (/oak_log|birch_log|spruce_log|jungle_log|acacia_log|dark_oak_log/.test(up.name)) return false
+          need++
+        }
+        if (need > 2) return false
+        return { need, pos }
+      }
+
       // 沿树干往上扫 0..5 格（树叶层也要看，因为树干可能在高处）
-      for (let dy = 0; dy <= 5; dy++) {
+      // 也往下扫 -1..-2（"站在树底下往上挖"）
+      for (const dyRange of [0, 1, 2, 3, 4, 5, -1, -2]) {
         for (const [dx, , dz] of dirs) {
-          const s = base.offset(dx, dy, dz)
+          const s = base.offset(dx, dyRange, dz)
           const key = `${s.x},${s.y},${s.z}`
           if (seen.has(key)) continue
           seen.add(key)
-          if (!this.standable(s)) continue
-          spots.push(s)
+          const info = spotInfo(s)
+          if (!info) continue
+          spots.push({ pos: s, need: info.need })
         }
       }
-      // 也考虑"站在树底下往上挖"（树干正下方有实体地面）
-      for (let dy = -1; dy >= -2; dy--) {
-        for (const [dx, , dz] of dirs) {
-          const s = base.offset(dx, dy, dz)
-          const key = `${s.x},${s.y},${s.z}`
-          if (seen.has(key)) continue
-          seen.add(key)
-          if (!this.standable(s)) continue
-          spots.push(s)
-        }
-      }
-      // 排序：先看能不能挖到树干（三维 4 格内），再看离自己近不近
+
+      // 排序：
+      //   1. 先看要不要挖（不用挖的优先）
+      //   2. 再看能不能挖到树干（三维 4 格内 —— digAt 的 REACH 是 4.2）
+      //   3. 最后看离自己近不近（少走路）
+      const reachable = (s) => s.distanceTo(base) <= 4.0
       spots.sort((a, b) => {
-        const da = a.distanceTo(base)
-        const db = b.distanceTo(base)
-        if (Math.abs(da - db) > 0.6) return da - db
-        return a.distanceTo(p) - b.distanceTo(p)
+        const ra = reachable(a.pos) ? 0 : 1
+        const rb = reachable(b.pos) ? 0 : 1
+        if (ra !== rb) return ra - rb
+        if (a.need !== b.need) return a.need - b.need
+        return a.pos.distanceTo(p) - b.pos.distanceTo(p)
       })
       return spots
+    }
+
+    /**
+     * 挖路直达：沿"我 → 树干"的直线，把挡路的软方块（树叶/草）挖掉。
+     *
+     * 这是最后的兜底。实测那棵树四周全是树叶，纯靠 pathfinder 走不到，
+     * 但人就在 6 格内 —— 挖开两格树叶就能站进去。
+     * 比"换下一棵"好，因为周围可能全是这种被树叶包住的树。
+     */
+    const digPathTo = async (target, maxBlocks = 8) => {
+      const from = this.pos().clone()
+      const dir = target.clone().subtract(from)
+      const len = Math.hypot(dir.x, dir.z)
+      if (len < 0.5) return false
+      let dug = 0
+      for (let i = 1; i <= maxBlocks; i++) {
+        const t = i / maxBlocks
+        const x = Math.floor(from.x + dir.x * t)
+        const z = Math.floor(from.z + dir.z * t)
+        for (const dy of [0, 1]) {
+          const v = new Vec3(x, Math.floor(from.y) + dy, z)
+          const b = this.bot.blockAt(v)
+          if (!b) continue
+          if (!this.solidBlock(b)) continue
+          // 只挖软方块和树干之间的树叶；石头挖不动也不划算
+          if (!/leaves|short_grass|tall_grass|fern|vine|snow/.test(b.name)) continue
+          try {
+            if (await this.digAt(b)) dug++
+          } catch (e) {}
+        }
+        if (dug >= 6) break
+      }
+      return dug > 0
+    }
+
+    /**
+     * 把树干周围挡路的树叶挖掉一圈（只挖软的，石头不动）。
+     * 用于「树被树叶包住，一格都站不了」的情况。
+     */
+    const clearAroundTree = async (base) => {
+      let dug = 0
+      for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1],
+        [2,0],[-2,0],[0,2],[0,-2]]) {
+        for (const dy of [0, 1]) {
+          const v = base.offset(dx, dy, dz)
+          const b = this.bot.blockAt(v)
+          if (!b || !this.solidBlock(b)) continue
+          if (!/leaves|short_grass|tall_grass|fern|vine|snow/.test(b.name)) continue
+          if (v.distanceTo(this.pos()) > 4.2) continue
+          try { if (await this.digAt(b)) dug++ } catch (e) {}
+        }
+        if (dug >= 10) break
+      }
+      return dug
+    }
+
+    /**
+     * 逐个试候选格，成功返回 true。
+     * 候选是 { pos, need }，need>0 表示要先挖开树叶/草。
+     */
+    const trySpots = async (spots, base, timeout) => {
+      for (const s of spots.slice(0, 4)) {
+        if (Date.now() - t0 > DEADLINE) return false
+        // 要挖的先把树叶挖掉，否则 pathfinder 不会穿过去
+        if (s.need > 0) {
+          try { await digPathTo(s.pos) } catch (e) {}
+        }
+        if (await walkTo(s.pos.x, s.pos.y, s.pos.z, 0, Math.min(timeout, 8000))) {
+          if (base.distanceTo(this.pos()) <= 4.2) return true
+        }
+      }
+      return false
     }
 
     /** 走到树干旁边（优先最近的可站立格，逐个试） */
@@ -1429,13 +1532,16 @@ class Actions {
       // 第二步：走近了再找精确落脚点
       const spots = standSpotsNear(base)
       if (!spots.length) {
-        // 树旁还没有可站的格（被树叶盖住/未加载）：
-        // 直接对树干做 GoalNear，让 pathfinder 自己贴上去
-        return await walkTo(base.x, base.y, base.z, 2, Math.min(timeout, 8000))
-      }
-      for (const s of spots.slice(0, 3)) {
-        if (Date.now() - t0 > DEADLINE) return false
-        if (await walkTo(s.x, s.y, s.z, 0, Math.min(timeout, 8000))) return true
+        // 树旁一格能站的都没有（连挖开树叶都不行）：
+        // 先把挡路的树叶挖一圈，再看一次
+        try { await clearAroundTree(base) } catch (e) {}
+        const again = standSpotsNear(base)
+        if (!again.length) {
+          return await walkTo(base.x, base.y, base.z, 2, Math.min(timeout, 8000))
+        }
+        if (await trySpots(again, base, timeout)) return true
+      } else {
+        if (await trySpots(spots, base, timeout)) return true
       }
 
       // 第三步：还是不够近（典型是 GoalXZ 把人带到了树脚下的低处，
