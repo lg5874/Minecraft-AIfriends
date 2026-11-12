@@ -274,6 +274,13 @@ class Actions {
 
   async goto (x, y, z, range = 1, timeoutMs = 30000) {
     this.check()
+
+    // 坐标校验：NaN/undefined 会让后面所有计算都变成 NaN
+    x = Number(x); y = Number(y); z = Number(z)
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      this.log(`[goto] 坐标无效 (${x},${y},${z})，不走了`)
+      return false
+    }
     this.current = `走到 ${Math.round(x)},${Math.round(y)},${Math.round(z)}`
 
     const p0 = this.pos()
