@@ -386,9 +386,40 @@ cd /root/workspace/mcplugin && ./build.sh
 
 `build.sh` 除了编译打包，还会跑 `tools/PaperCompat.java`：用真实的 Bukkit API 加载插件类，确认主类继承关系、命令签名、依赖类完整、jar 里没混进自检类或 paper-api。
 
-**当前实测：插件兼容 23 + 单元自检 31 + 边界 21 + 部署验证 34 = 109 项全过。**
+**当前实测：插件兼容 23 + 单元自检 31 + 边界 28 + 部署验证 34 = 116 项全过。**
 
-### 9.5 只在本地验证包本身
+### 9.5 真机验证（已做）
+
+上面都是模拟。真机也跑了：**Paper 1.21.11-132**（官方构建，sha256 校验过）真实启动，
+装这个插件 + 这个包，完整走了一遍：
+
+```
+[XJJ] === XJJBot 1.0.0 启动 ===
+[XJJ] 已请求启动
+[XJJ] 解包 minecraft-aifriend-...tar.gz -> .../bot
+[XJJ] [tar] extracted files=37
+[XJJ] npm install 结束 exit=0 用时 35s
+[XJJ] 生成了一份模板 config.json
+[XJJ] bot 已启动 pid=11505
+```
+
+bot 真的连进服务器并活动起来（日志里有他逛地图、探测服务器指令、被史莱姆打）。
+
+**孤儿回收也真机验过**：`kill -9` 掉服务器 → bot 变孤儿 → 重启服务器：
+
+```
+[XJJ] 发现上次遗留的 bot 进程 pid=4182（服务器上次可能是被强杀的），先收掉
+[XJJ] 孤儿进程已回收
+[XJJ] bot 已启动 pid=23016
+```
+
+之后 `ps` 里只剩一个 bot。
+
+**关服也验过**：`kill -TERM` 服务器 → `服务器关闭，收掉 bot` → `bot 已停止` → pidfile 清空 → bot 进程消失。
+
+Paper 的 `Nag author ... System.out` 告警也已清掉（全程走 `getLogger()`）。
+
+### 9.6 只在本地验证包本身
 
 ```bash
 cd /tmp && rm -rf pkgtest && mkdir pkgtest && cd pkgtest
@@ -452,6 +483,7 @@ tail -200 plugins/XJJBot/logs/bot/bot.log     # 他的视角
 - [ ] 改过 `bot/config.json` 的 `llm` 三行，`/xj restart` 过
 - [ ] 进游戏能看到他
 - [ ] 手机上的旧 bot 已经关掉（不然 `duplicate_login`）
+- [ ] 服务器被强杀过的话不用管，插件下次启动会自动回收孤儿（`bot.pid` 就是干这个的）
 
 ---
 

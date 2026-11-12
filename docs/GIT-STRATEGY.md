@@ -144,7 +144,29 @@ git config http.postBuffer 524288000
 ```
 
 **实测记录**：2026-11-13 06:41，`api.github.com` 返回 200 但 `github.com` 超时，
-push 报 `GnuTLS recv error (-110)`。改 HTTP/1.1 后立刻成功。
+push 报 `GnuTLS recv error (-110)`。改 HTTP/1.1 后成功过一次，
+但 06:52 又完全连不上（`Failed to connect to github.com port 443`）。
+
+### 备用方案：用 GitHub REST API 推送
+
+当 `github.com:443` 完全不通但 `api.github.com` 通时，用 `scripts/push-api.js`：
+
+```bash
+node scripts/push-api.js <token>
+```
+
+它做的事：
+1. 读远端 `main` 的 HEAD
+2. 算本地领先的提交和变化的文件
+3. 逐个文件建 blob
+4. 建 tree（基于远端 tree）
+5. 建 commit（父提交是远端 HEAD）
+6. PATCH ref 更新 `main`
+
+**注意**：它只推**最终状态**，不保留中间的多个 commit。
+所以能直连时优先用 `git push`，API 只作应急。
+
+**实测**：2026-11-13 06:52，`git push` 完全连不上，API 方式 4 个提交一次推成功。
 
 ---
 

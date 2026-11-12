@@ -849,7 +849,8 @@ async function main () {
     if (r.ok) continue
     byKind[r.kind] = (byKind[r.kind] || 0) + 1
   }
-  const disagreeCount = graded.filter(r => r.disagree).length
+  const missCount = graded.filter(r => r.judgeMiss).length
+  const alarmCount = graded.filter(r => r.judgeFalseAlarm).length
 
   console.log('\n' + '='.repeat(64))
   console.log('  结果')
@@ -872,11 +873,22 @@ async function main () {
     }
   }
 
-  if (disagreeCount) {
-    console.log(`\n⚠️  口径分歧 ${disagreeCount} 次：脚本判成功，但 main.js 的 judgeOutcome 判失败。`)
-    console.log('   这类就是"假成功" —— 正式运行时会记成失败，但背包其实变了。')
-    for (const r of results.filter(x => x.disagree)) {
-      console.log(`   · ${r.name}: judge 理由 = ${r.judge && r.judge.why}`)
+  if (missCount || alarmCount) {
+    console.log('\n' + '-'.repeat(64))
+    console.log('  judgeOutcome 与真实结果的偏差（这是 src/ 的问题，不是测试的问题）')
+    console.log('-'.repeat(64))
+    if (missCount) {
+      console.log(`🚨 漏报 ${missCount} 次：真实失败，judgeOutcome 却判成功。`)
+      console.log('   后果：正式运行时会把没做成的事记成"完成"，失败率被系统性低估。')
+      for (const r of graded.filter(x => x.judgeMiss)) {
+        console.log(`   · ${r.name}: ${r.detail.slice(0, 60)}`)
+      }
+    }
+    if (alarmCount) {
+      console.log(`\n⚠️  误报 ${alarmCount} 次：真实成功，judgeOutcome 判失败。`)
+      for (const r of graded.filter(x => x.judgeFalseAlarm)) {
+        console.log(`   · ${r.name}: judge 理由 = ${r.judge && r.judge.why}`)
+      }
     }
   }
 
@@ -908,7 +920,8 @@ async function main () {
     rate, ok, total,
     skipped: skippedList.length,
     failureKinds: byKind,
-    judgeDisagreements: disagreeCount,
+    judgeMiss: missCount,
+    judgeFalseAlarm: alarmCount,
     kicked: kicked || null,
     baseline,
     results
@@ -925,7 +938,8 @@ async function main () {
   // ---- 收尾 ----
   try { bot.quit() } catch (e) {}
   await sleep(600)
-  process.exit(rate >= 70 ? 0 : 1)
+  // 退出码：成功率达标 **且** judgeOutcome 没有漏报，才算通过
+  process.exit(rate >= 70 && missCount === 0 ? 0 : 1)
 }
 
 function invStr (inv) {
