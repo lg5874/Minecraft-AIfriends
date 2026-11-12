@@ -186,7 +186,9 @@ class Actions {
     out.push('')
     out.push(this.lookProfile('z', range, 6, 3))
     out.push('')
-    out.push(this.lookTop(range, 0))
+    // layer=-1 是脚下那层。原来用 0（身体层），露天地形下 169 格全是"·"，
+    // 264 字符（占全图 33%）纯废。改用脚下层，能看到地表材质和落脚点。
+    out.push(this.lookTop(range, -1))
     return out.join('\n')
   }
 
@@ -964,8 +966,9 @@ class Actions {
      */
     const walkTo = async (x, y, z, range = 2, timeout = 25000) => {
       try {
-        this.bot.pathfinder.setGoal(
-          new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range))
+        this.bot.pathfinder.setGoal(range <= 0
+          ? new goals.GoalBlock(Math.floor(x), Math.floor(y), Math.floor(z))
+          : new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range))
       } catch (e) { return false }
       const s = Date.now()
       let last = this.pos().clone()
@@ -979,11 +982,48 @@ class Actions {
           if (p.distanceTo(last) < 0.12) still += 200
           else still = 0
           last = p.clone()
-          if (still > 5000) break        // 卡住了，别耗满超时
+          if (still > 6000) break        // 卡住了，别耗满超时
           await sleep(200)
         }
       } finally {
         try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+      }
+      return false
+    }
+
+    /**
+     * 树干旁边能站人的格子。
+     *
+     * 关键教训：直接把 pathfinder 的目标设成"树干那一格"是走不到的 ——
+     * 那一格是实心原木，A* 在里面找不到落脚点，探针里表现为
+     * "走不到这棵（差 4 格）"每棵白耗 5 秒。必须换成旁边真正的站立格。
+     */
+    const standSpotsNear = (base) => {
+      const p = this.pos()
+      const spots = []
+      for (const [dx, dy, dz] of [
+        [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],
+        [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1],
+        [1, 0, 1], [-1, 0, -1], [1, 0, -1], [-1, 0, 1],
+        [2, 0, 0], [-2, 0, 0], [0, 0, 2], [0, 0, -2]
+      ]) {
+        const s = base.offset(dx, dy, dz)
+        if (!this.standable(s)) continue
+        spots.push(s)
+      }
+      spots.sort((a, b) => a.distanceTo(p) - b.distanceTo(p))
+      return spots
+    }
+
+    /** 走到树干旁边（优先最近的可站立格，逐个试） */
+    const goNearTree = async (base, timeout = 12000) => {
+      // 已经在挖掘距离内，不用走
+      if (base.distanceTo(this.pos()) <= 4.0) return true
+      const spots = standSpotsNear(base)
+      for (const s of spots.slice(0, 3)) {
+        if (Date.now() - t0 > DEADLINE) return false
+        const ok = await walkTo(s.x, s.y, s.z, 0, timeout)
+        if (ok) return true
       }
       return false
     }
@@ -1054,19 +1094,14 @@ class Actions {
         const base = cand.base
         const key = `${base.x},${base.y},${base.z}`
 
-        // 走到树干跟前
+        // 走到树干跟前（目标用旁边能站的格子，不是树干本身）
         let d = base.distanceTo(this.pos())
         if (d > 4.0) {
-          const okWalk = await walkTo(base.x, base.y, base.z, 2, 25000)
+          await goNearTree(base, 12000)
           d = base.distanceTo(this.pos())
-          if (!okWalk && d > 4.0) {
-            this.log(`[chop] 走不到这棵（差 ${d.toFixed(0)} 格），换下一棵`)
-            tried.add(key)
-            continue
-          }
         }
         if (d > 4.2) {
-          this.log(`[chop] 还差 ${d.toFixed(1)} 格，够不到，换下一棵`)
+          this.log(`[chop] 走不到这棵（差 ${d.toFixed(1)} 格），换下一棵`)
           tried.add(key)
           continue
         }
