@@ -25,6 +25,7 @@
 │       │   ├── config.json         ← ★ 你填 API key 的地方（永不进包）
 │       │   ├── data/               ← 他的记忆、技能、家（自己长）
 │       │   └── node_modules/       ← 插件 npm install 装的
+│       ├── bot.pid                 ← bot 的 pid，用来回收强杀留下的孤儿
 │       ├── runtime/                ← 插件下的 Node（系统有就复用）
 │       ├── npm-cache/
 │       └── logs/
@@ -213,6 +214,36 @@ cd /root/workspace/mcplugin
 
 实测（`DeployCheck`，见第 9 节）：`kill -9` 掉 bot 进程，守护在 5 秒内换了新 pid 拉起来，日志里留下 `bot 退出 exit=137 存活 Ns` 和 `bot 启动 #2`。
 
+### 6.1 孤儿进程回收（重要）
+
+有个场景守护机制本身救不了：**服务器自己被强杀**。
+
+面板"强制停止"、OOM killer、`kill -9` —— 这些情况下 `onDisable` 根本不会执行，
+bot 进程就变成了孤儿：服务器没了，它还在跑，占着 `XJJ` 这个名字。
+
+下次服务器起来，插件又拉起一个新的 bot，两个同名账号进同一个服务器 →
+`duplicate_login`，互相踢，看起来就是"他一直掉线"。
+
+解决办法是 pidfile：
+
+- 每次拉起 bot，把 pid 写进 `plugins/XJJBot/bot.pid`
+- 正常退出 / 正常关服时删掉
+- **下次启动 prepare 阶段第一件事：读 pidfile，如果那个 pid 还活着，先收掉**
+
+安全前提：不能瞎杀。回收前会读 `/proc/PID/cmdline`，确认里面确实有
+`plugins/XJJBot/bot/main.js` 才算我们的进程。pid 被系统复用了、指向别人的程序时，
+只清 pidfile，不动那个进程。
+
+真实 Paper 上验过：
+
+```
+[XJJ] 发现上次遗留的 bot 进程 pid=4182（服务器上次可能是被强杀的），先收掉
+[XJJ] 孤儿进程已回收
+[XJJ] bot 已启动 pid=23016
+```
+
+之后 `ps` 里只剩一个 bot。
+
 ---
 
 ## 7. 日志写在哪、怎么轮转
@@ -392,7 +423,8 @@ node scripts/package.js
 | `bot 目录里没有 main.js` | 包没传对位置，或传的不是 tar.gz。用 `/xj where` 看它到底在找哪 |
 | `/xj status` 显示 `config.json 还没填 key` | 就是第 4 节那一步没做 |
 | 起来了但进不去游戏 | `/xj logs 50` 看是不是 `ECONNREFUSED`（端口错）或 `duplicate_login`（同名账号在别处登录） |
-| `duplicate_login` | **手机上那个 bot 还在跑**。先 `ps aux \| grep main.js` 关掉，否则互相踢 |
+| `duplicate_login` | 两个同名 bot 在抢。可能是**手机上那个还在跑**（`ps aux \| grep main.js` 关掉），也可能是上次服务器被强杀留下的孤儿——正常情况下插件启动时会自动收掉，没收掉就看 `plugins/XJJBot/bot.pid` 在不在 |
+| 服务器被强杀后 bot 变成孤儿 | 不用手动处理。插件下次启动会自动回收（见 6.1），日志里有"发现上次遗留的 bot 进程" |
 | 日志刷 `ECONNREFUSED 127.0.0.1:端口` | `config.json` 里 `bot.port` 跟服务器实际端口不一致。插件首次生成时会自动填对，手改过的话检查一下 |
 | 他一直重启停不下来 | `/xj logs 100` 看退出码。若是 `exit=1` 且日志有"找不到配置文件"，说明 `config.json` 被删了 |
 | 磁盘满了 | `/xj prune`；或把 `log.maxMB` / `keepFiles` 调小 |

@@ -992,11 +992,28 @@ class Bot {
       } else {
         const why = result.error || verdict.why || outText
         this.log(`<<< 失败（${secs}s）：${why}`)
-        this.mem.add({
-          text: wishFailText(want.text, result.error || outText),
-          kind: 'skill',
-          importance: 0.65
-        })
+
+        // ===== 失败归因：进日志，不进长期记忆 =====
+        //
+        // 原来失败记 importance:0.65 + kind:'skill'（不衰减），
+        // 成功只记 0.4（会衰减）—— 长期下来记忆里全是失败。
+        //
+        // 而且 wishFailText 会把 "模型调用失败: HTTP 403 <!DOCTYPE html>"
+        // 当成"人生教训"存进长期记忆。那不是教训，是故障。
+        //
+        // 现在分两种：
+        //   - 环境/网络/模型故障 -> 只进日志
+        //   - 真正的"做事没成" -> 记进记忆，但 importance 降到 0.35（会衰减）
+        const isEnvFailure = /HTTP \d|DOCTYPE|ECONN|timeout|超时|模型调用失败|401|403|429|500|502|503/i.test(why)
+        if (!isEnvFailure) {
+          this.mem.add({
+            text: wishFailText(want.text, result.error || outText),
+            kind: 'event',
+            importance: 0.35
+          })
+        } else {
+          this.log('[mem] 这是环境故障，不写进长期记忆')
+        }
         this.will.finish()
         if (this.mood) this.mood.onEvent('task_fail', 1)
         // 告诉长期目标"这趟没成" —— 同一个阶段失败太多次它会自己换路
@@ -1108,23 +1125,15 @@ class Bot {
       }
     }
 
-    // 3. 说要做的物品，背包里有没有
-    //    注意：只有"制作类"任务才检查背包增加。
-    //    "摆箱子/存东西"这类是消耗物品，不适用。
-    const wantItem = this.extractWantedItem(goal)
-    if (wantItem && this._taskStartInv) {
-      // 判断是不是"制作/获取"类任务
-      const isProduce = /(做|制作|合成|弄|搞|挖|砍|打|弄到|搞到|收集|攒|备|升级|换)/.test(goal)
-      const isConsume = /(放|摆|存|放好|放下|安置|整理|存进|扔进)/.test(goal)
-
-      if (isProduce && !isConsume) {
-        const before = this._taskStartInv[wantItem] || 0
-        const now = this.countItem(wantItem)
-        if (now <= before) {
-          return { ok: false, why: `说要${wantItem}，但背包没增加（${before}->${now}）` }
-        }
-      }
-    }
+    // 3. （已删除）"说要做的物品背包有没有增加"这条判据
+    //
+    // 删掉的原因：它把"用工具干活"误判成"要制作工具"。
+    //   "用石斧砍树" -> extractWantedItem 提取 stone_axe
+    //   -> 砍完斧头还在（1->1）-> 判"背包没增加"-> 误判失败
+    //   "用石镐挖圆石" 同理
+    //
+    // 实测日志里 5 条真实目标有 2 条踩这个坑。
+    // 成败判定只留前两条：明确失败词 + 零产出痕迹。
 
     return { ok: true, why: '' }
   }

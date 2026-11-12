@@ -124,21 +124,41 @@ const TASKS = [
       const before = cnt()
       const hadPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
 
-      let ret = null
-      let err = null
+      // 路径 A：原子动作 mine()。这是"他自己写代码"会调的入口。
+      let retA = null
+      let errA = null
       try {
-        ret = await a.mine('stone', 3, 24)
-      } catch (e) { err = e.message }
+        retA = await a.mine('stone', 3, 24)
+      } catch (e) { errA = e.message }
+      await sleep(1000)
+      const afterA = cnt()
 
-      await sleep(1200)
+      // 路径 B：现成的脚手架 digStone()（会自己往下挖到石头层）。
+      // ROADMAP 阶段 1 要回答的就是"原子动作够不够" —— 所以两条路都测，
+      // 数据才有对比价值：A 成 B 不成 / A 不成 B 成，结论完全不同。
+      let retB = null
+      let errB = null
+      if (afterA <= before) {
+        ctx.notes.push('挖石头：mine() 没产出，自动回退测 digStone() 做对比')
+        try {
+          retB = await a.digStone(3)
+        } catch (e) { errB = e.message }
+        await sleep(1000)
+      }
       const after = cnt()
+
       const ok = after > before
+      const pathA = afterA > before ? 'mine() 成功' : 'mine() 失败'
+      const pathB = retB === null ? '（未测）'
+        : (after > afterA ? `digStone() 成功 ${afterA}->${after}` : 'digStone() 也失败')
+
       return {
         ok,
-        kind: ok ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
-        detail: `圆石 ${before} -> ${after}（mine 返回 ${JSON.stringify(ret)}` +
-          `${hadPick ? '，开局已有镐' : '，开局没镐（要先自己造）'}` +
-          `${err ? '，异常: ' + err.slice(0, 60) : ''}）`
+        kind: ok ? null : (errA || errB ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
+        detail: `圆石 ${before} -> ${after}｜${pathA}（返回 ${JSON.stringify(retA)}` +
+          `${errA ? '，异常: ' + errA.slice(0, 40) : ''}）｜${pathB}` +
+          `${errB ? '，异常: ' + errB.slice(0, 40) : ''}` +
+          `｜${hadPick ? '开局已有镐' : '开局没镐（要先自己造）'}`
       }
     }
   },
@@ -176,7 +196,28 @@ const TASKS = [
     goal: '做一把木镐',
     budget: 150,
     async run (a, bot, ctx) {
+      // 关键：开局背包里可能已经有木镐（服务器不掉落 + 上次测试留下的）。
+      // 不清掉的话 craftSmart 第一行 `if (countOf >= count) return true`
+      // 直接返回，"做木镐"变成 0 秒假通过 —— 历史数据里就踩过这个坑。
+      const pre = a.countOf('wooden_pickaxe')
+      if (pre > 0) {
+        try { await a.toss('wooden_pickaxe', pre) } catch (e) {}
+        await sleep(500)
+        // 丢在原地会被自己捡回来，走开两格
+        try { await a.wander(3) } catch (e) {}
+        await sleep(700)
+        if (a.countOf('wooden_pickaxe') > 0) {
+          return {
+            ok: false,
+            kind: FAIL_KINDS.PRECONDITION,
+            detail: `开局有 ${pre} 把木镐且丢不掉，无法测"从零做木镐"`
+          }
+        }
+        ctx.notes.push(`做木镐前丢弃了 ${pre} 把存货，保证从零开始`)
+      }
+
       const before = a.countOf('wooden_pickaxe')
+      const wood = a.woodCount()
       let err = null
       try {
         await a.craftSmart('wooden_pickaxe', 1)
@@ -184,15 +225,12 @@ const TASKS = [
 
       await sleep(600)
       const after = a.countOf('wooden_pickaxe')
-      // 判据：结束时手上有木镐（之前有也算"能做成"，但要标注是存货）
-      const ok = after > 0
-      const fresh = after > before
+      const ok = after > before
       return {
         ok,
         kind: ok ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
-        detail: `木镐 ${before} -> ${after}` +
-          (fresh ? '（新做出来）' : ok ? '（开局就有存货，没真正走合成链）' : '') +
-          (err ? `，异常: ${err.slice(0, 60)}` : '')
+        detail: `木镐 ${before} -> ${after}（原料: 原木 ${wood} 个）` +
+          (err ? `，异常: ${err.slice(0, 70)}` : '')
       }
     }
   },
@@ -204,6 +242,22 @@ const TASKS = [
     goal: '做一把石镐',
     budget: 180,
     async run (a, bot, ctx) {
+      const pre = a.countOf('stone_pickaxe')
+      if (pre > 0) {
+        try { await a.toss('stone_pickaxe', pre) } catch (e) {}
+        await sleep(500)
+        try { await a.wander(3) } catch (e) {}
+        await sleep(700)
+        if (a.countOf('stone_pickaxe') > 0) {
+          return {
+            ok: false,
+            kind: FAIL_KINDS.PRECONDITION,
+            detail: `开局有 ${pre} 把石镐且丢不掉，无法测"从零做石镐"`
+          }
+        }
+        ctx.notes.push(`做石镐前丢弃了 ${pre} 把存货，保证从零开始`)
+      }
+
       const before = a.countOf('stone_pickaxe')
       const cob = a.countOf('cobblestone') + a.countOf('cobbled_deepslate')
       const stick = a.countOf('stick')
@@ -214,12 +268,12 @@ const TASKS = [
 
       await sleep(600)
       const after = a.countOf('stone_pickaxe')
-      const ok = after > 0
+      const ok = after > before
       return {
         ok,
         kind: ok ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
         detail: `石镐 ${before} -> ${after}（材料: 圆石 ${cob} / 木棍 ${stick}）` +
-          (err ? `，异常: ${err.slice(0, 60)}` : '')
+          (err ? `，异常: ${err.slice(0, 70)}` : '')
       }
     }
   },
@@ -231,22 +285,30 @@ const TASKS = [
     goal: '放个箱子',
     budget: 240,
     async run (a, bot, ctx) {
-      // 先确保手上有箱子
-      if (a.countOf('chest') === 0 && !a.findBlock('chest', 10)) {
+      // 关键：附近可能已经有箱子（上次测试留下的）。
+      // 老写法 placeNearby 第一行 `if (findBlock(chest,10)) return exist`
+      // 直接返回已有箱子 —— "放箱子"变成 1 秒假通过，实际一次都没放。
+      // 现在必须让世界里的 chest 数量**增加**才算成功。
+      const countChests = () => {
+        const def = mcData.blocksByName.chest
+        if (!def) return 0
+        try {
+          return bot.findBlocks({ matching: def.id, maxDistance: 16, count: 32 }).length
+        } catch (e) { return 0 }
+      }
+      const chestsBefore = countChests()
+
+      // 确保手上有箱子
+      if (a.countOf('chest') === 0) {
         try { await a.craftSmart('chest', 1) } catch (e) {
-          ctx.notes.push('做箱子失败: ' + e.message.slice(0, 60))
+          ctx.notes.push('做箱子失败: ' + String(e.message).slice(0, 70))
         }
       }
       if (a.countOf('chest') === 0) {
-        const exist = a.findBlock('chest', 10)
-        if (exist) {
-          ctx.state.chestPos = exist.position
-          return { ok: true, detail: `附近已有箱子 @${fmt(exist.position)}（没走放置流程）` }
-        }
         return {
           ok: false,
           kind: FAIL_KINDS.PRECONDITION,
-          detail: `做不出箱子（木板 ${a.countOf('oak_planks') + a.countOf('birch_planks') + a.countOf('spruce_planks')} 张、原木 ${a.woodCount()} 个）`
+          detail: `做不出箱子（木板 ${a.countOf('oak_planks') + a.countOf('birch_planks') + a.countOf('spruce_planks') + a.countOf('jungle_planks')} 张、原木 ${a.woodCount()} 个、工作台 ${a.countOf('crafting_table')}）`
         }
       }
 
@@ -255,20 +317,24 @@ const TASKS = [
       try {
         placed = await a.placeNearby('chest')
       } catch (e) { err = e.message }
-
       await sleep(800)
-      // 判据：世界里真的有 chest 方块（不是"函数没报错"）
-      const inWorld = a.findBlock('chest', 10)
-      const target = placed || inWorld
-      if (target) ctx.state.chestPos = target.position
 
-      const ok = !!target
+      const chestsAfter = countChests()
+      const delta = chestsAfter - chestsBefore
+
+      // 判据：世界里的 chest 真的多了
+      const ok = delta > 0
+      if (ok && placed) ctx.state.chestPos = placed.position
+      else if (!ok && placed) ctx.state.chestPos = placed.position  // 复用旧箱子继续测"存东西"
+
       return {
         ok,
         kind: ok ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
         detail: ok
-          ? `箱子在世界里 @${fmt(target.position)}`
-          : `世界10格内没有 chest 方块${err ? '，异常: ' + err.slice(0, 60) : ''}`
+          ? `世界内 chest ${chestsBefore} -> ${chestsAfter} @${fmt(placed.position)}`
+          : `世界内 chest ${chestsBefore} -> ${chestsAfter}（没放出来` +
+            `${placed ? '，只是找到了旧箱子 @' + fmt(placed.position) : ''}）` +
+            `${err ? '，异常: ' + err.slice(0, 60) : ''}`
       }
     }
   },
@@ -334,7 +400,7 @@ const TASKS = [
     budget: 200,
     async run (a, bot, ctx) {
       const foodBefore = Math.round(bot.food)
-      const hadFood = a.hasFood()
+      const itemsBefore = a.foodList().reduce((s, f) => s + f.count, 0)
 
       let ret = null
       let err = null
@@ -344,16 +410,18 @@ const TASKS = [
 
       await sleep(1500)
       const foodAfter = Math.round(bot.food)
-      const nowHasFood = a.hasFood()
-      const foodCnt = a.foodList().reduce((s, f) => s + f.count, 0)
+      const itemsAfter = a.foodList().reduce((s, f) => s + f.count, 0)
 
-      // 判据：饱食度上升，或背包里确实有能吃的东西
-      const ok = foodAfter > foodBefore || nowHasFood
+      // 判据：背包里食物**变多了**，或饱食度上升。
+      // 不能只看 hasFood() —— 开局就有存货时那也是"有食物"，等于没测。
+      const gained = itemsAfter - itemsBefore
+      const ate = foodAfter - foodBefore
+      const ok = gained > 0 || ate > 0
+
       return {
         ok,
         kind: ok ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
-        detail: `饥饿 ${foodBefore} -> ${foodAfter}，背包食物 ${hadFood ? '有' : '无'} -> ` +
-          `${nowHasFood ? '有' : '无'}（共 ${foodCnt} 个）` +
+        detail: `饥饿 ${foodBefore} -> ${foodAfter}，背包食物 ${itemsBefore} -> ${itemsAfter} 个` +
           (ret ? `，findFood 返回 ${JSON.stringify(String(ret).slice(0, 40))}` : '，findFood 返回 null') +
           (err ? `，异常: ${err.slice(0, 60)}` : '')
       }
@@ -367,24 +435,88 @@ const TASKS = [
     goal: '从地下爬回地面',
     budget: 240,
     async run (a, bot, ctx) {
+      /**
+       * 这个任务最大的陷阱：**假成功**。
+       *
+       * 老写法是"本来就在地面 → 直接判成功"。历史 5 次跑，5 次都这么"通过"了，
+       * 等于这个任务从来没测过 —— 而"困在地下爬不出来"恰恰是 TEAM.md 里写的当前卡点。
+       *
+       * 更隐蔽的一层：**只挖竖井也不算地下**。
+       * isUnderground() 的判断是"头顶 15 格内有实体方块"。
+       * 原地往下挖 4 格，头顶还是通天 → 判成露天 → 又变成假成功。
+       *
+       * 所以测试夹具必须是"真地下"：往下挖 4 格，再横着挖 3 格，
+       * 让头顶压着实心泥土。这样才复现真实困境。
+       */
       const startY = Math.round(a.pos().y)
-      let dug = 0
+      const fixture = []
 
-      // 如果本来就在地面，先给自己挖个坑 —— 否则这个任务永远是"本来就在地面"的假成功。
-      // （历史数据里 5 次跑，5 次都是这么"通过"的，等于没测。）
-      if (!a.isUnderground()) {
-        for (let i = 0; i < 4; i++) {
-          const p = a.pos()
-          const below = bot.blockAt(p.offset(0, -1, 0))
-          if (!below || /bedrock|lava|water/.test(below.name)) break
-          let ok = false
-          try { ok = await a.digAt(below) } catch (e) { break }
-          if (!ok) break
-          dug++
-          await sleep(500)
+      // ---- 夹具 1：往下挖 4 格 ----
+      let dugDown = 0
+      for (let i = 0; i < 4; i++) {
+        const p = a.pos()
+        const below = bot.blockAt(p.offset(0, -1, 0))
+        if (!below || /bedrock|lava|water/.test(below.name)) {
+          fixture.push(`第${i + 1}格下面是 ${below ? below.name : '未知'}，停止下挖`)
+          break
         }
-        await sleep(600)
+        let ok = false
+        try { ok = await a.digAt(below) } catch (e) { break }
+        if (!ok) { fixture.push(`第${i + 1}格挖不动`); break }
+        dugDown++
+        await sleep(700)   // 等掉落 + 等自己掉下去
       }
+
+      if (dugDown < 3) {
+        return {
+          ok: false,
+          kind: FAIL_KINDS.PRECONDITION,
+          detail: `造不出地下夹具：只挖下去 ${dugDown} 格（${fixture.join('；')}）`
+        }
+      }
+
+      // ---- 夹具 2：横着挖 3 格，让头顶压着实心 ----
+      // 先挑一个前方是实心的方向（避免直接挖进天然洞穴）
+      const dirs = [
+        { name: '+X', dx: 1, dz: 0, yaw: -Math.PI / 2 },
+        { name: '-X', dx: -1, dz: 0, yaw: Math.PI / 2 },
+        { name: '+Z', dx: 0, dz: 1, yaw: 0 },
+        { name: '-Z', dx: 0, dz: -1, yaw: Math.PI }
+      ]
+      let chosen = null
+      for (const d of dirs) {
+        const p = a.pos()
+        const foot = bot.blockAt(p.offset(d.dx, 0, d.dz))
+        const head = bot.blockAt(p.offset(d.dx, 1, d.dz))
+        if (foot && head && foot.boundingBox === 'block' && head.boundingBox === 'block') {
+          chosen = d
+          break
+        }
+      }
+      if (!chosen) chosen = dirs[0]
+
+      let tunneled = 0
+      for (let step = 0; step < 3; step++) {
+        const p = a.pos()
+        // 挖脚和头两格
+        for (const dy of [0, 1]) {
+          const b = bot.blockAt(p.offset(chosen.dx, dy, chosen.dz))
+          if (!b || b.name === 'air' || b.name === 'cave_air') continue
+          try { await a.digAt(b) } catch (e) {}
+        }
+        // 往前走一步
+        try {
+          await bot.look(chosen.yaw, 0, true)
+          bot.setControlState('forward', true)
+          await sleep(650)
+          bot.setControlState('forward', false)
+        } catch (e) {}
+        await sleep(400)
+        tunneled++
+        // 已经够深就停
+        if (step >= 1 && a.isUnderground()) break
+      }
+      fixture.push(`下挖 ${dugDown} 格，向 ${chosen.name} 掘进 ${tunneled} 格`)
 
       const undergroundBefore = a.isUnderground()
       const yBefore = Math.round(a.pos().y)
@@ -393,24 +525,37 @@ const TASKS = [
         return {
           ok: false,
           kind: FAIL_KINDS.PRECONDITION,
-          detail: `造不出地下场景（只挖了 ${dug} 格，仍在露天 y=${yBefore}），任务无法验证`
+          detail: `夹具失败：${fixture.join('，')}，y=${yBefore} 仍被判为露天，无法验证`
         }
       }
 
+      // ---- 正式测：能不能自己爬出来 ----
+      const t0 = Date.now()
       let err = null
       try {
         await a.getToSurface(80)
       } catch (e) { err = e.message }
-
       await sleep(800)
+
       const out = !a.isUnderground()
       const yAfter = Math.round(a.pos().y)
+      const climbed = yAfter - yBefore
+
+      // 判据必须同时满足两条：
+      //   1. 不再被判在地下
+      //   2. 真的往上走了（不是靠"判定抖了一下"通过）
+      // 只上升 1 格而 y 回到起始高度不算 —— 那是自己挖的竖井还在头顶。
+      const rose = climbed >= dugDown - 1
+      const ok = out && rose
+
       return {
-        ok: out,
-        kind: out ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
-        detail: `起始 y=${startY}，自挖 ${dug} 格到 y=${yBefore}，结果 y=${yAfter}（上升 ${yAfter - yBefore}）` +
-          `${out ? '，已判定在地面' : '，仍判定在地下'}` +
-          (err ? `，异常: ${err.slice(0, 60)}` : '')
+        ok,
+        kind: ok ? null : (err ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
+        detail: `${fixture.join('，')}；起点 y=${startY}，困在 y=${yBefore}，` +
+          `结果 y=${yAfter}（爬升 ${climbed} 格，需 ≥${dugDown - 1}）` +
+          `${out ? '，判定已出地面' : '，仍判定在地下'}` +
+          `${ok ? '' : err ? `，异常: ${err.slice(0, 60)}` : '，爬升不足'}` +
+          `，耗时 ${Math.round((Date.now() - t0) / 1000)}s`
       }
     }
   }

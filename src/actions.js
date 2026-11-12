@@ -196,6 +196,22 @@ class Actions {
    * 判断某个方向能不能走（用视觉判断，不靠算法）
    * @returns {{walkable:boolean, needDig:number, reason:string}}
    */
+  /**
+   * 判断某个方向能不能走。
+   *
+   * 踩过的坑：原版只检查 body/head 是不是空的，完全没管 feet。
+   * feet 是实心（半砖、台阶、栅栏、雪层）时，身体过得去但脚过不去，
+   * 判"能走"然后撞上去。
+   *
+   * 而且 "dig <= 2 就能走" 太宽松 —— 身体和头都被堵（dig=2）
+   * 可能是一堵厚墙，挖 2 格也过不去（后面还有）。
+   *
+   * 现在按真人走路的判断：
+   *   - 脚、身、头三格都空 + 脚下有地 = 直接能走
+   *   - 身/头堵但脚空 + 脚下有地 = 挖 1-2 格能走（矮顶或树枝）
+   *   - 脚堵 = 走不过去（要么挖脚下，要么绕）
+   *   - 脚下悬空 = 走不过去（会掉下去）
+   */
   canWalkTo (dx, dz) {
     const p = this.pos()
     const feet = this.bot.blockAt(p.offset(dx, 0, dz))
@@ -206,25 +222,38 @@ class Actions {
     const isFree = b => b && (b.name === 'air' || b.name === 'cave_air' || b.boundingBox === 'empty')
     const isSolid = b => b && b.boundingBox === 'block'
 
-    if (!feet || !body || !head) return { walkable: false, needDig: 99, reason: '看不清' }
+    if (!feet || !body || !head) return { walkable: false, needDig: 99, reason: '看不清（区块没加载）' }
     if (/lava/.test(feet.name) || /lava/.test(below?.name || '')) {
       return { walkable: false, needDig: 99, reason: '有岩浆' }
     }
+    if (/water/.test(feet.name)) {
+      return { walkable: false, needDig: 99, reason: '有水，会淹' }
+    }
 
-    // 身体和头要空
+    // 脚下有没有地踩
+    const hasFloor = isSolid(below)
+    if (!hasFloor) {
+      return { walkable: false, needDig: 99, reason: '脚下悬空，会掉下去' }
+    }
+
+    // 脚这一格是实心 -> 过不去（除非挖掉）
+    if (!isFree(feet)) {
+      return { walkable: false, needDig: 1, reason: `脚那格是${feet.name}，得挖掉或绕` }
+    }
+
+    // 身体和头
     let dig = 0
     if (!isFree(body)) dig++
     if (!isFree(head)) dig++
-    // 脚下要有东西踩（或者自己垫）
-    const needFloor = !isSolid(below)
 
-    if (dig === 0 && !needFloor && isFree(feet)) {
+    if (dig === 0) {
       return { walkable: true, needDig: 0, reason: '直接能走' }
     }
-    if (dig <= 2 && !needFloor) {
-      return { walkable: true, needDig: dig, reason: `挖 ${dig} 格就能走` }
+    if (dig === 1) {
+      return { walkable: true, needDig: 1, reason: `挖 1 格（${isFree(body) ? head.name : body.name}）就能走` }
     }
-    return { walkable: false, needDig: dig + (needFloor ? 1 : 0), reason: `要挖 ${dig} 格，脚下${needFloor ? '悬空' : '有地'}` }
+    // 身体和头都堵：可能是一堵厚墙，挖 2 格也未必通
+    return { walkable: false, needDig: 99, reason: '身和头都堵着，像堵墙，别硬挖' }
   }
 
   scan (radius = 16) {
