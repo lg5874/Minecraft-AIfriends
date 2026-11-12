@@ -1030,24 +1030,51 @@ class Actions {
     /**
      * 树干旁边能站人的格子。
      *
-     * 关键教训：直接把 pathfinder 的目标设成"树干那一格"是走不到的 ——
-     * 那一格是实心原木，A* 在里面找不到落脚点，探针里表现为
-     * "走不到这棵（差 4 格）"每棵白耗 5 秒。必须换成旁边真正的站立格。
+     * 关键教训 1：直接把 pathfinder 的目标设成"树干那一格"是走不到的 ——
+     * 那一格是实心原木，A* 在里面找不到落脚点。
+     * 关键教训 2：只找树干**底格**旁边的位置也不够。实测一棵被树叶包住的橡树：
+     * 底格 y=71，而 bot 从 y=68 的水平面走过去停在 y=64（GoalXZ 只走水平），
+     * 三维距离 7.5 格 —— 差的全是高度，digAt 的 4.2 格够不到。
+     * 所以候选格要覆盖整根树干的高度范围，并且优先选"跟 bot 高度接近"的。
      */
     const standSpotsNear = (base) => {
       const p = this.pos()
       const spots = []
-      for (const [dx, dy, dz] of [
+      const seen = new Set()
+      const dirs = [
         [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],
-        [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1],
         [1, 0, 1], [-1, 0, -1], [1, 0, -1], [-1, 0, 1],
         [2, 0, 0], [-2, 0, 0], [0, 0, 2], [0, 0, -2]
-      ]) {
-        const s = base.offset(dx, dy, dz)
-        if (!this.standable(s)) continue
-        spots.push(s)
+      ]
+      // 沿树干往上扫 0..5 格（树叶层也要看，因为树干可能在高处）
+      for (let dy = 0; dy <= 5; dy++) {
+        for (const [dx, , dz] of dirs) {
+          const s = base.offset(dx, dy, dz)
+          const key = `${s.x},${s.y},${s.z}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          if (!this.standable(s)) continue
+          spots.push(s)
+        }
       }
-      spots.sort((a, b) => a.distanceTo(p) - b.distanceTo(p))
+      // 也考虑"站在树底下往上挖"（树干正下方有实体地面）
+      for (let dy = -1; dy >= -2; dy--) {
+        for (const [dx, , dz] of dirs) {
+          const s = base.offset(dx, dy, dz)
+          const key = `${s.x},${s.y},${s.z}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          if (!this.standable(s)) continue
+          spots.push(s)
+        }
+      }
+      // 排序：先看能不能挖到树干（三维 4 格内），再看离自己近不近
+      spots.sort((a, b) => {
+        const da = a.distanceTo(base)
+        const db = b.distanceTo(base)
+        if (Math.abs(da - db) > 0.6) return da - db
+        return a.distanceTo(p) - b.distanceTo(p)
+      })
       return spots
     }
 
@@ -1055,33 +1082,71 @@ class Actions {
     const goNearTree = async (base, timeout = 12000) => {
       // 已经在挖掘距离内，不用走
       if (base.distanceTo(this.pos()) <= 4.0) return true
-      const spots = standSpotsNear(base)
+      const p0 = this.pos()
 
-      // 远处（>16 格）时，树干旁边那几格可能还没加载到 / 被树叶盖住，
-      // standable 判定为空。这种情况不能直接放弃，先朝树的方向走近再说。
-      if (!spots.length) {
-        const p = this.pos()
-        const dx = base.x - p.x
-        const dz = base.z - p.z
-        const len = Math.hypot(dx, dz) || 1
-        const step = Math.min(20, Math.max(6, len - 3))
-        const tx = Math.round(p.x + dx / len * step)
-        const tz = Math.round(p.z + dz / len * step)
-        this.log(`[chop] 树旁没找到落脚点，先朝它走近（-> ${tx},${tz}）`)
-        await walkTo(tx, p.y, tz, 2, Math.min(timeout, 15000))
-        // 走近后重新找落脚点
-        const spots2 = standSpotsNear(base)
-        for (const s of spots2.slice(0, 3)) {
-          if (Date.now() - t0 > DEADLINE) return false
-          if (await walkTo(s.x, s.y, s.z, 0, timeout)) return true
+      // 第一步：远距离先用 GoalXZ 拉近（只走水平，A* 不用管精确高度，
+      // 成功率高得多）。之前直接对树干做 GoalBlock，A* 找不到落脚点，
+      // 33 格外的树每棵白耗 5 秒。
+      if (base.distanceTo(p0) > 8) {
+        try {
+          this.bot.pathfinder.setGoal(new goals.GoalXZ(
+            Math.floor(base.x), Math.floor(base.z)))
+        } catch (e) {}
+        const s = Date.now()
+        let still = 0
+        let last = this.pos().clone()
+        try {
+          while (Date.now() - s < timeout) {
+            this.check()
+            const p = this.pos()
+            if (Math.hypot(p.x - base.x, p.z - base.z) <= 3.5) break
+            if (p.distanceTo(last) < 0.12) still += 200
+            else still = 0
+            last = p.clone()
+            if (still > 5000) break
+            await sleep(200)
+          }
+        } finally {
+          try { this.bot.pathfinder.setGoal(null) } catch (e) {}
         }
-        return base.distanceTo(this.pos()) <= 4.2
+        if (base.distanceTo(this.pos()) <= 4.0) return true
       }
 
+      // 第二步：走近了再找精确落脚点
+      const spots = standSpotsNear(base)
+      if (!spots.length) {
+        // 树旁还没有可站的格（被树叶盖住/未加载）：
+        // 直接对树干做 GoalNear，让 pathfinder 自己贴上去
+        return await walkTo(base.x, base.y, base.z, 2, Math.min(timeout, 8000))
+      }
       for (const s of spots.slice(0, 3)) {
         if (Date.now() - t0 > DEADLINE) return false
-        const ok = await walkTo(s.x, s.y, s.z, 0, timeout)
-        if (ok) return true
+        if (await walkTo(s.x, s.y, s.z, 0, Math.min(timeout, 8000))) return true
+      }
+
+      // 第三步：还是不够近（典型是 GoalXZ 把人带到了树脚下的低处，
+      // 而树干在坡上，垂直差 7 格 —— 实测就是这个情况）。
+      // 用三维 GoalNear 让 pathfinder 自己爬坡；爬不上去就垫一个方块往上。
+      let d3 = base.distanceTo(this.pos())
+      if (d3 > 4.0) {
+        if (await walkTo(base.x, base.y, base.z, 2, 10000)) {
+          if (base.distanceTo(this.pos()) <= 4.2) return true
+        }
+      }
+      d3 = base.distanceTo(this.pos())
+      if (d3 > 4.0 && base.y > this.pos().y + 1) {
+        // 站在低处够不到树干：垫方块往上抬，抬到够得着为止
+        for (let i = 0; i < 6 && base.distanceTo(this.pos()) > 4.0; i++) {
+          if (Date.now() - t0 > DEADLINE) return false
+          try {
+            const up = await this.pillarUp(1)
+            if (!up) break
+          } catch (e) {
+            this.log('[chop] 垫方块失败: ' + e.message)
+            break
+          }
+          await sleep(200)
+        }
       }
       return base.distanceTo(this.pos()) <= 4.2
     }
@@ -1147,7 +1212,10 @@ class Actions {
 
       // 逐个试，砍到一棵就收工（砍不动就换下一棵，不再盲目 wander）
       let choppedThisRound = 0
-      for (const cand of list) {
+      // 关键：只试最近的 3 棵。之前会把 20 多棵远树挨个试一遍，
+      // 每棵失败 5~12 秒，时间全浪费在"走不到"上（实测 190s 只砍到 1 棵）。
+      const tryList = list.slice(0, 3)
+      for (const cand of tryList) {
         if (Date.now() - t0 > DEADLINE) break
         const base = cand.base
         const key = `${base.x},${base.y},${base.z}`

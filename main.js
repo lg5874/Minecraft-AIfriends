@@ -859,6 +859,8 @@ class Bot {
           this.log('[impulse] 临时改主意：' + whim)
         }
       }
+      // impulse.maybe() 也会问模型，同样要重新确认忙不忙
+      if (this.busy) return
     }
 
     // 8. 没有别的事，就问自己想干什么
@@ -866,8 +868,15 @@ class Bot {
     //    放这里而不是 tick 开头：ensure() 没有目标时要问模型（几秒），
     //    不能让自救/躲夜排队等它。
     await this.ensureGoal()
+    // 【实测踩到】ensureGoal 要等模型好几秒。这几秒里别的地方可能已经把
+    // busy 置成 true（复活后回家、反射层抢救），而上面第 6 步的 busy 检查
+    // 早就过了。不在这里重新确认的话，回家途中会再起一个任务跟它抢
+    // pathfinder 的目标 —— 实测「离家 164.8 格 → 197.5 格」，越走越远。
+    if (this.busy) return
     if (!want) want = await this.will.think()
     if (!want) return
+    // will.think() 同样可能等模型；它回来时也可能已经忙起来了
+    if (this.busy) return
 
     this.busy = true
     this._busySince = Date.now()
