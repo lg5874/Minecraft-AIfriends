@@ -1239,6 +1239,27 @@ class Actions {
       const p = this.pos()
       const [dx, dz] = dirs[dirIdx]
 
+      // ===== 步骤0：先挖自己头顶 =====
+      // 关键！不挖这个，跳起来头会撞到天花板，永远上不去。
+      // （之前只挖前方，所以 40 步一格都没升）
+      const ownCeiling = bot.blockAt(p.offset(0, 2, 0))
+      if (ownCeiling && ownCeiling.boundingBox === 'block' && !/bedrock/.test(ownCeiling.name)) {
+        try {
+          await this.bestToolFor(ownCeiling)
+          await bot.dig(ownCeiling, true)
+          await sleep(150)
+        } catch (e) {}
+      }
+      // 再挖头顶上面那格，给自己留出跳跃空间
+      const ownCeiling2 = bot.blockAt(p.offset(0, 3, 0))
+      if (ownCeiling2 && ownCeiling2.boundingBox === 'block' && !/bedrock/.test(ownCeiling2.name)) {
+        try {
+          await this.bestToolFor(ownCeiling2)
+          await bot.dig(ownCeiling2, true)
+          await sleep(150)
+        } catch (e) {}
+      }
+
       // ===== 步骤1：挖前方 y+1 和 y+2（身体和头的位置）=====
       for (const dy of [1, 2]) {
         const b = bot.blockAt(p.offset(dx, dy, dz))

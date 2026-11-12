@@ -742,6 +742,16 @@ class Bot {
       if (this.actions) this.actions.cancel = false
     }
 
+    // 忙完了：回头接一下刚才没顾上的话（说"等会儿"就得回来）
+    if (this.talk) {
+      try {
+        const replied = await this.talk.followUpDeferred()
+        if (replied) this.log('[followup] 回头接完了')
+      } catch (e) {
+        this.log('[followup] ' + e.message)
+      }
+    }
+
     await sleep(3000 + Math.random() * 9000)
   }
 

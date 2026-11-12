@@ -36,6 +36,7 @@ class Talk {
     this.persuasion = new persuasion.Persuasion(ctx.dataDir || '/tmp')
     this.recentSaid = []      // 最近说过的话，用于语气疲劳判断
     this.botChain = []        // 检测 bot 之间的对话链
+    this.deferred = []        // 忙的时候没回/说要等会儿的，得回头接
     this.lastReplyTo = null   // 上一条是回给谁的
   }
 
@@ -284,6 +285,10 @@ ${this.fatigueHint()}`
     const busy = this.ctx.busy && this.ctx.busy()
     if (busy) {
       const cfg = this.ctx.cfg.behavior
+
+      // 记进"回头再回"的队列 —— 说"等会儿"就是承诺，之后必须接
+      this.defer(username, message)
+
       // 只有一小部分情况是真的没看见（比如正在打怪）
       if (Math.random() < 0.15) {
         this.ctx.log('[chat] 这会儿腾不出手 ' + username)
@@ -297,6 +302,74 @@ ${this.fatigueHint()}`
     }
 
     await this.reply(username, message)
+  }
+
+  /** 记下一条"等会儿再回"的话 */
+  defer (who, msg) {
+    // 同一人同一句不重复记
+    const dup = this.deferred.find(d => d.who === who && d.msg === msg)
+    if (dup) return
+    this.deferred.push({ who, msg, at: Date.now(), handled: false })
+    // 只留最近 10 条
+    if (this.deferred.length > 10) this.deferred.shift()
+  }
+
+  /**
+   * 忙完了，回头接一下刚才没回的话。
+   * 真人说"等会儿"之后一定会回来，不然就是没礼貌。
+   * @returns {Promise<boolean>} 有没有说话
+   */
+  async followUpDeferred () {
+    // 筛出还没处理的、且已经过了至少 8 秒的（太近说明还没忙完）
+    const now = Date.now()
+    const pending = this.deferred.filter(d => !d.handled && now - d.at > 8000)
+    if (!pending.length) return false
+
+    // 只接最近的一条（真人不会一口气回十条）
+    const item = pending[pending.length - 1]
+    item.handled = true
+
+    this.ctx.log(`[followup] 回头接 ${item.who} 刚才说的：${item.msg.slice(0, 30)}`)
+
+    const status = this.ctx.actions ? this.ctx.actions.status() : null
+    let world = ''
+    try {
+      world = this.ctx.perceive ? this.ctx.perceive.brief() : ''
+    } catch (e) {}
+
+    const msgs = [
+      { role: 'system', content: persona.systemPrompt(this.mem, world, [], {
+        secrets: this.mem.secrets, taste: this.ctx.taste, mood: this.ctx.mood
+      }) },
+      { role: 'system', content: `刚才你很忙，${item.who} 跟你说了话，你回了句"等会儿"或者没顾上。
+现在你手头的事弄完了（或告一段落了），该回头接一下。
+
+${item.who} 刚才说的是：${item.msg}
+
+要求：
+- 就像刚腾出手一样，自然地接一句
+- 短，一两句
+- 不要道歉式开场（"不好意思刚才在忙"这种太客气），真人不这么说
+- 可以直接回他刚才的问题，或者就说"刚才没顾上，你说啥"
+- 如果那话已经过时了（比如他问你借东西，现在你不确定还要不要），就说"还等着不"
+- 不想接就输出 [不说]` }
+    ]
+
+    let out = null
+    try {
+      const r = await this.llm.chat(msgs, { maxTokens: 160, temperature: 0.95 })
+      out = (r.text || '').trim()
+    } catch (e) { return false }
+
+    if (!out || out.includes('[不说]') || out.includes('[不理]')) return false
+    out = cleanLine(out, 50)
+    if (!out) return false
+    if (persona.isLeak(out) || persona.isMachineTalk(out)) return false
+
+    this.history.push({ who: item.who, msg: item.msg })
+    this.history.push({ who: '我', msg: out })
+    await this.say(out)
+    return true
   }
 
   /** 第一次见面，问对方怎么称呼 */
