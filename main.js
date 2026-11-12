@@ -1089,7 +1089,13 @@ function main () {
   process.on('SIGINT', () => { b.shutdown(); process.exit(0) })
   process.on('SIGTERM', () => { b.shutdown(); process.exit(0) })
   process.on('uncaughtException', (e) => {
-    console.log('[fatal] ' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e))
+    const msg = e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : String(e)
+    console.log('[fatal] ' + msg)
+    // 别让这类断言错误把整个进程干掉
+    if (/Invalid itemType|AssertionError/.test(msg)) {
+      console.log('[fatal] 这是 mineflayer 内部断言，忽略继续跑')
+      return
+    }
   })
 
   b.connect()

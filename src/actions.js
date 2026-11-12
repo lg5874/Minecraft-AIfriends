@@ -153,9 +153,12 @@ class Actions {
     const dy = Math.abs(y - p0.y)
 
     // 目标跟自己不在同一层：先解决高度差，再水平走
-    if (dy > 3) {
+    if (dy > 2) {
       const reached = await this.gotoVertical(y, timeoutMs)
-      if (!reached) return false
+      if (!reached) {
+        this.log(`[goto] 高度到不了（目标 y=${Math.round(y)}，现在 y=${Math.round(this.pos().y)}）`)
+        return false
+      }
     }
 
     const goal = new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range)
@@ -174,9 +177,12 @@ class Actions {
         const moved = p.distanceTo(lastP)
         lastP = p.clone()
 
-        // 1. 自己算距离：够近就算到了
+        // 1. 到达判定：水平近 + **垂直也必须近**
+        // 之前的 bug：垂直容差给到 4 格，结果箱子在 y=58 他在 y=45，
+        // 差了 13 格却判定"到了"，然后去开箱子必然失败。
         const dxz = Math.hypot(p.x - x, p.z - z)
-        if (dxz <= range + 2 && Math.abs(p.y - y) <= Math.max(4, range + 2)) {
+        const dyAbs = Math.abs(p.y - y)
+        if (dxz <= range + 2 && dyAbs <= 2) {
           return true
         }
 
@@ -2068,14 +2074,31 @@ class Actions {
 
   async depositAll (x, y, z, except = []) {
     const c = await this.openChest(x, y, z)
+    let moved = 0
     try {
-      const items = this.bot.inventory.items()
-      for (const it of items) {
-        if (except.some(e => it.name.includes(e))) continue
-        try { await c.deposit(it.type, null, it.count) } catch (e) {}
+      // 每次操作后背包会变，所以要重新取列表
+      for (let round = 0; round < 3; round++) {
+        const items = this.bot.inventory.items()
+          .filter(it => !except.some(e => it.name.includes(e)))
+        if (!items.length) break
+        let any = false
+        for (const it of items) {
+          // 关键：itemType 必须是有效数字，否则 mineflayer 内部断言失败
+          const t = Number(it.type)
+          if (!Number.isInteger(t) || t < 0) continue
+          try {
+            await c.deposit(t, null, it.count)
+            moved++
+            any = true
+          } catch (e) {}
+        }
+        if (!any) break
+        await sleep(200)
       }
-      return true
-    } finally { c.close() }
+      return moved > 0
+    } finally {
+      try { c.close() } catch (e) {}
+    }
   }
 
   async withdraw (x, y, z, itemName, count = 1) {
@@ -2083,9 +2106,13 @@ class Actions {
     try {
       const slot = c.containerItems().find(i => i.name === itemName)
       if (!slot) throw new Error('箱子里没有 ' + itemName)
-      await c.withdraw(slot.type, null, Math.min(count, slot.count))
+      const t = Number(slot.type)
+      if (!Number.isInteger(t) || t < 0) throw new Error('物品 ID 无效: ' + slot.type)
+      await c.withdraw(t, null, Math.min(count, slot.count))
       return true
-    } finally { c.close() }
+    } finally {
+      try { c.close() } catch (e) {}
+    }
   }
 
   // ---------------- 捡东西 ----------------
