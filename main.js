@@ -114,8 +114,10 @@ class Bot {
 
     bot.on('message', (msg) => {
       const t = msg.toString()
-      if (/died|slain|drowned|blew up|fell|burned|starved|withered|hit the ground|was killed/.test(t)) {
-        this.lastDeathMsg = t
+      // 只认跟自己名字一起出现的死亡消息
+      if (!t.includes(bot.username)) return
+      if (/died|slain|drowned|blew up|fell|burned|starved|withered|hit the ground|was killed|shot|impaled|suffocated|froze|magma|void|kinetic/.test(t)) {
+        this.lastDeathMsg = t.replace(/^[^:]*:\s*/, '').trim()
       }
     })
 
@@ -197,7 +199,13 @@ class Bot {
     this.talk = new Talk(bot, this.llm, this.mem, {
       log: (s) => this.log(s),
       cfg: this.cfg,
-      busy: () => this.busy,
+      // 只有真的在干正事才算忙。卡住/发呆/原地折腾都不算
+      busy: () => {
+        if (!this.busy) return false
+        // 如果一分钟没动静，就不算忙了（他只是在等模型或者卡住了）
+        if (this._taskProgress && Date.now() - this._taskProgress.at > 60000) return false
+        return true
+      },
       currentTaskDesc: () => this.taskDesc ? `你现在正在${this.taskDesc}。` : '你现在没什么事干。',
       actions: this.actions,
       dataDir: DATA,
@@ -222,7 +230,13 @@ class Bot {
       mem: this.mem,
       log: (s) => this.log(s),
       cfg: this.cfg,
-      busy: () => this.busy,
+      // 只有真的在干正事才算忙。卡住/发呆/原地折腾都不算
+      busy: () => {
+        if (!this.busy) return false
+        // 如果一分钟没动静，就不算忙了（他只是在等模型或者卡住了）
+        if (this._taskProgress && Date.now() - this._taskProgress.at > 60000) return false
+        return true
+      },
       onEvent: (kind, data) => this.onReflexEvent(kind, data)
     })
     this.reflex.start()
@@ -261,6 +275,21 @@ class Bot {
     this.clockTimer = setInterval(() => {
       try { this.mem.tick(1) } catch (e) {}
     }, 1000)
+
+    // 心跳：每 30 秒打一行，方便看出是不是卡死了
+    if (this._heartbeat) clearInterval(this._heartbeat)
+    this._heartbeat = setInterval(() => {
+      const b = this.bot
+      if (!b || !b.entity) {
+        this.log('[hb] 不在游戏里（' + (b ? 'entity 空' : '没连接') + '）')
+        return
+      }
+      const p = b.entity.position
+      const st = this.actions ? this.actions.status() : null
+      const idle = this._taskProgress ? Math.round((Date.now() - this._taskProgress.at) / 1000) : 0
+      const inv = st ? Object.keys(st.inventory).length : 0
+      this.log(`[hb] ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)} 血${st ? st.health : '?'} 饿${st ? st.food : '?'} 背包${inv}种 ${this.busy ? '忙:' + this.taskDesc + (idle > 20 ? `（${idle}秒没动）` : '') : '空闲'} 心情:${this.mood ? this.mood.state() : '?'}`)
+    }, 30000)
   }
 
   // ==================== 下线 / 重连 ====================
@@ -283,6 +312,8 @@ class Bot {
   onDeath () {
     this.deathCount++
     this.deathsSinceSafe++
+    this._deathTimes = (this._deathTimes || [])
+    this._deathTimes.push(Date.now())
 
     const how = this.lastDeathMsg || '不知道怎么回事'
     this.log('[death] ' + how)
@@ -326,6 +357,19 @@ class Bot {
     const bot = this.bot
     if (!bot || !bot.entity) return
     this.lastDamageKind = null
+
+    // 短时间内连续死 -> 出生点不安全，得走远
+    const now = Date.now()
+    this._deathTimes = (this._deathTimes || []).filter(t => now - t < 180000)
+    if (this._deathTimes.length >= 2) {
+      this.log('[respawn] 这地方反复死，走远点重生')
+      try {
+        await this.actions.wander(60)
+        await this.actions.ensureChunks(4000)
+      } catch (e) {}
+      this._deathTimes = []
+    }
+
     try {
       // 水里往上浮
       if (bot.entity.isInWater || (bot.oxygenLevel !== undefined && bot.oxygenLevel < 20)) {
@@ -394,6 +438,13 @@ class Bot {
 
   async loop () {
     while (this.running && this.bot && this.bot.entity) {
+      // 兜底：busy 卡太久（比如异常没走到 finally），强制放开
+      if (this.busy && this._busySince && Date.now() - this._busySince > (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000 + 30000) {
+        this.log('[stall] busy 状态卡太久，强制恢复')
+        this.busy = false
+        this.taskDesc = ''
+        if (this.actions) this.actions.cancel = false
+      }
       try {
         await this.tick()
       } catch (e) {
@@ -475,14 +526,49 @@ class Bot {
     if (!want) return
 
     this.busy = true
+    this._busySince = Date.now()
     this.taskDesc = want.text
     if (this.actions) { this.actions.cancel = false; this.actions.stop() }
     const t0 = Date.now()
     if (this.impulse) this.impulse.taskStarted()
     this.log(`>>> 开始：${want.text}`)
 
+    // 卡死检测：任务里如果连续 60 秒没有任何动作，就当它挂了
+    this._taskProgress = { at: Date.now(), pos: this.bot.entity.position.clone() }
+    const stallCheck = setInterval(() => {
+      const tp = this._taskProgress
+      if (!tp) return
+      const p = this.bot.entity ? this.bot.entity.position : null
+      if (!p) return
+      // 位置动了、或者背包变了、或者刚打了日志 -> 算有进展
+      if (p.distanceTo(tp.pos) > 0.8) {
+        tp.pos = p.clone()
+        tp.at = Date.now()
+        return
+      }
+      if (Date.now() - tp.at > 60000) {
+        this.log('[stall] 一分钟没动，强制结束任务')
+        if (this.actions) this.actions.cancel = true
+        try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+        tp.at = Date.now() + 600000   // 别重复触发
+      }
+    }, 5000)
+
+    // 硬超时：代码里可能卡在某个 await 上，到点强制打断
+    const hardTimeout = (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000
+    const timeoutPromise = new Promise((_, rej) => {
+      this._taskTimer = setTimeout(() => {
+        if (this.actions) this.actions.cancel = true
+        try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+        rej(new Error('这个任务干太久了，先放下'))
+      }, hardTimeout)
+    })
+
     try {
-      const result = await this.coder.writeAndRun(want.text, this.contextForTask())
+      const result = await Promise.race([
+        this.coder.writeAndRun(want.text, this.contextForTask()),
+        timeoutPromise
+      ])
       const secs = Math.round((Date.now() - t0) / 1000)
       const outText = String(result.output || '')
       const head = outText.slice(0, 40)
@@ -531,6 +617,9 @@ class Bot {
       this.log('任务异常: ' + e.message)
       this.will.finish()
     } finally {
+      if (stallCheck) clearInterval(stallCheck)
+      this._taskProgress = null
+      if (this._taskTimer) { clearTimeout(this._taskTimer); this._taskTimer = null }
       this.busy = false
       this.taskDesc = ''
       if (this.actions) this.actions.cancel = false

@@ -142,7 +142,7 @@ class Reflex {
     // 5. 天黑 + 血不多 + 没怪贴脸 -> 挖个洞躲着（真人的第一反应）
     this.checkNight()
 
-    // 6. 卡住脱困
+    // 6. 卡住脱困（只在真的想动却没动时才触发）
     this.checkStuck()
   }
 
@@ -284,16 +284,29 @@ class Reflex {
     return ents[0]
   }
 
-  // 走着走着位置不动 -> 卡住了，跳一下或者换个方向
+  // 只有"pathfinder 说在走"但"实际没挪窝"时才算卡住
   checkStuck () {
-    const p = this.bot.entity.position
+    const bot = this.bot
+    if (!bot.entity) return
+    const p = bot.entity.position
     if (!this.lastPos) { this.lastPos = p.clone(); this.stuckSince = 0; return }
+
     const moved = p.distanceTo(this.lastPos)
     this.lastPos = p.clone()
-    const moving = this.bot.pathfinder && this.bot.pathfinder.isMoving && this.bot.pathfinder.isMoving()
-    if (moving && moved < 0.15) {
+
+    // pathfinder 是不是真的在驱动移动
+    const pfMoving = bot.pathfinder && typeof bot.pathfinder.isMoving === 'function'
+      ? bot.pathfinder.isMoving() : false
+    // 有没有手动按键
+    const manual = ['forward', 'back', 'left', 'right'].some(k => {
+      try { return bot.getControlState(k) } catch (e) { return false }
+    })
+
+    const wantsToMove = pfMoving || manual
+
+    if (wantsToMove && moved < 0.12) {
       this.stuckSince++
-      if (this.stuckSince >= 8) {
+      if (this.stuckSince >= 10) {     // 10 * 0.8s = 8 秒没动
         this.stuckSince = 0
         this.unstuck()
       }
@@ -304,7 +317,12 @@ class Reflex {
 
   async unstuck () {
     const now = Date.now()
-    if (now - (this.lastUnstuck || 0) < 6000) return
+    if (now - (this.lastUnstuck || 0) < 15000) return   // 15 秒内只折腾一次
+    // 没在寻路、也没按键 -> 他只是站着，不用"脱困"
+    const bot0 = this.bot
+    const pfMoving = bot0.pathfinder && typeof bot0.pathfinder.isMoving === 'function'
+      ? bot0.pathfinder.isMoving() : false
+    if (!pfMoving) return
     this.lastUnstuck = now
     const bot = this.bot
     this.ctx.log('[unstuck]')

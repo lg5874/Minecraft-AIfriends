@@ -366,11 +366,16 @@ Talk.prototype.detectDemand = function (message, username) {
   // 已经是同一件事的后续追问
   if (this.pendingDemand) return this.pendingDemand
 
-  // 新要求：出现"帮我/去/给我/过来/来"这类祈使
-  const isDemand = /(帮我|帮忙|去|过来|来|给我|带我|陪我|一起|快点|赶紧|挖|砍|盖|打|找)/.test(m) &&
-    /(呗|吧|啊|嘛|吗|好不好|行不行|[!！]|$)/.test(m) &&
-    m.length >= 4
+  // 新要求：必须是明确的祈使句（"帮我X" / "去X" / "给我X" / "快点X"）
+  // 光提一个动词不算 —— "你发育怎么样了"是在聊天，不是要人干活
+  const imperative = /^(帮我|帮忙|你去|去|给我|带我|陪我|过来|快点|赶紧|来帮|能不能帮|可不可以帮|麻烦你|求)/.test(m) ||
+    /(帮我|帮忙|带我|陪我|给我点|过来一下|快点过来|求你了|求你帮|行行好|拜托你)/.test(m)
 
+  // 而且得是真的在要东西/要人做事，不是问句
+  const asking = /(呗|吧|嘛|好不好|行不行|可以吗|成不)[？?]?$/.test(m) || /[!！]$/.test(m)
+  const question = /[？?]$/.test(m) && !imperative
+
+  const isDemand = imperative && !question && m.length >= 3
   if (!isDemand) return null
 
   // 猜这件事有多麻烦

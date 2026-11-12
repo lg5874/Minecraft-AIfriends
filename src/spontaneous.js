@@ -121,8 +121,9 @@ class Spontaneity {
 
     const said = await talk.speak(item.ev.situation, {
       chance: item.ev.chance,
-      maxLen: item.ev.maxLen,
-      people: item.ev.people || []
+      maxLen: Math.min(item.ev.maxLen || 20, 24),
+      people: item.ev.people || [],
+      extraHint: '随口一句就行，最多十几个字。别汇报，别描述一堆数字。'
     })
     if (said) this.lastSpokeAt = Date.now()
     return said

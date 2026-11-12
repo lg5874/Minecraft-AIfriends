@@ -189,6 +189,13 @@ return '砍了树但没木头'
 - actions.findBlock(name, maxDist=32)  找最近的某种方块，返回方块对象或 null
 - actions.nearestEntity(name, range=16)  找最近的实体
 
+### 常用方块名（必须写全名，别写 log/stone 这种）
+原木：oak_log / birch_log / spruce_log / jungle_log / acacia_log / dark_oak_log / cherry_log / mangrove_log
+木板：oak_planks / birch_planks / spruce_planks …（每种树对应一种）
+石头类：stone / cobblestone / deepslate / cobbled_deepslate / granite / diorite / andesite
+矿石：coal_ore / iron_ore / copper_ore / gold_ore / diamond_ore / redstone_ore / lapis_ore
+其他：dirt / grass_block / sand / gravel / water / lava / crafting_table / furnace / chest
+
 ### 挖
 - actions.mine(blockName, count, maxDist=32)  挖若干个，返回实际挖到几个
 - actions.chopTree(count)  砍树，返回砍了几棵

@@ -271,7 +271,13 @@ class Actions {
 
   findBlock (name, maxDist = 32) {
     const def = mcData.blocksByName[name]
-    if (!def) throw new Error('没有这种方块: ' + name)
+    if (!def) {
+      // 给个提示，别只说"没有"
+      const hint = /^log$/.test(name) ? '（要写 oak_log / birch_log 这种全名）'
+        : /_log$/.test(name) && !name.includes('_') ? '（木板是 _planks，原木是 _log）'
+        : ''
+      throw new Error('没有这种方块: ' + name + hint)
+    }
     return this.bot.findBlock({ matching: def.id, maxDistance: maxDist })
   }
 
@@ -298,6 +304,14 @@ class Actions {
   async digAt (block) {
     if (!block) return false
     this.check()
+
+    // 方块可能已经被挖掉了 / 变成空气了，别对着空气挥镐
+    const live = this.bot.blockAt(block.position)
+    if (!live || live.name === 'air' || live.name === 'cave_air') {
+      return false
+    }
+    if (/water|lava|bedrock/.test(live.name)) return false
+    block = live
     // 关键：寻路还在跑的时候挖方块会被打断
     try { this.bot.pathfinder.setGoal(null) } catch (e) {}
     for (const k of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
@@ -322,6 +336,11 @@ class Actions {
     if (d > 5) {
       await this.goto(block.position.x, block.position.y, block.position.z, 2, 20000)
     }
+    // 走过去之后方块可能已经变了，再确认一次
+    const again = this.bot.blockAt(block.position)
+    if (!again || again.name === 'air' || again.name === 'cave_air') return false
+    block = again
+
     // 选对工具
     await this.bestToolFor(block)
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -371,6 +390,7 @@ class Actions {
   async mine (blockName, count = 1, maxDist = 32) {
     await this.ensureChunks()
     let got = 0
+    let emptyTries = 0
     let guard = 0
     while (got < count && guard++ < count * 4 + 10) {
       this.check()
@@ -401,6 +421,11 @@ class Actions {
       }
       const ok = await this.digAt(b)
       if (ok) got++
+      else {
+        // 挖失败：可能方块没了，重新找
+        emptyTries = (emptyTries || 0) + 1
+        if (emptyTries > 5) break
+      }
       await sleep(120)
     }
     return got
@@ -413,6 +438,9 @@ class Actions {
       'mangrove_log', 'cherry_log', 'pale_oak_log']
     let trees = 0
     let wanderTry = 0
+
+    // 关键：先在最大半径内找一遍，别急着走
+    await sleep(300)
     while (trees < count) {
       this.check()
       let found = null
@@ -648,75 +676,122 @@ class Actions {
     return true
   }
 
-  // 合成带重试（服务器偶尔不及时回包）
+  /**
+   * 合成（带重试 + 背包同步）。
+   *
+   * 之前老失败的原因：服务端回包慢，本地 inventory 还没更新就去 craft，
+   * mineflayer 算出"材料不够"，报 missing ingredient。
+   * 解决：合成前等一下、失败后重新取配方、必要时打开一次背包触发同步。
+   */
   async safeCraft (recipe, times, table) {
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       try {
         await this.bot.craft(recipe, times, table || null)
         return true
       } catch (e) {
-        const msg = String(e && e.message || '')
+        const msg = String((e && e.message) || '')
         this.log('craft retry' + i + ': ' + msg)
-        if (/missing ingredient|not enough/i.test(msg)) throw e
-        await sleep(800)
-        // 重新取一次配方
+
+        // 等一会儿让背包同步
+        await sleep(600 + i * 400)
+
+        // 打开再关一次箱子/背包，强制同步物品栏
+        if (/missing ingredient|not enough/i.test(msg)) {
+          await this.syncInventory()
+        }
+
+        // 重新取配方（背包可能刚变）
         try {
-          const rs = this.bot.recipesFor(recipe.result.id, null, 1, table || null)
-          if (rs && rs.length) recipe = rs[0]
+          const id = recipe.result && recipe.result.id
+          if (id) {
+            const rs = this.bot.recipesFor(id, null, Math.max(1, times), table || null)
+            if (rs && rs.length) { recipe = rs[0]; continue }
+          }
         } catch (e2) {}
+
+        if (i === 3) throw new Error('合成反复失败: ' + msg)
       }
     }
-    throw new Error('合成反复失败')
+    return false
   }
 
-  // 保证身边有工作台（没有就从原木开始造一个）
+  /** 强制同步背包：开关一次随身合成格 */
+  async syncInventory () {
+    try {
+      // 触发服务端重发背包
+      this.bot._client.write('window_click', {
+        windowId: 0, slot: -999, mouseButton: 0,
+        mode: 0, item: { present: false }
+      })
+      await sleep(300)
+    } catch (e) {}
+  }
+
+  // 保证身边有工作台
   async ensureTable () {
-    // 1. 附近已经有了（8 格内）
-    let t = this.findBlock('crafting_table', 10)
-    if (t) return t
+    // 1. 附近已经有了
+    const near = this.findBlock('crafting_table', 10)
+    if (near) return near
 
     // 2. 手上有，放下去
     if (this.countOf('crafting_table') > 0) {
-      t = await this.placeNearby('crafting_table')
-      if (t) return t
+      const placed = await this.placeNearby('crafting_table')
+      if (placed) return placed
     }
 
-    // 3. 造一个：需要木板 x4（工作台不需要工作台）
-    if (this.countOf('crafting_table') === 0) {
-      const tableId = this.itemId('crafting_table')
-      let rs = this.bot.recipesFor(tableId, null, 1, null)
-      if (!rs || !rs.length) {
-        // 木板不够，先搞木板
-        try {
-          if (this.woodCount() === 0) await this.ensureWood(2)
-          await this.anyPlanks(4)
-        } catch (e) {}
-        rs = this.bot.recipesFor(tableId, null, 1, null)
-      }
-      if (rs && rs.length) {
-        try {
-          await this.safeCraft(rs[0], 1, null)
-        } catch (e) {
-          this.log('[table] 造工作台失败: ' + e.message)
+    // 3. 造一个：只要 4 块木板，不需要工作台
+    const tableId = this.itemId('crafting_table')
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // 木板够不够
+      let plankName = this.bestPlank()
+      if (!plankName || this.countOf(plankName) < 4) {
+        // 用原木做木板
+        if (this.woodCount() > 0) {
+          try { await this.anyPlanks(8) } catch (e) {}
+        } else {
+          try { await this.ensureWood(2); await this.anyPlanks(8) } catch (e) {}
         }
+        plankName = this.bestPlank()
+      }
+      if (!plankName || this.countOf(plankName) < 4) {
+        this.log('[table] 木板不够（' + (plankName ? this.countOf(plankName) : 0) + '/4）')
+        await sleep(500)
+        continue
+      }
+
+      // 取配方
+      const rs = this.bot.recipesFor(tableId, null, 1, null)
+      if (!rs || !rs.length) {
+        this.log('[table] 取不到工作台配方，等背包同步')
+        await this.syncInventory()
+        await sleep(500)
+        continue
+      }
+
+      try {
+        await this.safeCraft(rs[0], 1, null)
+      } catch (e) {
+        this.log('[table] 合工作台失败: ' + e.message)
+        await sleep(400)
+        continue
+      }
+
+      // 合成了就放
+      if (this.countOf('crafting_table') > 0) {
+        const placed = await this.placeNearby('crafting_table')
+        if (placed) return placed
+        // 放不下也算有（拿着也行，craft 时传 table 对象另说）
       }
     }
 
-    // 4. 放下去
-    if (this.countOf('crafting_table') > 0) {
-      t = await this.placeNearby('crafting_table')
-      if (t) return t
-    }
-
-    // 5. 走一段再试（可能脚下太挤）
-    for (let i = 0; i < 3; i++) {
-      try { await this.wander(6) } catch (e) {}
-      await sleep(400)
-      t = this.findBlock('crafting_table', 8)
+    // 4. 实在不行，走一段换个开阔点的地方放
+    for (let i = 0; i < 2; i++) {
+      try { await this.wander(8) } catch (e) {}
+      const t = this.findBlock('crafting_table', 8)
       if (t) return t
       if (this.countOf('crafting_table') > 0) {
-        t = await this.placeNearby('crafting_table')
-        if (t) return t
+        const placed = await this.placeNearby('crafting_table')
+        if (placed) return placed
       }
     }
     return null
@@ -904,9 +979,18 @@ class Actions {
     return { survey: best, pos: bestPos }
   }
 
-  // 长途找个东西：边走边扫，最多走 n 段
+  // 长途找个东西：先扫近的，再逐步扩大半径，最后才走
   async travelToFind (predicate, maxLegs = 6, legBlocks = 40) {
     await this.ensureChunks()
+
+    // 先扫附近（很多时候东西就在旁边，只是之前没扫到）
+    for (const r of [16, 32, 48, 64]) {
+      const hit = predicate()
+      if (hit) return hit
+      // 换个半径再扫一次（findBlock 的 maxDistance 由 predicate 内部决定）
+      await sleep(150)
+    }
+
     for (let i = 0; i < maxLegs; i++) {
       this.check()
       const hit = predicate()
