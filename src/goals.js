@@ -54,6 +54,13 @@ function itemCount (inv, key) {
     case '#log': return sum(/_log$/)
     case '#planks': return sum(/_planks$/)
     case '#stone': return sum(/^(cobblestone|stone|deepslate|cobbled_deepslate|andesite|diorite|granite|tuff)$/)
+    // 地表就能挖到的石头（挖 stone 掉 cobblestone）。垫脚、盖墙都用它。
+    // 单独列一个键，是因为 #stone 把 andesite/diorite/granite/deepslate/tuff
+    // 也算进去了 —— 那些主要生成在地下（y≈50 上下），
+    // 在地表攒垫脚料时去挖它们是够不到的。
+    // 实测：目标「攒够垫脚的石头」时他一直在找 andesite，
+    // 日志里 [goto] 高度到不了（目标 y=57，现在 y=63）连着刷。
+    case '#surfacestone': return sum(/^(cobblestone|stone|cobbled_deepslate)$/)
     case '#food': return sum(/^(bread|cooked_|baked_potato|apple|carrot|potato|beef|porkchop|chicken|mutton|rabbit)/)
     default: return Number(inv[key]) || 0
   }
@@ -130,7 +137,12 @@ const POOL = [
     tag: '建造',
     stages: [
       { kind: 'do', title: '找块够平的地方，把地面收拾出来', need: { count: 1 } },
-      { kind: 'gather', title: '备料：石头和木头攒够一堆', need: { '#stone': 48, '#log': 16 } },
+      {
+        kind: 'gather',
+        title: '备料：石头和木头攒够一堆',
+        need: { '#surfacestone': 48, '#log': 16 },
+        where: '地上：石头挖裸露的岩面，木头找树'
+      },
       { kind: 'do', title: '把四面墙立起来', need: { count: 1 } },
       { kind: 'do', title: '封顶，顺手装个门', need: { count: 1 } }
     ],
@@ -187,14 +199,19 @@ const POOL = [
     why: '地上看不远，站高了心里有数',
     tag: '建造',
     stages: [
-      { kind: 'gather', title: '攒够垫脚的石头', need: { '#stone': 40 } },
+      {
+        kind: 'gather',
+        title: '在附近地上捡够垫脚的石头',
+        need: { '#surfacestone': 40 },
+        where: '地上（脚边、山坡、石头裸露的地方）'
+      },
       { kind: 'do', title: '一层层往上码，搭到高处', need: { count: 1 } },
       { kind: 'do', title: '站上去，把四周看一遍', need: { count: 1 } }
     ],
     score (status) {
       const inv = status.inventory || {}
       let s = 42
-      if (itemCount(inv, '#stone') >= 40) s += 25
+      if (itemCount(inv, '#surfacestone') >= 40) s += 25
       if (pickTier(inv) >= 0) s += 10
       return s
     }
@@ -545,6 +562,9 @@ ${list}
       '## 你心里挂着的一件事',
       `目标：${this.goal.title}${this.goal.why ? '（' + this.goal.why + '）' : ''}`,
       `进度：第 ${idx}/${this.goal.stages.length} 步 —— ${s.title}`,
+      // 去哪找：没有这句他会挑"最近的那块" —— 而最近的石头可能在地下，
+      // 他下不去（实测 [goto] 高度到不了 连刷 6 次）。
+      s.where ? `去哪弄：${s.where}` : '',
       this.progressText() ? `这一步到现在：${this.progressText()}` : '',
       '这件事不是今天干完的，是一天天攒出来的。能干就往前推一点，别每次从零想。'
     ].filter(Boolean)
