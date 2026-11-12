@@ -98,6 +98,126 @@ class Actions {
   }
 
   // 环顾四周，返回看到的东西，用来"观察"
+  // ============================================================
+  // 视觉：让他真的"看见"地形，而不是一堆方块计数
+  // ============================================================
+
+  /** 单个方块画成什么符号 */
+  _sym (b) {
+    if (!b) return '?'
+    const n = b.name
+    if (n === 'air' || n === 'cave_air') return '·'
+    if (/lava/.test(n)) return 'L'
+    if (/water/.test(n)) return '~'
+    if (/_log$/.test(n)) return 'T'
+    if (/leaves/.test(n)) return 't'
+    if (/_ore$/.test(n)) return 'O'
+    if (n === 'bedrock') return '#'
+    if (/chest|furnace|crafting_table/.test(n)) return 'C'
+    if (b.boundingBox === 'block') return '█'
+    return '░'
+  }
+
+  /**
+   * 侧面剖视图：沿某个方向切一刀，看竖直方向的地形。
+   * 这是最有用的一张图 —— 能直接看出"头顶有没有石头""前面通不通"。
+   *
+   * @param {string} axis 'x' | 'z'  沿哪个轴切
+   * @param {number} range 水平看多远（默认 8）
+   * @param {number} up 往上看几格（默认 8）
+   * @param {number} down 往下看几格（默认 4）
+   */
+  lookProfile (axis = 'x', range = 8, up = 8, down = 4) {
+    const p = this.pos()
+    const lines = []
+
+    const head = `      y+${up}${' '.repeat(Math.max(0, (up + down) * 1 - 4))}y-${down}`
+    lines.push(`【${axis === 'x' ? '东西' : '南北'}方向剖面】`)
+
+    for (let d = -range; d <= range; d++) {
+      let row = ''
+      for (let dy = up; dy >= -down; dy--) {
+        const b = axis === 'x'
+          ? this.bot.blockAt(p.offset(d, dy, 0))
+          : this.bot.blockAt(p.offset(0, dy, d))
+        row += this._sym(b)
+      }
+      const label = `${axis}${d >= 0 ? '+' : ''}${String(d).padStart(2)}`
+      lines.push(`${label}: ${row}${d === 0 ? '  ← 你在这' : ''}`)
+    }
+    return lines.join('\n')
+  }
+
+  /**
+   * 俯视图：从头顶往下看，脚下的平面。
+   * 能看出"四周哪里能走"。
+   */
+  lookTop (range = 8, layer = 0) {
+    const p = this.pos()
+    const lines = ['【俯视图】']
+    for (let dz = -range; dz <= range; dz++) {
+      let row = ''
+      for (let dx = -range; dx <= range; dx++) {
+        row += this._sym(this.bot.blockAt(p.offset(dx, layer, dz)))
+      }
+      lines.push(`z${dz >= 0 ? '+' : ''}${String(dz).padStart(2)}: ${row}${dz === 0 ? '  ← 你' : ''}`)
+    }
+    return lines.join('\n')
+  }
+
+  /**
+   * 完整的视觉快照：三个方向的剖面 + 俯视 + 图例。
+   * 这是给模型"看世界"用的。
+   */
+  lookAround3D (range = 6) {
+    const p = this.pos()
+    const out = []
+    out.push(`【位置】x=${Math.round(p.x)} y=${Math.round(p.y)} z=${Math.round(p.z)}`)
+    out.push('【图例】█实心 ·空 ~水 L岩浆 T原木 t树叶 O矿石 #基岩 C容器 ░半格 ?未知')
+    out.push('')
+    out.push(this.lookProfile('x', range, 6, 3))
+    out.push('')
+    out.push(this.lookProfile('z', range, 6, 3))
+    out.push('')
+    out.push(this.lookTop(range, 0))
+    return out.join('\n')
+  }
+
+  /**
+   * 判断某个方向能不能走（用视觉判断，不靠算法）
+   * @returns {{walkable:boolean, needDig:number, reason:string}}
+   */
+  canWalkTo (dx, dz) {
+    const p = this.pos()
+    const feet = this.bot.blockAt(p.offset(dx, 0, dz))
+    const body = this.bot.blockAt(p.offset(dx, 1, dz))
+    const head = this.bot.blockAt(p.offset(dx, 2, dz))
+    const below = this.bot.blockAt(p.offset(dx, -1, dz))
+
+    const isFree = b => b && (b.name === 'air' || b.name === 'cave_air' || b.boundingBox === 'empty')
+    const isSolid = b => b && b.boundingBox === 'block'
+
+    if (!feet || !body || !head) return { walkable: false, needDig: 99, reason: '看不清' }
+    if (/lava/.test(feet.name) || /lava/.test(below?.name || '')) {
+      return { walkable: false, needDig: 99, reason: '有岩浆' }
+    }
+
+    // 身体和头要空
+    let dig = 0
+    if (!isFree(body)) dig++
+    if (!isFree(head)) dig++
+    // 脚下要有东西踩（或者自己垫）
+    const needFloor = !isSolid(below)
+
+    if (dig === 0 && !needFloor && isFree(feet)) {
+      return { walkable: true, needDig: 0, reason: '直接能走' }
+    }
+    if (dig <= 2 && !needFloor) {
+      return { walkable: true, needDig: dig, reason: `挖 ${dig} 格就能走` }
+    }
+    return { walkable: false, needDig: dig + (needFloor ? 1 : 0), reason: `要挖 ${dig} 格，脚下${needFloor ? '悬空' : '有地'}` }
+  }
+
   scan (radius = 16) {
     const p = this.pos()
     const out = { blocks: {}, entities: [], players: [] }
@@ -505,63 +625,77 @@ class Actions {
   // 挖若干块某种方块
   async mine (blockName, count = 1, maxDist = 32) {
     await this.ensureChunks()
+    // 关键：数的是掉落物，不是方块名
+    const itemName = dropOf(blockName)
+    const startCount = this.countOf(itemName)
+
     // 挖地表资源（原木）时如果在地下，先上去
     if (/_log$/.test(blockName) && this.isUnderground()) {
       this.log('[mine] 在地下挖不到原木，先回地面')
       await this.getToSurface()
       await this.ensureChunks(3000)
     }
-    // 关键：数的是掉落物，不是方块名
-    const itemName = dropOf(blockName)
-    const startCount = this.countOf(itemName)
+
+    const def = mcData.blocksByName[blockName]
+    if (!def) throw new Error('没有这种方块: ' + blockName)
+
+    const failed = []      // 试过挖不到的坐标
     let got = 0
-    let emptyTries = 0
-    let guard = 0
-    while (got < count && guard++ < count * 4 + 10) {
+    let attempts = 0
+    const maxAttempts = count * 6 + 15
+
+    while (got < count && attempts++ < maxAttempts) {
       this.check()
-      // 血太少或者快淹死了，先撤
       if (this.bot.health <= 6) throw new Error('血太少了，得先撤')
       if (this.bot.oxygenLevel < 8) throw new Error('快淹死了')
-      let b = this.findBlock(blockName, maxDist)
-      if (!b && got === 0) {
-        // 附近没有：往下挖一层看看（玩家都这么干）
-        const p = this.pos()
-        const below = this.bot.blockAt(p.offset(0, -1, 0))
-        if (below && below.name !== 'air' && !/water|lava|bedrock/.test(below.name)) {
-          try { await this.digAt(below) } catch (e) {}
-          await this.pickupNearby(4)
-          b = this.findBlock(blockName, maxDist)
+
+      // 找最近的、没试过的
+      let target = null
+      const p = this.pos()
+      const r = Math.min(maxDist, 32)
+      const cands = []
+      for (let dx = -r; dx <= r; dx += 1) {
+        for (let dy = -10; dy <= 10; dy += 1) {
+          for (let dz = -r; dz <= r; dz += 1) {
+            const b = this.bot.blockAt(p.offset(dx, dy, dz))
+            if (!b || b.name !== blockName) continue
+            const key = `${b.position.x},${b.position.y},${b.position.z}`
+            if (failed.includes(key)) continue
+            cands.push(b)
+          }
         }
       }
-      if (!b) {
+      if (!cands.length) {
         if (got === 0) {
-          try { await this.wander(10) } catch (e) {}
-          await this.ensureChunks(2500)
-          b = this.findBlock(blockName, maxDist)
+          // 附近真没有：走远点找
+          this.log(`[mine] 附近 ${r} 格内没 ${blockName}，走远找`)
+          await this.wander(30)
+          await this.ensureChunks(3000)
+          continue
         }
-        if (!b) {
-          if (got === 0) {
-            throw new Error(`附近 ${maxDist} 格内找不到 ${blockName}` +
-              `（现在在 y=${Math.round(this.pos().y)}，背包有 ${this.countOf(blockName)} 个）`)
-          }
+        break
+      }
+      cands.sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
+      target = cands[0]
+
+      const ok = await this.digAt(target)
+      if (ok) {
+        got++
+        try { await this.pickupNearby(4) } catch (e) {}
+      } else {
+        // 记下来，别再试
+        failed.push(`${target.position.x},${target.position.y},${target.position.z}`)
+        if (failed.length >= 8 && got === 0) {
+          this.log(`[mine] 试了 ${failed.length} 个都挖不到，放弃`)
           break
         }
       }
-      const ok = await this.digAt(b)
-      if (ok) {
-        got++
-        // 挖完必须捡，否则物品全留在地上（这是"挖到0块"的根因）
-        try { await this.pickupNearby(4) } catch (e) {}
-      } else {
-        emptyTries = (emptyTries || 0) + 1
-        if (emptyTries > 5) break
-      }
       await sleep(120)
     }
-    // 返回真实增加的数量（不是"挖了几次"）
+
+    // 返回真实增加的数量
     const gained = this.countOf(itemName) - startCount
-    if (gained > 0) return gained
-    return got   // 万一是掉别的东西（比如精准采集），返回挖的次数
+    return gained > 0 ? gained : got
   }
 
   // 砍树：找原木，挖掉整棵
@@ -635,7 +769,15 @@ class Actions {
       } else {
         // 这棵砍不动，记下来别再试
         tried.push(`${base.x},${base.y},${base.z}`)
-        this.log(`[chop] 这棵砍不动（差 ${found.position.distanceTo(this.pos()).toFixed(0)} 格），换一棵`)
+        const dist = found.position.distanceTo(this.pos())
+        this.log(`[chop] 这棵砍不动（差 ${dist.toFixed(0)} 格），换一棵`)
+        // 如果连续几棵都很远，说明该换个地方了
+        if (tried.length >= 3) {
+          this.log('[chop] 附近几棵都够不到，走远点')
+          try { await this.wander(40) } catch (e) {}
+          await this.ensureChunks(4000)
+          tried.length = 0     // 换地方后重新计
+        }
         if (tried.length >= 5) throw new Error('试了 5 棵树都砍不动')
       }
       await sleep(200)
@@ -993,75 +1135,165 @@ class Actions {
     return null
   }
 
-  /** 我现在是不是在地下（头顶有厚实方块） */
+  /**
+   * 我现在是不是在地下。
+   *
+   * 判据：从头顶往上找，第一块"能挡住光"的方块离我多远。
+   *   - 3 格内就有 -> 肯定在洞里
+   *   - 一直通到天空（找到 y>=120 还没遮挡）-> 露天
+   *   - 中间遇到遮挡，但上面还有空 -> 半封闭（山洞、树下）
+   *
+   * 之前用"头顶 10 格有 4 格实心"判定，但每走一步地形都变，
+   * 同一个位置两次测出不同结果。
+   */
   isUnderground () {
+    const bot = this.bot
     const p = this.pos()
-    let solidCount = 0
-    for (let dy = 2; dy <= 10; dy++) {
-      const b = this.bot.blockAt(p.offset(0, dy, 0))
-      if (b && b.boundingBox === 'block') solidCount++
+
+    // 头顶 2 格就被挡 -> 肯定在洞里
+    const near = bot.blockAt(p.offset(0, 2, 0))
+    const near2 = bot.blockAt(p.offset(0, 3, 0))
+    if (near && near.boundingBox === 'block') return true
+    if (near2 && near2.boundingBox === 'block') return true
+
+    // 往上找第一个遮挡
+    let firstBlockAt = -1
+    for (let dy = 4; dy <= 60; dy++) {
+      const b = bot.blockAt(p.offset(0, dy, 0))
+      if (!b) break
+      if (b.boundingBox === 'block' && !/leaves|log/.test(b.name)) {
+        firstBlockAt = dy
+        break
+      }
     }
-    return solidCount >= 4     // 头顶 10 格里有 4 格以上实心 -> 在地下
+
+    // 一直通到天（60 格内没遮挡）-> 露天
+    if (firstBlockAt < 0) return false
+
+    // 头顶 15 格内就有石头 -> 在洞里
+    // （实测：y=51 时头顶 +9 才开始有石头，+20 是地表草地。
+    //  原来的阈值 8 太严，差一格就误判成露天）
+    if (firstBlockAt <= 15) return true
+
+    // 更远的遮挡：可能是山体或树冠，算露天
+    return false
   }
 
   /**
    * 挖一条台阶回到地面。
    * 这是真人在洞里最常干的事：往上挖个楼梯出来。
    */
-  async getToSurface (maxSteps = 30) {
+  /**
+   * 挖阶梯回到地面。
+   *
+   * 关键：必须挖"楼梯"，不能原地往上挖。
+   * 楼梯 = 往前走一格的同时上升一格。
+   * 每步：挖掉【前方】的方块（脚下那格 + 上面两格），然后走进去跳上去。
+   *
+   * 之前失败的原因：只挖了自己头顶，但脚下没变，跳了也上不去。
+   */
+  /**
+   * 挖阶梯回到地面。
+   *
+   * 踩过的坑：直接"挖头顶然后跳"不行，因为跳上去脚下是空的，会掉下来。
+   *
+   * 正确做法（真人挖楼梯就是这样）：
+   *   1. 先把【前方 y+1】挖空（这是我的身体要占的位置）
+   *   2. 把【前方 y+0】填上（这是我的脚要踩的台阶）
+   *   3. 挖掉【前方 y+2】（头）
+   *   4. 跳上去
+   *
+   * 这样每走一步上升一格，形成台阶。
+   */
+  async getToSurface (maxSteps = 60) {
     const bot = this.bot
     if (!this.isUnderground()) return true
-    this.log('[surface] 在地下，往上挖个楼梯出去')
 
-    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]]
-    const [dx, dz] = dirs[Math.floor(Math.random() * 4)]
+    const startY = this.pos().y
+    this.log('[surface] 在地下（y=' + Math.round(startY) + '），挖阶梯上去')
+
+    const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]]
+    let dirIdx = Math.floor(Math.random() * 4)
+    let noProgress = 0
+
+    // 找填充用的方块
+    const filler = () => ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite']
+      .map(n => this.item(n)).find(Boolean)
 
     for (let step = 0; step < maxSteps; step++) {
       this.check()
-      const p = this.pos()
 
-      // 到了地面就停
       if (!this.isUnderground()) {
-        this.log('[surface] 出来了，y=' + Math.round(this.pos().y))
+        const climbed = Math.round(this.pos().y - startY)
+        this.log(`[surface] 出来了！y=${Math.round(this.pos().y)}（上升 ${climbed} 格）`)
         return true
       }
 
-      // 挖身体和头顶两格
-      const body = bot.blockAt(p.offset(dx, 1, dz * 0 + 0).offset(0, 0, 0))
-      const headUp = bot.blockAt(p.offset(dx, 2, 0))
-      const feetAhead = bot.blockAt(p.offset(dx, 0, 0))
+      const p = this.pos()
+      const [dx, dz] = dirs[dirIdx]
 
-      // 先挖面前的（往前上方挖，形成楼梯）
-      for (const b of [headUp, feetAhead]) {
+      // ===== 步骤1：挖前方 y+1 和 y+2（身体和头的位置）=====
+      for (const dy of [1, 2]) {
+        const b = bot.blockAt(p.offset(dx, dy, dz))
         if (!b) continue
         if (b.name === 'air' || b.name === 'cave_air') continue
         if (/bedrock|lava|water/.test(b.name)) continue
         try {
           await this.bestToolFor(b)
           await bot.dig(b, true)
-          await sleep(150)
+          await sleep(130)
         } catch (e) {}
       }
 
-      // 往上跳一格
+      // ===== 步骤2：确保前方 y+0 有实体方块当台阶 =====
+      const stepBlock = bot.blockAt(p.offset(dx, 0, dz))
+      if (!stepBlock || stepBlock.boundingBox !== 'block') {
+        // 需要在"前方 y-1"上面放一块
+        const support = bot.blockAt(p.offset(dx, -1, dz))
+        const fill = filler()
+        if (support && support.boundingBox === 'block' && fill) {
+          try {
+            await bot.equip(fill, 'hand')
+            await bot.lookAt(support.position.offset(0.5, 0.5, 0.5), true)
+            await sleep(100)
+            await bot.placeBlock(support, new Vec3(0, 1, 0))
+            await sleep(200)
+          } catch (e) {}
+        } else if (!fill) {
+          // 没方块可垫：换个方向挖（可能那边有天然台阶）
+          dirIdx = (dirIdx + 1) % 4
+          continue
+        }
+      }
+
+      // ===== 步骤3：走上去 =====
       try {
         await bot.look(Math.atan2(-dx, dz), 0, true)
+        await sleep(90)
         bot.setControlState('jump', true)
         bot.setControlState('forward', true)
-        await sleep(450)
+        await sleep(700)
         bot.setControlState('jump', false)
         bot.setControlState('forward', false)
       } catch (e) {}
-      await sleep(200)
+      await sleep(300)
 
-      // 检查有没有真的上升
-      const p2 = this.pos()
-      if (p2.y <= p.y + 0.3) {
-        // 没上去，换个方向
-        const [nx, nz] = dirs[Math.floor(Math.random() * 4)]
-        if (nx !== dx || nz !== dz) { /* 下轮用新方向 */ }
+      // ===== 检查进度 =====
+      const nowY = this.pos().y
+      if (nowY > p.y + 0.4) {
+        noProgress = 0
+      } else {
+        noProgress++
+        if (noProgress >= 3) {
+          dirIdx = (dirIdx + 1) % 4
+          noProgress = 0
+          this.log(`[surface] 方向 (${dx},${dz}) 走不通，换方向`)
+        }
       }
     }
+
+    const climbed = this.pos().y - startY
+    this.log(`[surface] 挖了 ${maxSteps} 步，上升 ${Math.round(climbed)} 格，还没出去`)
     return !this.isUnderground()
   }
 

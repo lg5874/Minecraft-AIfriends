@@ -636,6 +636,7 @@ class Bot {
     this.busy = true
     this._busySince = Date.now()
     this.taskDesc = want.text
+    this._taskStartInv = this.snapshotInv()   // 记下开始时的背包，用来判断产出
     if (this.actions) { this.actions.cancel = false; this.actions.stop() }
     const t0 = Date.now()
     if (this.impulse) this.impulse.taskStarted()
@@ -707,7 +708,8 @@ class Bot {
         // 干完了：攒个念头，让主动层决定说不说
         if (this.spont) this.spont.push(spontaneous.onGoalDone(want.text, outText))
       } else {
-        this.log(`<<< 失败（${secs}s）：${result.error || outText}`)
+        const why = result.error || verdict.why || outText
+        this.log(`<<< 失败（${secs}s）：${why}`)
         this.mem.add({
           text: wishFailText(want.text, result.error || outText),
           kind: 'skill',
@@ -739,6 +741,102 @@ class Bot {
     }
 
     await sleep(3000 + Math.random() * 9000)
+  }
+
+  /**
+   * 判断一个任务到底成没成。
+   *
+   * 不能靠正则匹配模型写的自然语言（"挖青金石矿（mine返回0）"这种，
+   * 正则穷举不完）。改成三条硬标准，任一不满足就算失败：
+   *
+   *   1. 模型自己说了失败词（明确的"失败/没做成/做不了"）
+   *   2. 输出里有"返回0""从0变成0""0块""0个"这种零产出的痕迹
+   *   3. 任务说要做某样东西，但背包里没有
+   */
+  judgeOutcome (goal, outText, t0) {
+    const t = String(outText || '')
+
+    // 1. 明确的失败词
+    if (/^(失败|没做成|没成功|做不了|搞不定|完成不了|放弃)/.test(t)) {
+      return { ok: false, why: '模型明确说了失败' }
+    }
+    if (/(做不了|没做成|搞不定|完成不了|没能|白忙|砍不到|挖不到|找不到|弄不到|拿不到)/.test(t)) {
+      return { ok: false, why: '输出里有失败词' }
+    }
+
+    // 2. 零产出的痕迹
+    const zeroPatterns = [
+      /（mine返回0）/,
+      /返回\s*0\b/,
+      /从\s*0\s*变成\s*0/,
+      /\b0\s*(块|个|根|把|颗)/,
+      /挖了\s*0/,
+      /做了\s*0/,
+      /没拿到|没弄到|没挖到|没砍到|一个也没|一块也没/
+    ]
+    for (const re of zeroPatterns) {
+      if (re.test(t)) return { ok: false, why: '输出显示零产出' }
+    }
+
+    // 3. 说要做的物品，背包里有没有
+    //    注意：只有"制作类"任务才检查背包增加。
+    //    "摆箱子/存东西"这类是消耗物品，不适用。
+    const wantItem = this.extractWantedItem(goal)
+    if (wantItem && this._taskStartInv) {
+      // 判断是不是"制作/获取"类任务
+      const isProduce = /(做|制作|合成|弄|搞|挖|砍|打|弄到|搞到|收集|攒|备|升级|换)/.test(goal)
+      const isConsume = /(放|摆|存|放好|放下|安置|整理|存进|扔进)/.test(goal)
+
+      if (isProduce && !isConsume) {
+        const before = this._taskStartInv[wantItem] || 0
+        const now = this.countItem(wantItem)
+        if (now <= before) {
+          return { ok: false, why: `说要${wantItem}，但背包没增加（${before}->${now}）` }
+        }
+      }
+    }
+
+    return { ok: true, why: '' }
+  }
+
+  /** 从目标描述里猜他想要什么物品 */
+  extractWantedItem (goal) {
+    const map = {
+      '木镐': 'wooden_pickaxe', '石镐': 'stone_pickaxe', '铁镐': 'iron_pickaxe',
+      '钻石镐': 'diamond_pickaxe', '木斧': 'wooden_axe', '石斧': 'stone_axe',
+      '铁斧': 'iron_axe', '木剑': 'wooden_sword', '石剑': 'stone_sword',
+      '铁剑': 'iron_sword', '工作台': 'crafting_table', '熔炉': 'furnace',
+      '箱子': 'chest', '木棍': 'stick', '火把': 'torch', '床': 'red_bed',
+      '面包': 'bread', '木门': 'oak_door', '梯子': 'ladder',
+      '煤': 'coal', '铁锭': 'iron_ingot', '青金石': 'lapis_lazuli',
+      '钻石': 'diamond', '圆石': 'cobblestone', '木板': 'oak_planks'
+    }
+    for (const [cn, en] of Object.entries(map)) {
+      if (goal.includes(cn)) return en
+    }
+    return null
+  }
+
+  /** 数背包里某个物品有多少 */
+  countItem (name) {
+    try {
+      let n = 0
+      for (const i of this.bot.inventory.items()) {
+        if (i.name === name) n += i.count
+      }
+      return n
+    } catch (e) { return 0 }
+  }
+
+  /** 背包快照（物品名 -> 数量） */
+  snapshotInv () {
+    const out = {}
+    try {
+      for (const i of this.bot.inventory.items()) {
+        out[i.name] = (out[i.name] || 0) + i.count
+      }
+    } catch (e) {}
+    return out
   }
 
   contextForTask () {
