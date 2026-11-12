@@ -472,6 +472,9 @@ class Bot {
     this.taskDesc = ''
     this.seekingFood = false
     this.sheltered = false
+    // 死了就别硬走回家了（尸体在别处，走了也白走）
+    this._homing = false
+    if (this.home) { try { this.home.stop() } catch (e) {} }
     if (this.actions) { this.actions.cancel = true; this.actions.stop() }
     if (this.will) this.will.finish()
     if (this.mood) this.mood.onEvent('death', 1)
@@ -480,6 +483,7 @@ class Bot {
   async onRespawn () {
     this.log('复活了')
     if (this.reflex) this.reflex.reset()
+    this._homing = false
     if (this.actions) { this.actions.cancel = false; this.actions.stop() }
     this.busy = false
     setTimeout(() => this.afterRespawn(), 3000)
@@ -574,18 +578,29 @@ class Bot {
     // onRespawn 把 busy 清成 false 之后，主循环有 3 秒（afterRespawn 的延迟）
     // 去起一个新任务。这时候再去回家就是两个人抢同一个 pathfinder ——
     // 实测表现为「离家 164.8 格 → 197.5 格」，越走越远。
-    // 已经在忙就这趟不回了，下次复活再说（回家不是救命的活）。
     if (this.busy) {
       this.log('[home] 手上有活，这趟先不回家')
       return
     }
+    if (this._homing) return
 
     this.log(`[home] 离家 ${Math.round(dist)} 格，走回去`)
+
+    // 【实测踩到第二个坑】只设 busy 不够。
+    // 回来途中有一个"早就起跑"的任务走到 finally，它无条件把 busy 拍成 false，
+    // 主循环于是又起新任务，两边抢 pathfinder。实测日志：
+    //     06:18:14 [home] 离家 106 格，走回去
+    //     06:18:16 <<< 完成（5s）：…            ← 老任务收尾，把 busy 清了
+    //     06:18:27 >>> 开始：备料…              ← 主循环起了新任务
+    //     06:18:33 [home] 第 1 段没往前走（107 → 105）
+    // 所以再加一个"回家专用"的归属位 _homing，它只有这里写，
+    // 主循环和 reflex 都认它 —— 谁也别想趁 busy 被误清时插进来。
+    this._homing = true
     this.busy = true
     this._busySince = Date.now()
     this.taskDesc = '走回家'
     try {
-      const r = await this.home.goHome({ timeoutMs: 150000 })
+      const r = await this.home.goHome({ timeoutMs: 300000 })
       if (r && r.ok) {
         this.log(`[home] 到家了（${r.seconds}s）`)
         if (this.events) this.events.push('found_something', { home: true }, '你走回家了')
@@ -595,6 +610,7 @@ class Bot {
     } catch (e) {
       this.log('[home] 回家出错: ' + e.message)
     } finally {
+      this._homing = false
       this.busy = false
       this.taskDesc = ''
     }
@@ -651,8 +667,10 @@ class Bot {
 
   async loop () {
     while (this.running && this.bot && this.bot.entity) {
-      // 兜底：busy 卡太久（比如异常没走到 finally），强制放开
-      if (this.busy && this._busySince && Date.now() - this._busySince > (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000 + 30000) {
+      // 兜底：busy 卡太久（比如异常没走到 finally），强制放开。
+      // 回家期间不算"卡死"—— 它有自己的超时（最长 5 分钟），
+      // 这里强行清掉只会让主循环插进来抢寻路。
+      if (!this._homing && this.busy && this._busySince && Date.now() - this._busySince > (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000 + 30000) {
         this.log('[stall] busy 状态卡太久，强制恢复')
         this.busy = false
         this.taskDesc = ''
@@ -851,7 +869,9 @@ class Bot {
     }
 
     // 6. 正在干活不打断
-    if (this.busy) return
+    //    回家也算在干活：它自己管 busy，但万一被别处误清过，
+    //    这里再兜一次，保证主循环不会趁虚插进来抢寻路。
+    if (this.busy || this._homing) return
 
     // 7. 有答应别人的事就先做（答应了要做到）
     let want = null
@@ -869,7 +889,7 @@ class Bot {
         }
       }
       // impulse.maybe() 也会问模型，同样要重新确认忙不忙
-      if (this.busy) return
+      if (this.busy || this._homing) return
     }
 
     // 8. 没有别的事，就问自己想干什么
@@ -881,11 +901,11 @@ class Bot {
     // busy 置成 true（复活后回家、反射层抢救），而上面第 6 步的 busy 检查
     // 早就过了。不在这里重新确认的话，回家途中会再起一个任务跟它抢
     // pathfinder 的目标 —— 实测「离家 164.8 格 → 197.5 格」，越走越远。
-    if (this.busy) return
+    if (this.busy || this._homing) return
     if (!want) want = await this.will.think()
     if (!want) return
     // will.think() 同样可能等模型；它回来时也可能已经忙起来了
-    if (this.busy) return
+    if (this.busy || this._homing) return
 
     this.busy = true
     this._busySince = Date.now()
@@ -1002,8 +1022,15 @@ class Bot {
       if (stallCheck) clearInterval(stallCheck)
       this._taskProgress = null
       if (this._taskTimer) { clearTimeout(this._taskTimer); this._taskTimer = null }
-      this.busy = false
-      this.taskDesc = ''
+      // 【实测踩到的坑】任务收尾会无条件把 busy 拍成 false。
+      // 但"回家"是另一条独立的动作线，它跑几十秒到几分钟。
+      // 期间一个早就起跑的任务走到这里，就把回家的忙状态误清掉，
+      // 主循环立刻起新任务，两边抢 pathfinder —— 实测「107 → 105 → 107」原地打转。
+      // 回家期间不碰 busy，让 tryGoHomeAfterRespawn 的 finally 负责收尾。
+      if (!this._homing) {
+        this.busy = false
+        this.taskDesc = ''
+      }
       if (this.actions) this.actions.cancel = false
     }
 
