@@ -380,7 +380,6 @@ class Home {
   async goHome (opts = {}) {
     this.cancel = false
     const t0 = Date.now()
-    const timeoutMs = opts.timeoutMs || 150000
     const range = opts.range == null ? 2 : opts.range
 
     const p0 = this.pos()
@@ -400,52 +399,64 @@ class Home {
       return { ok: true, seconds: 0, dist: startDist, already: true, from: p0, to: p0.clone(), legs }
     }
 
+    // 总超时按距离算。
+    //
+    // 原来写死 150 秒。实测：离家 106.8 格，150 秒只推进了 68 格
+    //（106.8 → 39.0），然后报"走不回去"—— 差 39 格。
+    // 真人走路也不会"15 分钟没到家就永远不回了"。
+    // 2 秒/格是实测速度（水平），留一倍余量；下限 60 秒，上限 10 分钟。
+    const timeoutMs = opts.timeoutMs ||
+      Math.max(60000, Math.min(startDist * 2000, 600000))
+    const left = () => timeoutMs - (Date.now() - t0)
+
     this.stats.goHomeRuns = (this.stats.goHomeRuns || 0) + 1
     this.stats.lastGoHomeAt = Date.now()
 
-    const left = () => timeoutMs - (Date.now() - t0)
+    // ---- 分段走 ----
+    //
+    // 为什么分段：一次 setGoal 走到底，pathfinder 中途规划失败就整趟结束，
+    // 后面 40 格再也没机会。分段后每段从"现在的位置"重新规划一次，
+    // 相当于每走一段就重新看一眼路。
+    //
+    // 每段之后检查"有没有比段前更近"：连续两段没进展就认输，
+    // 不然会在原地磨到超时。
+    let best = startDist
+    let stall = 0
+    let segIndex = 0
+    const MAX_SEGMENTS = 8
+    let reached = false
 
-    // ---- 1. 直线走回去 ----
-    let leg = await this._leg('direct', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
-      range: opts.range == null ? 2 : opts.range,
-      timeoutMs: Math.min(Math.max(20000, startDist * 1400), Math.max(8000, left() - 5000))
-    }))
-    legs.push(leg)
+    for (segIndex = 0; segIndex < MAX_SEGMENTS; segIndex++) {
+      if (this.cancel) break
+      if (left() < 8000) break
 
-    // ---- 2. 沿着出门的路退回去 ----
-    if (!leg.ok && !this.cancel && this.trail.length && left() > 8000) {
-      leg = await this._leg('trail', () => this._followTrail({ leftMs: left() - 4000, range: opts.range == null ? 2 : opts.range }))
-      legs.push(leg)
-      if (leg.ok) {
-        // 退回来路了，再补最后一段
-        const l2 = await this._leg('final', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
-          range: 2, timeoutMs: Math.max(8000, Math.min(45000, left() - 2000))
-        }))
-        legs.push(l2)
-        if (!l2.ok) leg = l2
-      }
-    }
+      const segBefore = this.distanceFromHome(this.pos())
+      const r = await this._oneSegment(range, left)
+      for (const l of r.legs) legs.push(Object.assign({ seg: segIndex + 1 }, l))
+      if (r.ok) { reached = true; break }
 
-    // ---- 3. 只对齐水平坐标，高度交给寻路 ----
-    if (!leg.ok && !this.cancel && left() > 6000) {
-      leg = await this._leg('xz', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
-        xz: true,
-        range: 2,
-        timeoutMs: Math.max(6000, Math.min(60000, left() - 2000))
-      }))
-      legs.push(leg)
-      if (leg.ok) {
-        const l2 = await this._leg('xz-final', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
-          range: 2, timeoutMs: Math.max(5000, Math.min(25000, left()))
-        }))
-        legs.push(l2)
-        if (!l2.ok) leg = l2
+      const segAfter = this.distanceFromHome(this.pos())
+      if (segAfter <= range + 3) { reached = true; break }
+
+      if (segAfter < segBefore - 4) {
+        stall = 0
+        best = Math.min(best, segAfter)
+        this.log(`[home] 第 ${segIndex + 1} 段：${Math.round(segBefore)} → ${Math.round(segAfter)} 格`)
+      } else {
+        stall++
+        this.log(`[home] 第 ${segIndex + 1} 段没往前走（${Math.round(segBefore)} → ${Math.round(segAfter)}）`)
+        // 连续 3 段都推不动才认输。实测地形会有一段走不动（悬崖/水/树墙），
+        // 换条策略往往下一段就通了，急着放弃等于白走前面那几十格。
+        if (stall >= 3) {
+          this.log('[home] 连续 3 段没进展，不硬耗了')
+          break
+        }
       }
     }
 
     const p1 = this.pos()
     const finalDist = p1 ? this.distanceFromHome(p1) : Infinity
-    const ok = finalDist <= range + 3
+    const ok = reached || finalDist <= range + 3
     const seconds = Math.round((Date.now() - t0) / 100) / 10
 
     if (ok) {
@@ -458,17 +469,77 @@ class Home {
     }
     this.save()
 
-    this.log(`[home] ${ok ? '到家了' : '没到家'}：${seconds}s，还差 ${finalDist.toFixed(1)} 格`)
+    this.log(`[home] ${ok ? '到家了' : '没到家'}：${seconds}s，${segIndex} 段，还差 ${finalDist.toFixed(1)} 格`)
     return {
       ok,
       seconds,
       dist: finalDist,
       startDist,
+      best,
+      segments: segIndex,
       from: p0,
       to: p1,
       legs,
-      reason: ok ? '' : (this.cancel ? '被中断' : '走不回去')
+      reason: ok ? '' : (this.cancel ? '被中断' : (stall >= 2 ? '走不回去（两段都没进展）' : '走不回去'))
     }
+  }
+
+  /**
+   * 走一段。三条策略依次试，跟原来一样，但预算由调用方给（分段共用总超时）。
+   * @returns {Promise<{ok:boolean, legs:Array}>}
+   */
+  async _oneSegment (range, left) {
+    const legs = []
+    // 每段的预算。
+    //
+    // 给太多 = 分段没意义（direct 一口气吃掉全部时间，走不通就没机会重规划）。
+    // 给太少 = 每段都"超时"，实测 45 秒只走十几格，反而走不完。
+    // 取剩余时间的一半、夹在 30~120 秒之间：direct 走一段，然后从新位置
+    // 重新规划一次 —— 这正是分段的收益。
+    const budget = () => {
+      const rem = left() - 3000
+      return Math.max(15000, Math.min(Math.floor(rem * 0.5), Math.min(120000, rem)))
+    }
+
+    // ---- 1. 直线走回去 ----
+    let leg = await this._leg('direct', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
+      range, timeoutMs: budget()
+    }))
+    legs.push(leg)
+    if (leg.ok) return { ok: true, legs }
+
+    // ---- 2. 沿着出门的路退回去 ----
+    if (!this.cancel && this.trail.length && left() > 8000) {
+      leg = await this._leg('trail', () => this._followTrail({
+        leftMs: Math.max(5000, Math.min(30000, left() - 4000)),
+        range
+      }))
+      legs.push(leg)
+      if (leg.ok) {
+        const l2 = await this._leg('final', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
+          range, timeoutMs: budget()
+        }))
+        legs.push(l2)
+        return { ok: l2.ok, legs }
+      }
+    }
+
+    // ---- 3. 只对齐水平坐标，高度交给寻路 ----
+    if (!this.cancel && left() > 6000) {
+      leg = await this._leg('xz', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
+        xz: true, range, timeoutMs: budget()
+      }))
+      legs.push(leg)
+      if (leg.ok) {
+        const l2 = await this._leg('xz-final', () => this._walkTo(this.home.x, this.home.y, this.home.z, {
+          range, timeoutMs: Math.max(5000, Math.min(20000, left()))
+        }))
+        legs.push(l2)
+        return { ok: l2.ok, legs }
+      }
+    }
+
+    return { ok: false, legs }
   }
 
   async _leg (name, fn) {

@@ -52,6 +52,12 @@ const MACHINE_TALK = [
   /[a-z]{3,}:\d+/,                      // "stone:204"
   /\(-?\d+,\s*-?\d+,\s*-?\d+\)/,     // 坐标
   /已挖掉|已放置|执行成功|操作完成/,
+  // 数字箭头（"51→52"）—— 这是变量变化的写法，人不会这么说
+  /\d+\s*(?:→|->|>)\s*\d+/,
+  // 一堆"X块、Y块、Z块"的罗列（任务报告格式）
+  /(\d+\s*(块|个|根|把|颗)(、|，|,)){2,}/,
+  // "A 51→52，B 3→3" 这种对照
+  /\S+\s*\d+\s*→\s*\d+/,
   /\b(andesite|diorite|granite|deepslate|cobblestone|sandstone|tuff|calcite)\b/i
 ]
 

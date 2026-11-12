@@ -918,32 +918,60 @@ class Actions {
       // 挑第一个可达的。全不可达就换地方，不再硬试。
       cands.sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
 
+      // ===== 可达性预筛 =====
+      // 踩过的坑：只检查"周围有没有空气"是没用的 —— 石头里的矿周围本来就有空气
+      // （那是矿洞），但路不通。结果 500 个全判可达 -> digAt 全失败 ->
+      // "都够不到，换地方" -> 满地图乱跑（实测 8 分钟漂 100 格，0 个任务完成）。
+      //
+      // 正确做法：
+      //   1. 用 canDigBlock 过滤（工具等级）
+      //   2. 目标必须在"能挖到"的距离内，或者中间有连通空间
+      //   3. **严格限制换地方次数**，别无限漂移
+      const REACH = 4.2
       const reachable = []
       for (const c of cands) {
-        // canDigBlock 会检查工具等级和方块硬度
         try {
           if (!this.bot.canDigBlock(c)) continue
         } catch (e) { continue }
-        // 检查周围有没有可以站人的空位（能走过去才挖得到）
-        let hasStand = false
-        for (const [ox, oy, oz] of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[1,1,0],[-1,1,0],[0,1,1],[0,1,-1]]) {
-          const nb = this.bot.blockAt(c.position.offset(ox, oy, oz))
-          if (nb && (nb.name === 'air' || nb.name === 'cave_air')) { hasStand = true; break }
+
+        const dist = c.position.distanceTo(p)
+        // 已经够得着的：直接可用
+        if (dist <= REACH) { reachable.push(c); break }
+
+        // 远处的：检查视线（用 raycast 或者简单的地形判断）
+        // 简化版：检查从自己到目标连线上有没有大量实心方块
+        // （真正能不能走到，交给 digAt 的 goto 判断）
+        let blocked = 0
+        const steps = Math.min(8, Math.ceil(dist))
+        for (let i = 1; i <= steps; i++) {
+          const t = i / steps
+          const v = p.offset(
+            Math.round((c.position.x - p.x) * t),
+            Math.round((c.position.y - p.y) * t),
+            Math.round((c.position.z - p.z) * t)
+          )
+          const nb = this.bot.blockAt(v)
+          if (nb && nb.boundingBox === 'block') blocked++
         }
-        if (hasStand) reachable.push(c)
-        if (reachable.length >= 5) break   // 够用了，别全扫
+        // 连线上实心方块不超过一半，就值得试
+        if (blocked <= steps / 2) reachable.push(c)
+        if (reachable.length >= 3) break
       }
 
       if (!reachable.length) {
-        this.log(`[mine] ${cands.length} 个 ${blockName} 都够不到，换地方`)
-        if (got === 0) {
-          await this.wander(30)
-          await this.ensureChunks(3000)
-          // 防止无限找：试过 3 次就走人
-          if (failed.length > 3) break
-        } else break
+        this.log(`[mine] ${cands.length} 个 ${blockName} 都够不到`)
+        // 严格限制：只换 2 次地方，然后明确失败
+        this._mineWanderCount = (this._mineWanderCount || 0) + 1
+        if (this._mineWanderCount >= 2 || got > 0) {
+          this.log('[mine] 换地方太多次了，这次放弃')
+          this._mineWanderCount = 0
+          break
+        }
+        await this.wander(15)
+        await this.ensureChunks(2500)
         continue
       }
+      this._mineWanderCount = 0
       target = reachable[0]
 
       const ok = await this.digAt(target)
@@ -2096,18 +2124,36 @@ class Actions {
     const stockFiller = async (need = 12) => {
       if (fillerCount() >= need) return true
       const t0 = Date.now()
-      while (fillerCount() < need && Date.now() - t0 < 25000) {
+      let round = 0
+      while (fillerCount() < need && Date.now() - t0 < 30000 && round++ < 20) {
         const p = this.pos()
-        const below = p.offset(0, -1, 0)
-        if (!isSolid(below)) break
-        if (/bedrock|lava|water/.test(nameAt(below))) break
-        const before = fillerCount()
-        await digOne(below)
-        await sleep(260)
-        if (fillerCount() <= before && !isSolid(p.offset(0, -1, 0))) {
-          // 挖了但没进包（可能是空手挖石头），别再耗时间
-          if (fillerCount() === 0) break
+
+        // 优先挖头顶的石头（挖完正好给自己腾出上升空间，一举两得）。
+        // 别挖脚下：挖掉脚下人就掉下去了，位置变了还得重新判断。
+        const fs = firstSolidAbove(p, 6)
+        if (fs > 0) {
+          const before = fillerCount()
+          await digOne(p.offset(0, fs, 0))
+          await grabDrops(4)
+          await sleep(200)
+          // 一块都没多出来（空手挖石头不掉东西之类），别再耗
+          if (fillerCount() <= before && round > 3) break
+          continue
         }
+
+        // 头顶没石头了：往旁边挖一格看看
+        let dug = false
+        for (const [dx, dz] of DIRS) {
+          const v = p.offset(dx, 1, dz)
+          if (!isSolid(v)) continue
+          if (/bedrock|lava|water/.test(nameAt(v))) continue
+          await digOne(v)
+          await grabDrops(4)
+          dug = true
+          break
+        }
+        if (!dug) break
+        await sleep(200)
       }
       this.log(`[surface] 攒料：${fillerCount()} 块`)
       return fillerCount() > 0

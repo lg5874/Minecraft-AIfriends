@@ -42,7 +42,16 @@ class SelfState {
   }
 
   start () {
-    this.snapshot()           // 建立基线
+    // 建立基线。
+    //
+    // 这里必须把结果存进 known —— 原来只调了 snapshot() 没赋值，
+    // 而 known 初始是 {}（truthy），于是上线头 2 秒里 prompt() 的
+    // `if (!s) return ''` 拦不住，直接读到 s.tools.pickaxe 就抛
+    // "Cannot read properties of undefined (reading 'pickaxe')"，
+    // 整段自我状态失效（他不知道自己的镐子还在不在）。
+    // 下次 tick() 才会填 known，所以那 2 秒是空窗。
+    const base = this.snapshot()
+    if (base) this.known = base
     this.timer = setInterval(() => this.tick(), 2000)
   }
 
@@ -161,15 +170,19 @@ class SelfState {
    */
   prompt () {
     const s = this.known
+    // 空对象也是 truthy，光判 !s 拦不住"还没扫过"的中间态。
+    // 这里把字段补齐成默认值再往下走，保证 prompt() 永远不抛。
     if (!s) return ''
+    const inv = s.inv || {}
+    const tools = s.tools || {}
 
     const lines = []
 
     // 工具状况（最重要）
     const toolBits = []
     for (const kind of ['pickaxe', 'axe', 'shovel', 'sword']) {
-      const t = s.tools[kind]
-      if (t) {
+      const t = tools[kind]
+      if (t && t.name) {
         const dur = t.durability != null && t.maxDurability
           ? `，耐久 ${Math.round(t.durability / t.maxDurability * 100)}%`
           : ''
@@ -185,29 +198,29 @@ class SelfState {
     const watch = ['oak_log', 'birch_log', 'spruce_log', 'oak_planks', 'birch_planks',
       'stick', 'cobblestone', 'coal', 'iron_ingot', 'raw_iron', 'torch', 'crafting_table', 'furnace']
     for (const w of watch) {
-      const n = s.inv[w] || 0
+      const n = inv[w] || 0
       if (n > 0) mats.push(`${w.replace(/_/g, ' ')}×${n}`)
     }
     if (mats.length) lines.push('材料：' + mats.join('、'))
 
     // 状态
-    lines.push(`血 ${s.health}/20，饿 ${s.food}/20，背包 ${s.slotsUsed}/36 格，手上是 ${s.held ? s.held.replace(/_/g, ' ') : '空手'}`)
+    lines.push(`血 ${s.health == null ? '?' : s.health}/20，饿 ${s.food == null ? '?' : s.food}/20，背包 ${s.slotsUsed == null ? '?' : s.slotsUsed}/36 格，手上是 ${s.held ? s.held.replace(/_/g, ' ') : '空手'}`)
 
     // 最近发生的变化（他自己注意到的）
-    const recent = this.changes.filter(c => Date.now() - c.at < 120000).slice(-4)
+    const recent = (this.changes || []).filter(c => Date.now() - c.at < 120000).slice(-4)
     if (recent.length) {
       lines.push('刚刚发生：' + recent.map(c => c.what).join('；'))
     }
 
     // 关键提示
     const hints = []
-    if (!s.tools.pickaxe) hints.push('没有镐子，挖石头不会掉东西，得先做一把')
-    if (!s.tools.pickaxe && !s.inv.oak_log && !s.inv.birch_log && !s.inv.stick && !s.inv.oak_planks) {
+    if (!tools.pickaxe) hints.push('没有镐子，挖石头不会掉东西，得先做一把')
+    if (!tools.pickaxe && !inv.oak_log && !inv.birch_log && !inv.stick && !inv.oak_planks) {
       hints.push('也没木头没木棍，得先砍树')
     }
-    if (s.tools.pickaxe && s.tools.pickaxe.low) hints.push('镐子快坏了，考虑做把新的')
-    if (s.food < 18) hints.push('饱食度低于 18 不回血')
-    if (s.slotsUsed >= 34) hints.push('背包快满了，需要整理')
+    if (tools.pickaxe && tools.pickaxe.low) hints.push('镐子快坏了，考虑做把新的')
+    if (s.food != null && s.food < 18) hints.push('饱食度低于 18 不回血')
+    if (s.slotsUsed != null && s.slotsUsed >= 34) hints.push('背包快满了，需要整理')
 
     if (hints.length) {
       lines.push('注意：' + hints.join('；'))
