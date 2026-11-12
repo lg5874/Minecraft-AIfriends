@@ -62,7 +62,35 @@ class Will {
     const inv = Object.entries(status.inventory).map(([k, v]) => `${k}x${v}`).join(' ')
     const catalog = this.skills.catalog(15)
 
-    const prompt = `你现在在自己的世界里，没人管你。你站在 ${status.pos.x},${status.pos.y},${status.pos.z}，${status.time}，血 ${status.health}，饿 ${status.food}。
+    // ===== 让意愿层也能"看见"环境 =====
+    // 之前只给坐标，模型不知道自己在洞里还是在地表，
+    // 所以在 y=44 的地下挑"去砍树" —— 树在地表，必然失败。
+    let place = ''
+    try {
+      const ug = this.ctx.actions.isUnderground()
+      const depth = ug ? `你现在在**地下**（y=${Math.round(status.pos.y)}），头顶有石头，四周可能是矿道。` : `你现在在地表附近（y=${Math.round(status.pos.y)}）。`
+      place = depth
+      // 头顶离地表多远
+      if (ug) {
+        let blocks = 0
+        for (let dy = 2; dy <= 60; dy++) {
+          const b = this.ctx.actions.bot.blockAt(this.ctx.actions.pos().offset(0, dy, 0))
+          if (b && b.boundingBox === 'block') { blocks = dy; break }
+        }
+        if (blocks) place += `头顶约 ${blocks} 格处是石头/地面。`
+      }
+      // 附近有什么
+      const trees = ['oak_log','birch_log','spruce_log','jungle_log','acacia_log','dark_oak_log']
+        .some(l => { try { return !!this.ctx.actions.findBlock(l, 32) } catch (e) { return false } })
+      place += trees ? '附近有树。' : '附近没树。'
+      const stone = (() => { try { return !!this.ctx.actions.findBlock('stone', 24) } catch (e) { return false } })()
+      place += stone ? '附近有石头。' : ''
+    } catch (e) {}
+
+    const prompt = `你现在在自己的世界里，没人管你。
+
+【你在哪】${place}
+坐标 ${status.pos.x},${status.pos.y},${status.pos.z}，${status.time}，血 ${status.health}，饿 ${status.food}。
 背包：${inv || '空的'}
 你已经会的事：
 ${catalog}
@@ -74,6 +102,8 @@ ${this.mem.lastSummary() ? '上次下线前在：' + this.mem.lastSummary().text
 你现在想干点什么？挑一件你现在**就能开始动手**的事。要求：
 - 一句话，说清楚要做什么，比如"去挖点铁"、"找地方盖个屋子"、"砍点木头"
 - 要具体，别说"探索世界"这种空话
+- **必须符合你现在的位置**：在地下就挖矿/往上走，在地表才砍树盖房
+  如果你在地下却想砍树，那要先爬出去 —— 那也算合理的想法，但要写清楚"先爬出去"
 - 别挑需要特殊条件的事（比如下界、末地）
 - 如果背包里工具太差，先把工具弄好
 

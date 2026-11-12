@@ -192,7 +192,75 @@ return '砍了树但没木头'
 \`\`\``
   }
 
+  /**
+   * API 文档。
+   * 有个环境变量 AIFRIEND_MINIMAL_API=1 可以切成"精简模式"：
+   * 只给视觉 + 原子动作，不给那些"完整解决方案"的函数。
+   * 这是用来做实验的：验证模型靠视觉能不能自己写出正确的逻辑。
+   */
+  /** 精简版：只有视觉 + 原子动作 */
+  apiDocMinimal () {
+    return `### 看地形（视觉）
+- actions.lookAround3D(range=6)  完整地形图
+- actions.lookProfile('x'|'z', range, up, down)  单方向剖面
+- actions.lookTop(range, layer)  俯视图
+- actions.canWalkTo(dx, dz)  判断某方向能不能走：{walkable, needDig, reason}
+- actions.pos()  当前位置 {x,y,z}
+- actions.status()  返回 {pos, health, food, time, inventory}
+- actions.findBlock(name, maxDist)  找最近的方块
+- actions.findAny([名字1,名字2], maxDist)  在多个名字里找
+- actions.blockAt(x,y,z)  看某个位置是什么方块
+
+### 走
+- actions.goto(x, y, z, range=1)  走到坐标
+- actions.walkToward(dx, dz, 毫秒)  朝某个方向走一段（会先转向）
+- actions.wander(格数)  随便走走
+- actions.stop()  停下
+
+### 挖
+- actions.digAt(block)  挖指定的方块（会先走过去，够不到返回 false）
+- actions.bestToolFor(block)  换最合适的工具
+
+### 放
+- actions.place(blockName, x, y, z)  在指定坐标放方块
+- actions.placeNearby(blockName)  在脚边找位置放
+
+### 合成
+- actions.craft(itemName, count)  合成（需要工作台时会自动找/放）
+- actions.itemId(name)  物品 id
+
+### 背包
+- actions.item(name)  背包里这个物品或 null
+- actions.countOf(name)  有多少个
+- actions.equip(name)  装备/手持
+- actions.eat()  吃东西
+- actions.foodList()  能吃的列表
+
+### 战斗
+- actions.nearestEntity(name, range)  找最近的实体
+- actions.attack(name, times)  打怪
+
+### 其他
+- actions.pickupNearby(radius)  捡地上的东西
+- actions.ensureChunks()  等区块加载
+- sleep(毫秒)  等待
+- say('文字')  说话
+- log('文字')  写日志
+
+### 常用方块名（必须写全名）
+原木：oak_log / birch_log / spruce_log
+木板：oak_planks / birch_planks / spruce_planks
+石头：stone / cobblestone / deepslate / andesite / granite / diorite
+矿石：coal_ore / iron_ore / copper_ore / gold_ore / diamond_ore / lapis_ore
+注意：挖矿石掉的不一定是同名物品！
+  lapis_ore→lapis_lazuli  iron_ore→raw_iron  stone→cobblestone
+  用 actions.countOf() 时要查掉落物的名字`
+  }
+
   apiDoc () {
+    if (process.env.AIFRIEND_MINIMAL_API === '1') {
+      return this.apiDocMinimal()
+    }
     return `### 移动
 - actions.goto(x, y, z, range=1)  走到坐标，返回 true/false
 - actions.gotoPlayer(name, range=2)  走到某个玩家旁边

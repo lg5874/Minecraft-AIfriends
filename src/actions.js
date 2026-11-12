@@ -102,6 +102,13 @@ class Actions {
   // 视觉：让他真的"看见"地形，而不是一堆方块计数
   // ============================================================
 
+  /** 看某个位置是什么方块 */
+  blockAt (x, y, z) {
+    const b = this.bot.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)))
+    if (!b) return null
+    return { name: b.name, solid: b.boundingBox === 'block', pos: { x: b.position.x, y: b.position.y, z: b.position.z } }
+  }
+
   /** 单个方块画成什么符号 */
   _sym (b) {
     if (!b) return '?'
