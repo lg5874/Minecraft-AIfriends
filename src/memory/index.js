@@ -22,7 +22,7 @@ const writer = require('./writer')
 const { cnChars } = require('./text')
 const { STOP } = writer
 
-const VERSION = 2
+const VERSION = 3
 
 class Memory {
   constructor (dir) {
@@ -35,6 +35,7 @@ class Memory {
     this.places = {}         // 地点，单独存（不衰减）
     this.session = []        // 本次上线的事件（虚拟分钟 + 文本）
     this.secrets = []        // 别人私下托付的秘密
+    this.journal = []        // 工作日志：任务执行结果走这里，不进 entries
     this.lastDecayAt = 0
     this.load()
   }
@@ -54,6 +55,7 @@ class Memory {
       this.places = d.places || {}
       this.session = Array.isArray(d.session) ? d.session : []
       this.secrets = Array.isArray(d.secrets) ? d.secrets : []
+      this.journal = Array.isArray(d.journal) ? d.journal : []
       this.lastDecayAt = d.lastDecayAt || 0
       this.summaries = d.summaries || []
     } catch (e) {
@@ -62,10 +64,15 @@ class Memory {
       this.places = {}
       this.session = []
       this.summaries = []
+      this.journal = []
     }
   }
 
-  /** 从 v1（旧的平铺结构）迁移 */
+  /**
+   * 迁移。
+   * v1: 旧的平铺结构（events/facts/lessons/places）
+   * v2: entries 里混着大量任务流水账 -> 过一遍准入，不合格的挪进 journal
+   */
   migrate (old) {
     this.entries = []
     this.people = {}
@@ -73,6 +80,8 @@ class Memory {
     this.session = []
     this.secrets = []
     this.summaries = []
+    this.journal = []
+
     // 旧的 people
     for (const [name, p] of Object.entries(old.people || {})) {
       this.people[name] = {
@@ -107,6 +116,23 @@ class Memory {
     for (const l of (old.lessons || [])) {
       this.entries.push(entry.make({ text: '教训：' + l, kind: KINDS.SKILL, importance: 0.75 }, 0))
     }
+
+    // v2 -> v3：把历史里混进来的任务流水账清出去
+    if (Array.isArray(old.entries) && old.entries.length) {
+      this.people = old.people || this.people
+      this.places = old.places || this.places
+      this.secrets = Array.isArray(old.secrets) ? old.secrets : []
+      this.summaries = Array.isArray(old.summaries) ? old.summaries : []
+      this.lastDecayAt = old.lastDecayAt || 0
+      const kept = []
+      for (const e of old.entries) {
+        const r = sanitizeEntry(e)
+        if (r) kept.push(r)
+        else this.journal.push({ t: e.createdAt || 0, text: short(e.text), from: 'migrate' })
+      }
+      this.entries = kept
+    }
+
     this.save()
   }
 
@@ -121,6 +147,7 @@ class Memory {
         session: this.session,
         secrets: this.secrets,
         summaries: this.summaries,
+        journal: this.journal.slice(-300),
         lastDecayAt: this.lastDecayAt
       }, null, 0), 'utf8')
     } catch (e) {
@@ -168,12 +195,58 @@ class Memory {
 
   // ---------------- 写 ----------------
 
-  /** 直接记一条（调用方已经判断过值得记） */
-  add ({ text, kind, who, emotion, importance, certainty, hops, where, silent }) {
+  /**
+   * 写一条记忆。**所有路径最后都走这里**，所以准入判定只能有一处。
+   *
+   * 判定不合格的（任务流水账、计划、自言自语）不进记忆，
+   * 只落到 journal —— 那是工作日志，不进提示词、不衰减、也不占记忆位置。
+   *
+   * @param {object} o
+   * @param {string} o.text
+   * @param {string} [o.kind]
+   * @param {string|string[]} [o.who]
+   * @param {number} [o.emotion]
+   * @param {number} [o.importance]
+   * @param {boolean} [o.force] 调用方已经确认真实语义（人物档案/秘密/恩怨），跳过准入
+   * @returns {object|null} 写入或命中的条目；被判定为日志时返回 null
+   */
+  add (o = {}) {
     const now = this.clock.now()
+    const text = String(o.text == null ? '' : o.text).replace(/\s+/g, ' ').trim()
+    if (!text) return null
+
+    let v
+    if (o.force) {
+      v = { keep: true, text, kind: o.kind || KINDS.EVENT, who: normWho(o.who), where: o.where || null, emotion: o.emotion, importance: o.importance, reason: 'forced' }
+    } else {
+      v = writer.admit({
+        text,
+        kind: o.kind,
+        who: o.who,
+        where: o.where,
+        emotion: o.emotion,
+        importance: o.importance,
+        // 老接口的契约：调用方显式给了情绪/重要性，说明它已经判断过"这事有点分量"。
+        // 这种允许进，但压成弱记忆（几小时就淡），不会污染长期印象。
+        vouched: o.emotion != null || o.importance != null
+      })
+    }
+
+    // 不是记忆，是日志
+    if (!v.keep) {
+      this.journal.push({ t: now, text: short(text), why: v.reason })
+      if (this.journal.length > 300) this.journal.shift()
+      if (!o.silent) this.save()
+      return null
+    }
+
+    const finalText = v.text
+    const kind = v.kind
+    const who = (v.who && v.who.length) ? v.who : normWho(o.who)
+    const where = v.where || o.where || null
 
     // 先去重：同一类、同一批人、内容高度重合的，合并而不是新增
-    const dup = this.findDuplicate(text, kind, who, now)
+    const dup = this.findDuplicate(finalText, kind, who, now)
     if (dup) {
       dup.repeat = (dup.repeat || 1) + 1
       dup.emotion = Math.min(1, dup.emotion + 0.08)
@@ -185,12 +258,36 @@ class Memory {
       return dup
     }
 
-    const e = entry.make({ text, kind, who, emotion, importance, certainty, hops, where }, now)
+    const e = entry.make({
+      text: finalText,
+      kind,
+      who,
+      where,
+      emotion: v.emotion == null ? o.emotion : v.emotion,
+      importance: v.importance == null ? o.importance : v.importance,
+      certainty: o.certainty,
+      hops: o.hops
+    }, now)
     this.entries.push(e)
-    this.session.push({ t: now, text: short(text) })
+    this.session.push({ t: now, text: short(finalText) })
     if (this.session.length > 200) this.session.shift()
-    if (!silent) this.save()
+    if (!o.silent) this.save()
     return e
+  }
+
+  /**
+   * 只记日志，不碰记忆。
+   * 任务执行结果走这里 —— 他要复盘时能查，但不会把它当成"记忆"念出来。
+   */
+  log (text, meta = {}) {
+    const now = this.clock.now()
+    this.journal.push({
+      t: now,
+      text: short(String(text || '')),
+      why: meta.why || 'task',
+      ok: meta.ok
+    })
+    if (this.journal.length > 300) this.journal.shift()
   }
 
   /**
@@ -220,17 +317,18 @@ class Memory {
 
   /** 从一句对话里提取并决定要不要记 */
   maybeRemember (text, meta = {}) {
-    const v = writer.judge(text, meta)
+    const v = writer.admit({ text, who: meta.who, where: meta.where })
     if (!v.keep) return null
     return this.add({
-      text,
+      text: v.text,
       kind: v.kind,
-      who: meta.who || [],
+      who: v.who && v.who.length ? v.who : meta.who || [],
       emotion: v.emotion,
       importance: v.importance,
       certainty: meta.certainty,
       hops: meta.hops,
-      where: meta.where
+      where: v.where || meta.where,
+      force: true   // 已经判定过，别再判一次
     })
   }
 
@@ -259,7 +357,7 @@ class Memory {
     if (p.notes.length > 30) p.notes.shift()
     this.add({
       text: `关于${name}：${text}`, kind: KINDS.PERSON,
-      who: [name], importance: 0.6
+      who: [name], importance: 0.6, force: true
     })
   }
 
@@ -269,7 +367,7 @@ class Memory {
     if (p.gave.length > 40) p.gave.shift()
     this.add({
       text: `我把${item}给了${to}`, kind: KINDS.PERSON,
-      who: [to], importance: 0.55, emotion: 0.4
+      who: [to], importance: 0.55, emotion: 0.4, force: true
     })
   }
 
@@ -280,7 +378,7 @@ class Memory {
     p.trust = Math.min(10, (p.trust || 0) + 1)
     this.add({
       text: `${from}给了我${item}`, kind: KINDS.PERSON,
-      who: [from], importance: 0.65, emotion: 0.6
+      who: [from], importance: 0.65, emotion: 0.6, force: true
     })
   }
 
@@ -291,7 +389,7 @@ class Memory {
     p.trust = Math.max(-10, (p.trust || 0) - times)
     this.add({
       text: `${by}打我`, kind: KINDS.GRIEVANCE,
-      who: [by], importance: 0.75, emotion: 0.8
+      who: [by], importance: 0.75, emotion: 0.8, force: true
     })
   }
 
@@ -308,7 +406,7 @@ class Memory {
     p.lastHitAt = 0
     this.add({
       text: `${name}跟我道歉了，这事就算了`, kind: KINDS.PERSON,
-      who: [name], importance: 0.7, emotion: 0.6
+      who: [name], importance: 0.7, emotion: 0.6, force: true
     })
   }
 
@@ -337,7 +435,7 @@ class Memory {
     this.add({
       text: `${from} 私下跟我说：${content}${about ? '（不能让 ' + about + ' 知道）' : ''}`,
       kind: 'promise', who: [from].concat(about ? [about] : []),
-      importance: 0.8, emotion: 0.5
+      importance: 0.8, emotion: 0.5, force: true
     })
     return sec
   }
@@ -363,7 +461,35 @@ class Memory {
       x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z),
       note: note || '', t: this.clock.now()
     }
+    // 地点本身不衰减（places 单独存），但"这地方有什么"要进记忆，
+    // 这样他在附近时会想起来。
+    // note 得是人话 —— "评分 5.0" 这种是内部打分，不是记忆。
+    if (note && !/^(评分|score|得分)\s*[:：]?\s*[\d.]+$/i.test(String(note).trim())) {
+      this.add({
+        text: `${name}：${note}`,
+        kind: KINDS.PLACE,
+        where: name,
+        importance: 0.6,
+        force: true
+      })
+    }
     this.save()
+  }
+
+  /**
+   * 记一条地点知识：「X 那边有 Y」。
+   * 这是真人会记的东西，也是"想起"最有用的东西。
+   */
+  learnPlace (where, what, opts = {}) {
+    if (!where || !what) return null
+    return this.add({
+      text: `${where}那边有${what}`,
+      kind: KINDS.PLACE,
+      where,
+      importance: opts.importance == null ? 0.6 : opts.importance,
+      emotion: opts.emotion || 0.3,
+      force: true
+    })
   }
 
   getPlace (name) { return this.places[name] }
@@ -373,12 +499,21 @@ class Memory {
   /**
    * 想起一些事。
    * @param {string} query 当前情境
-   * @param {object} [opts] { people:[], limit }
+   * @param {object} [opts] { people:[], limit, near:{x,z} }
    */
   remember (query, opts = {}) {
     const now = this.clock.now()
-    const list = recall.search(this.entries, { text: query, people: opts.people || [] },
-      opts.limit || 8, now)
+    const list = recall.search(
+      this.entries,
+      {
+        text: query,
+        people: opts.people || [],
+        near: opts.near || null,
+        places: this.places
+      },
+      opts.limit || 8,
+      now
+    )
     recall.markRecalled(list, now)
     return list
   }
@@ -437,28 +572,34 @@ class Memory {
 
   /**
    * 把这次上线压成一句"今天干了啥"。
-   * 不调模型，就用事件挑几条重要的拼 —— 便宜、够用。
+   *
+   * 注意：这里只压**真记忆**（session 里本来就是准入过的），
+   * 而且不再从 journal 抓文本 —— 否则又把流水账绕回来了。
    */
   summarizeSession () {
-    if (!this.session.length) return null
+    if (!this.session.length) {
+      this.session = []
+      return null
+    }
     const now = this.clock.now()
     const mine = this.session.slice(-60)
 
-    // 挑最"有内容"的几件事
     const picked = []
     for (const s of mine) {
-      if (picked.length >= 6) break
+      if (picked.length >= 5) break
       const t = String(s.text || '')
       if (t.length < 4) continue
-      if (/^(走到|看了|转了一圈)/.test(t)) continue
       picked.push(t)
     }
-    if (!picked.length) return null
+    if (!picked.length) {
+      this.session = []
+      return null
+    }
 
     const summary = {
       at: now,
       minutes: this.clock.sessionMinutes(),
-      text: picked.join('；').slice(0, 300)
+      text: picked.join('；').slice(0, 240)
     }
     this.summaries = this.summaries || []
     this.summaries.push(summary)
@@ -469,6 +610,45 @@ class Memory {
 
   // ---------------- 状态 ----------------
 
+  /**
+   * 清理：把记忆里混着的任务流水账挑出去。
+   * 幂等 —— 跑几次结果一样，可以随时手动跑。
+   *
+   * @param {object} [opts] { dryRun }
+   * @returns {{before:number, after:number, removed:number, rescued:number, samples:object[]}}
+   */
+  purgeLogs (opts = {}) {
+    const before = this.entries.length
+    const kept = []
+    const removed = []
+    let rescued = 0
+
+    for (const e of this.entries) {
+      const r = sanitizeEntry(e)
+      if (!r) { removed.push(e); continue }
+      if (r.text !== e.text) rescued++
+      kept.push(r)
+    }
+
+    const report = {
+      before,
+      after: kept.length,
+      removed: removed.length,
+      rescued,
+      samples: removed.slice(0, 10).map(e => ({ kind: e.kind, text: String(e.text).slice(0, 70) }))
+    }
+
+    if (!opts.dryRun) {
+      this.entries = kept
+      for (const e of removed) {
+        this.journal.push({ t: e.createdAt || 0, text: short(e.text), why: 'purge' })
+      }
+      if (this.journal.length > 300) this.journal = this.journal.slice(-300)
+      this.save()
+    }
+    return report
+  }
+
   stats () {
     return {
       entries: this.entries.length,
@@ -477,10 +657,16 @@ class Memory {
       protectedCount: this.entries.filter(e => e.protected).length,
       people: Object.keys(this.people).length,
       places: Object.keys(this.places).length,
+      journal: (this.journal || []).length,
       playMinutes: Math.round(this.clock.now()),
       sessions: this.clock.sessions || 0,
       secrets: (this.secrets || []).length
     }
+  }
+
+  /** 工作日志（给排查用，不进提示词） */
+  recentLog (n = 10) {
+    return (this.journal || []).slice(-n)
   }
 }
 
@@ -490,6 +676,50 @@ function agoText (mins) {
   const h = mins / 60
   if (h < 24) return `${h.toFixed(0)}小时前`
   return `${(h / 24).toFixed(0)}天前`
+}
+
+function normWho (w) {
+  if (!w) return []
+  return (Array.isArray(w) ? w : [w]).filter(Boolean).slice(0, 6)
+}
+
+/**
+ * 体检一条历史条目：是真记忆就留下（必要时压一压），是流水账就返回 null。
+ * 迁移和清理都走这里。
+ */
+function sanitizeEntry (e) {
+  if (!e || !e.text) return null
+  const v = writer.admit({
+    text: e.text,
+    kind: e.kind,
+    who: e.who,
+    where: e.where,
+    emotion: e.emotion,
+    importance: e.importance
+  })
+  if (!v.keep) return null
+
+  // 已经在衰减的，尊重它现在的强度（别让清理变成"恢复记忆"）
+  const keepStrength = typeof e.strength === 'number' ? e.strength : 1
+  const ne = entry.make({
+    text: v.text,
+    kind: v.kind,
+    who: (v.who && v.who.length) ? v.who : normWho(e.who),
+    where: v.where || e.where || null,
+    emotion: e.emotion == null ? v.emotion : e.emotion,
+    importance: e.importance == null ? v.importance : e.importance,
+    certainty: e.certainty,
+    hops: e.hops
+  }, e.createdAt || 0)
+  ne.id = e.id || ne.id
+  ne.strength = keepStrength
+  ne.recallCount = e.recallCount || 0
+  ne.lastRecall = e.lastRecall || 0
+  ne.repeat = e.repeat
+  ne.lastAt = e.lastAt
+  ne.fuzzy = false   // 文字变了，模糊标记不适用
+  ne.archived = e.archived || false
+  return ne
 }
 
 function jaccard (a, b) {

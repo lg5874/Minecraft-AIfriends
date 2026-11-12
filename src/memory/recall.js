@@ -18,7 +18,8 @@ const STOP = new Set('的了是我你他她它在有和就都也很不个这那�
 
 function relevance (entry, queryChars, queryWords, names) {
   let score = 0
-  const text = entry.text + ' ' + (entry.who || []).join(' ')
+  // where 也算内容：「山洞有铁矿」要能被"山洞"这两个字捞出来
+  const text = entry.text + ' ' + (entry.who || []).join(' ') + ' ' + (entry.where || '')
 
   // 1. 汉字重叠
   const t = cnChars(text, STOP)
@@ -47,8 +48,21 @@ function relevance (entry, queryChars, queryWords, names) {
 }
 
 /**
+ * 离得越近越容易想起来（"上次就在这附近"）。
+ * 没有坐标就没有加成。
+ */
+function proximity (entry, near, places) {
+  if (!near || !entry.where || !places) return 0
+  const p = places[entry.where]
+  if (!p) return 0
+  const d = Math.hypot((p.x || 0) - near.x, (p.z || 0) - near.z)
+  if (d > 96) return 0
+  return (1 - d / 96) * 0.6
+}
+
+/**
  * @param {object[]} entries 所有记忆
- * @param {object} q { text, people }
+ * @param {object} q { text, people, near:{x,z}, places:{} }
  * @param {number} limit
  * @param {number} now 当前游戏时间
  */
@@ -57,6 +71,11 @@ function search (entries, q, limit = 8, now = 0) {
   const queryChars = cnChars(query, STOP)
   const queryWords = (query.toLowerCase().match(/[a-z_]{3,}/g) || [])
   const names = (q && q.people) || []
+  const near = (q && q.near) || null
+  const places = (q && q.places) || null
+
+  // "只知道坐标"：别因为查不到字就把地点知识全漏掉
+  const noQuery = !queryChars.size && !queryWords.length && !names.length
 
   const scored = []
   for (const e of entries) {
@@ -64,17 +83,23 @@ function search (entries, q, limit = 8, now = 0) {
     if (e.strength < 0.05 && !e.protected) continue
 
     const rel = relevance(e, queryChars, queryWords, names)
+    const nearBonus = proximity(e, near, places)
     const recallBonus = Math.min(e.recallCount || 0, 10) * 0.05
 
-    // 完全没相关、也不涉及提到的人 -> 跳过
-    if (rel <= 0 && recallBonus <= 0) continue
+    // 完全没相关、也不是身边的人和事 -> 跳过
+    if (rel <= 0 && recallBonus <= 0 && nearBonus <= 0) {
+      // 例外：说不出话（只给了坐标）时，让地点知识有机会冒出来
+      if (!(noQuery && e.kind === 'place')) continue
+    }
 
-    const score =
+    let score =
       rel * 0.45 +
       (e.emotion || 0) * 0.2 +
       (e.importance || 0) * 0.2 +
       (e.strength || 0) * 0.1 +
-      recallBonus
+      recallBonus +
+      nearBonus
+    if (noQuery && e.kind === 'place') score += 0.25
 
     scored.push({ e, score })
   }

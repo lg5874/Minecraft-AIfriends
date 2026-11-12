@@ -31,15 +31,52 @@ class Coder {
   }
 
   // 主入口：写一段代码来完成 goal
+  //
+  // 两段式：先跑旧技能，跑不动才让模型重写。
+  // 技能是模型以前写通的代码，复用 = 直接跑，省掉一次生成。
   async writeAndRun (goal, extraContext = '') {
     const skillCatalog = this.skills.catalog(30)
-    // 先按这次要做的事，捞出最相关的几个技能代码，一起给它参考
-    const relevant = this.skills.search(goal, 3)
-    const relevantCode = relevant.map(sk =>
-      `### ${sk.name}（${sk.desc}）\n\`\`\`javascript\n${sk.code}\n\`\`\``
-    ).join('\n\n')
     const apiDoc = this.apiDoc()
-    const status = JSON.stringify(this.actions.status())
+    const statusObj = this.actions.status()
+    const status = JSON.stringify(statusObj)
+
+    // ---- 第一段：找可以直接跑的旧技能 ----
+    // 复用前必须过适用性检查（工具升级了、东西已经有了，就不该再跑）
+    const tried = new Set()
+    let skillFailed = ''
+    const MAX_REUSE = 2
+
+    for (let i = 0; i < MAX_REUSE; i++) {
+      const picked = this.skills.pickFor(goal, statusObj, { exclude: tried })
+      if (!picked) break
+      const sk = picked.skill
+      tried.add(sk.name)
+
+      const t0 = Date.now()
+      this.ctx.log(`[skill] 复用 ${sk.name}：${sk.desc}（${picked.reason}）`)
+      const out = await this.run(sk.code, goal)
+      const ms = Date.now() - t0
+
+      // 跑一次记一次，失败也记 —— 成功率必须是真的
+      this.skills.markUse(sk.name, out.ok, { ms, error: out.error })
+
+      if (out.ok) {
+        this.skills.markTask({ reused: true, ok: true })
+        this.lastCode = sk.code
+        return { ok: true, code: sk.code, output: out.output, reused: sk.name }
+      }
+      skillFailed = out.error || String(out.output || '未知原因')
+      this.ctx.log(`[skill] ${sk.name} 跑挂了：${skillFailed}`)
+    }
+
+    // 旧技能都不行：让模型重写。失败的技能也一并给它看，当反面参考
+    const relevant = this.skills.search(goal, 3, statusObj, { exclude: tried })
+    const relevantCode = relevant.map(sk => {
+      const runs = (sk.ok || 0) + (sk.fail || 0)
+      const rate = runs ? Math.round((sk.ok || 0) / runs * 100) + '%' : '还没试过'
+      const note = sk._applicable === false ? `【现在不适用：${sk._why}】` : ''
+      return `### ${sk.name}（${sk.desc}，成功率 ${rate}）${note}\n\`\`\`javascript\n${sk.code}\n\`\`\``
+    }).join('\n\n')
 
     let feedback = ''
     const MAX = 4
@@ -78,11 +115,15 @@ class Coder {
       if (this.ctx && this.ctx.dumpCode) this.ctx.dumpCode(goal, code, attempt)
       const out = await this.run(code, goal)
       if (out.ok) {
-        return { ok: true, code, output: out.output }
+        // 这次是重新生成的，没有复用旧技能 —— 也要记进任务统计
+        this.skills.markTask({ reused: false, ok: true })
+        return { ok: true, code, output: out.output, reused: null }
       }
       feedback = out.error + (out.output ? '\n输出：' + out.output : '')
     }
-    return { ok: false, error: '试了 ' + MAX + ' 次都没成：' + feedback }
+    this.skills.markTask({ reused: false, ok: false })
+    const prefix = skillFailed ? '旧技能也没跑通（' + skillFailed + '）；' : ''
+    return { ok: false, error: prefix + '试了 ' + MAX + ' 次都没成：' + feedback }
   }
 
   async run (code, goal) {
@@ -176,6 +217,9 @@ ${apiDoc}
 
 ## 已经会的技能（可以直接调用 actions 做类似的事，也可以组合）
 ${skillCatalog}
+
+**注意**：上面标着"成功率"的技能是真的跑过的。成功率低的别再照抄它的写法；
+标"未用"的是还没验证过的新技能，可以参考思路但别当成可靠方案。
 
 ## 例子
 \`\`\`javascript

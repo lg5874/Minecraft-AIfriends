@@ -12,6 +12,7 @@ const FALLBACK_WILLS = [
 
 class Will {
   constructor (llm, mem, skills, ctx) {
+    this.goals = ctx && ctx.goals ? ctx.goals : null
     this.llm = llm
     this.mem = mem
     this.skills = skills
@@ -29,6 +30,20 @@ class Will {
   async think () {
     const now = Date.now()
     if (this.current && !this.current.done) return this.current
+
+    // ===== 有长期目标就优先做它 =====
+    // 真人不会每天从零想"我今天干嘛"，而是接着昨天没做完的事
+    try {
+      const g = this.goals && this.goals.current()
+      if (g && !g.done) {
+        this.current = g
+        this.lastThink = now
+        this.ctx.log('[will] ' + g.text + (g.fromGoal ? `（大目标：${g.goal}，第${g.stageIndex + 1}/${g.total}步）` : ''))
+        return this.current
+      }
+    } catch (e) {
+      this.ctx.log('[will] 长期目标读取失败: ' + e.message)
+    }
 
     // 死亡太多：先保命，别瞎跑
     if (this.ctx.deaths && this.ctx.deaths() >= 3) {

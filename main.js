@@ -174,6 +174,22 @@ class Bot {
         if (this.reflex) this.reflex.onHurt(ent)
       } catch (e) {}
     })
+
+    // ==================== 事件源（perception-owner 补） ====================
+    // 规矩：每个监听器里只有一行推送，判断/节流/格式化全在 src/events.js。
+    // 这样 main.js 不被业务逻辑污染，以后加事件源也不动主循环。
+    // 每个 pushXxx 自己 try/catch，断了不会把连接带崩。
+    bot.on('health', () => { if (this.events) this.events.pushHealth(bot) })
+    bot.on('time', () => { if (this.events) this.events.pushTime(bot) })
+    bot.on('rain', () => { if (this.events) this.events.pushWeather(bot) })
+    bot.on('weatherUpdate', () => { if (this.events) this.events.pushWeather(bot) })
+    bot.on('blockUpdate', (oldBlock, newBlock) => { if (this.events) this.events.pushBlockChange(oldBlock, newBlock, bot) })
+    bot.on('blockBreakProgressObserved', (block, stage, entity) => { if (this.events) this.events.pushDig(block, bot, entity) })
+    bot.on('playerCollect', (collector, collected) => { if (this.events) this.events.pushCollect(collector, collected, bot) })
+    bot.on('experience', () => { if (this.events) this.events.pushExp(bot) })
+    bot.on('entityMoved', () => { if (this.events) this.events.pushProximity(bot) })
+    bot.on('kicked', (reason) => { if (this.events) this.events.pushKick(reason) })
+    bot.on('respawn', () => { if (this.events) this.events.pushRespawn(bot) })
   }
 
   // ==================== 上线 ====================
@@ -704,11 +720,15 @@ class Bot {
       ])
       const secs = Math.round((Date.now() - t0) / 1000)
       const outText = String(result.output || '')
-      const head = outText.slice(0, 40)
-      const looksFailed = /^(失败|没做成|没成功|做不了|搞不定|完成不了)|失败[:：]|没做成[:：]/.test(head) ||
-        /做不了|没做成|搞不定|完成不了/.test(outText)
 
-      if (result.ok && !looksFailed) {
+      // ===== 成败判定 =====
+      // 之前这里有两个致命 bug：
+      //   1. 写了 judgeOutcome() 却从没调用，用的是一段只能匹配开头 40 字的粗糙正则
+      //   2. 失败分支引用了未定义的 verdict 变量，抛 ReferenceError，
+      //      导致所有失败记录都写不进记忆（日志里有三次 "verdict is not defined"）
+      const verdict = this.judgeOutcome(want.text, outText, t0)
+
+      if (result.ok && verdict.ok) {
         this.log(`<<< 完成（${secs}s）：${outText}`)
         if (result.code) {
           this.skills.add({

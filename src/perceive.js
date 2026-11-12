@@ -82,7 +82,36 @@ class Perception {
     return DIRS[idx]
   }
 
-  pos () { return this.bot.entity.position }
+  pos () {
+    try { return this.bot.entity.position } catch (e) { return null }
+  }
+
+  /**
+   * 读一个方块。
+   *
+   * **null 有两种完全不同的意思，绝不能混：**
+   *   - 区块没加载 / 刚断线 / 人死了还没复活 -> null（我们"看不见"）
+   *   - 那里确实是空气                   -> { name:'air' }（我们"看见了，是空的"）
+   *
+   * 之前把两者当成一回事：断线时 blockAt 全返回 null，
+   * 于是"头顶一路没遮挡" -> 判成露天 -> 他以为自己在地面上。
+   * actions.js 的 isUnderground 现在还有这个问题（不归我改，报告见 PERCEPTION-REPORT.md）。
+   */
+  blockAt (pos) {
+    if (!pos) return null
+    try {
+      return this.bot.blockAt(pos) || null
+    } catch (e) {
+      return null
+    }
+  }
+
+  /** 这个世界我到底看得见吗（有没有 entity、脚下那块加载了没） */
+  canSee () {
+    const p = this.pos()
+    if (!p) return false
+    return this.blockAt(p.offset(0, -1, 0)) !== null
+  }
 
   /** 大致距离说法，别写精确数字（人不会说"距离 17.3 格"） */
   distWord (d) {
@@ -96,34 +125,127 @@ class Perception {
   // ---------------- 地形 ----------------
 
   /**
+   * 头顶的通天情况。
+   *
+   * 这是"我在洞里还是在地面"的唯一判据，所以必须能表达"不知道"。
+   *
+   * 关键：扫的过程中只要连续遇到 null，就不能下"露天"的结论 ——
+   * 那可能是石头，只是区块还没加载。这时返回 unknown。
+   *
+   * @returns {{
+   *   state: 'open'|'covered'|'unknown',
+   *   firstBlockAt: number,   // 第一块遮挡离头顶几格，-1 = 没找到
+   *   firstBlock: string|null,
+   *   checked: number,        // 扫了几格
+   *   blind: number           // 其中几格看不见（null）
+   * }}
+   */
+  sky () {
+    const p = this.pos()
+    if (!p) return { state: 'unknown', firstBlockAt: -1, firstBlock: null, checked: 0, blind: 0 }
+
+    let checked = 0
+    let blind = 0
+    let firstBlockAt = -1
+    let firstBlock = null
+
+    for (let dy = 2; dy <= 60; dy++) {
+      checked++
+      const b = this.blockAt(p.offset(0, dy, 0))
+      if (!b) {
+        blind++
+        // 连续 3 格看不见就不猜了（再往上大概率都没加载）
+        if (blind >= 3) break
+        continue
+      }
+      // 树叶/原木算遮挡，但不等于在洞里 —— 树底下也是露天
+      if (b.boundingBox === 'block' && !/leaves|log/.test(b.name)) {
+        firstBlockAt = dy
+        firstBlock = b.name
+        break
+      }
+    }
+
+    if (blind >= 3) {
+      return { state: 'unknown', firstBlockAt: -1, firstBlock: null, checked, blind }
+    }
+    if (firstBlockAt < 0) {
+      return { state: 'open', firstBlockAt: -1, firstBlock: null, checked, blind }
+    }
+    return { state: 'covered', firstBlockAt, firstBlock, checked, blind }
+  }
+
+  /**
+   * 我是不是在地下 —— **正确版**。
+   *
+   * 这个函数是给 Lead 参考/替换 actions.js 里那个 isUnderground 用的
+   *（actions.js 不归我改，只报告问题）。
+   *
+   * 跟 actions.js 那版的三处差别：
+   *   1. 断线 / 区块没加载 -> 返回 null（不知道），不是 false（露天）
+   *   2. 阈值从 15 放宽到 20，并加"绝对高度"兜底：
+   *      y < 60 且头顶有遮挡 -> 一定在地下
+   *   3. 树冠（leaves/log）不算遮挡，站在树顶不该判成洞
+   *
+   * @returns {boolean|null} true 地下 / false 露天 / null 看不清
+   */
+  isUnderground () {
+    const p = this.pos()
+    if (!p) return null
+
+    // 头顶 2-3 格就被挡 -> 铁定在洞里（这条不依赖远处区块）
+    const near = this.blockAt(p.offset(0, 2, 0))
+    const near2 = this.blockAt(p.offset(0, 3, 0))
+    if (near && near.boundingBox === 'block') return true
+    if (near2 && near2.boundingBox === 'block') return true
+
+    const s = this.sky()
+
+    // 看不见 -> 不知道，别猜
+    if (s.state === 'unknown') return null
+    // 头顶通天 -> 露天
+    if (s.state === 'open') return false
+    // 有遮挡：近处的算洞；远的算山体/树冠
+    if (s.firstBlockAt <= 20) return true
+    // 已经在很低的位置（地表一般 63-72），头顶还有遮挡 -> 还是洞里
+    if (p.y < 60) return true
+    return false
+  }
+
+  /**
    * 描述"我站在什么地方"。
    * 这是最有用的一条 —— 模型需要知道自己在哪。
+   *
+   * 断线时不再瞎编"我站在不知道什么上"，而是如实说看不见。
    */
   describeTerrain () {
-    const bot = this.bot
     const p = this.pos()
+    if (!p) return '我不知道自己在哪（还没进游戏或者刚断线）'
+
     const bits = []
+    const ent = this.bot.entity || {}
 
     // 脚下是什么
-    const below = bot.blockAt(p.offset(0, -1, 0))
-    const feet = bot.blockAt(p)
-    const groundName = below ? (INTERESTING[below.name] || groundWord(below.name)) : '不知道什么'
+    const below = this.blockAt(p.offset(0, -1, 0))
+    const feet = this.blockAt(p)
+    const groundName = below ? (INTERESTING[below.name] || groundWord(below.name)) : null
 
-    if (bot.entity.isInWater) bits.push('我在水里')
-    else if (bot.entity.isInLava) bits.push('我泡在岩浆里')
-    else if (feet && feet.name !== 'air' && feet.name !== 'cave_air' && feet.boundingBox !== 'empty') {
+    if (ent.isInWater) bits.push('我在水里')
+    else if (ent.isInLava) bits.push('我泡在岩浆里')
+    else if (feet && feet.name !== 'air' && feet.name !== 'cave_air' && feet.boundingBox === 'block') {
       bits.push('我卡在方块里')
-    } else {
+    } else if (groundName) {
       bits.push(`我站在${groundName}上`)
+    } else {
+      // 看不见脚下 —— 断线、区块没加载、或者正在掉落
+      bits.push('脚下看不见（区块没加载，或者我正在往下掉）')
     }
 
-    // 头顶有没有遮挡 -> 判断在洞里还是露天
-    let openSky = true
-    for (let dy = 2; dy <= 12; dy++) {
-      const b = bot.blockAt(p.offset(0, dy, 0))
-      if (b && b.boundingBox === 'block' && !/leaves/.test(b.name)) { openSky = false; break }
-    }
-    bits.push(openSky ? '头顶是露天的' : '头顶有遮挡，像在洞里或者树底下')
+    // 头顶有没有遮挡 -> 洞里还是露天。必须区分"露天"和"看不见"
+    const s = this.sky()
+    if (s.state === 'open') bits.push('头顶是露天的')
+    else if (s.state === 'covered') bits.push('头顶有遮挡，像在洞里或者树底下')
+    else bits.push('头顶看不清（区块没加载，别当自己在地面上）')
 
     // 四个方向的地形起伏
     const slopes = []
@@ -137,30 +259,41 @@ class Perception {
     if (slopes.length) bits.push(slopes.join('、'))
 
     // 时间、天气
-    const tod = bot.time && bot.time.timeOfDay
-    if (tod !== undefined) {
+    const tod = this.bot.time && this.bot.time.timeOfDay
+    if (tod !== undefined && tod !== null) {
       if (tod < 12000) bits.push('现在是白天')
       else if (tod < 13800) bits.push('天快黑了')
       else if (tod < 22200) bits.push('现在是晚上')
       else bits.push('天快亮了')
     }
-    if (bot.isRaining) bits.push('在下雨')
+    if (this.bot.isRaining) bits.push('在下雨')
 
     return bits.join('，')
   }
 
-  /** 某个水平位置的地面高度 */
+  /**
+   * 某个水平位置的地面高度。
+   * @returns {number|null} null 表示"要么没地面，要么看不见" —— 要区分用 heightAtDetail()
+   */
   heightAt (dx, dz) {
-    const bot = this.bot
+    return this.heightAtDetail(dx, dz).y
+  }
+
+  /** 带原因的版本：能分清"这里是空的"和"我看不见" */
+  heightAtDetail (dx, dz) {
     const p = this.pos()
+    if (!p) return { y: null, why: 'blind' }
+
     const base = p.offset(dx, 0, dz)
+    let blind = 0
     for (let dy = 8; dy >= -12; dy--) {
-      const b = bot.blockAt(base.offset(0, dy, 0))
-      if (b && b.boundingBox === 'block' && !/leaves|log/.test(b.name)) {
-        return Math.floor(p.y + dy)
+      const b = this.blockAt(base.offset(0, dy, 0))
+      if (!b) { blind++; continue }
+      if (b.boundingBox === 'block' && !/leaves|log/.test(b.name)) {
+        return { y: Math.floor(p.y + dy), why: 'ok' }
       }
     }
-    return null
+    return { y: null, why: blind > 0 ? 'blind' : 'empty' }
   }
 
   // ---------------- 附近有什么 ----------------
@@ -170,16 +303,19 @@ class Perception {
    * 用聚类：把挨着的同类方块合成一个"地方"。
    */
   describeNearby (radius = 26, limit = 8) {
-    const bot = this.bot
     const p = this.pos()
+    if (!p) return '我看不见周围（还没进游戏或者刚断线）'
     const groups = new Map()   // name -> [{pos, n}]
+    let sampled = 0
+    let blind = 0
 
     // 采样，别太密（性能）
     for (let dx = -radius; dx <= radius; dx += 2) {
       for (let dz = -radius; dz <= radius; dz += 2) {
         for (let dy = -10; dy <= 12; dy += 2) {
-          const b = bot.blockAt(p.offset(dx, dy, dz))
-          if (!b) continue
+          sampled++
+          const b = this.blockAt(p.offset(dx, dy, dz))
+          if (!b) { blind++; continue }
           const label = INTERESTING[b.name]
           if (!label) continue
           // 只关心地表或浅层
@@ -213,6 +349,12 @@ class Perception {
     out.sort((a, b) => a.dist - b.dist)
     const picked = out.slice(0, limit)
 
+    // 采样点里超过一半读不到 -> 是断线/区块没加载，不是"周围什么都没有"
+    const blindPct = sampled ? blind / sampled : 0
+    if (blindPct > 0.5) {
+      return `周围大部分看不见（${Math.round(blindPct * 100)}% 的采样点读不到，区块没加载或者刚断线）`
+    }
+
     if (!picked.length) return '周围没什么值得注意的东西'
 
     return picked.map(o => {
@@ -237,8 +379,9 @@ class Perception {
     const bot = this.bot
     const p = this.pos()
     const out = []
+    if (!p) return ''
 
-    for (const e of Object.values(bot.entities)) {
+    for (const e of Object.values(bot.entities || {})) {
       if (!e || e === bot.entity) continue
       if (!e.name || !HOSTILE.has(e.name)) continue
       const d = e.position.distanceTo(p)
@@ -296,6 +439,7 @@ class Perception {
     const bot = this.bot
     const p = this.pos()
     const out = []
+    if (!p) return '我不知道自己在哪，也看不清谁在附近'
 
     for (const [name, pl] of Object.entries(bot.players || {})) {
       if (name === bot.username) continue
@@ -322,9 +466,12 @@ class Perception {
 
   /** 猜一个玩家在干嘛（看他的动作/朝向） */
   guessPlayerDoing (name, ent) {
+    if (!ent || !ent.position) return ''
     const prev = this._playerPrev && this._playerPrev[name]
     this._playerPrev = this._playerPrev || {}
-    const now = { pos: ent.position.clone(), at: Date.now() }
+    let pos
+    try { pos = ent.position.clone() } catch (e) { return '' }
+    const now = { pos, at: Date.now() }
     this._playerPrev[name] = now
 
     if (!prev) return ''
@@ -348,8 +495,9 @@ class Perception {
     const list = this.events.recent(seconds * 1000)
     if (!list.length) return ''
     return list.map(e => {
-      const ago = Math.max(1, Math.round((now - e.at) / 1000))
-      return `${ago} 秒前 ${e.what}`
+      const ago = Math.max(1, Math.round((now - (e.lastAt || e.at)) / 1000))
+      const n = e.count || 1
+      return `${ago} 秒前 ${e.what}${n > 1 ? `（${n} 次）` : ''}`
     }).join('；')
   }
 
@@ -357,14 +505,19 @@ class Perception {
 
   describeSelf () {
     const bot = this.bot
-    const items = bot.inventory ? bot.inventory.items() : []
-    const invCount = items.reduce((a, b) => a + b.count, 0)
+    if (!bot || !bot.entity) return '我看不到自己的状态（没连上服务器）'
+
+    let items = []
+    try { items = bot.inventory ? bot.inventory.items() : [] } catch (e) { items = [] }
     const slots = items.length
     const held = bot.heldItem ? itemWord(bot.heldItem.name) : '空手'
 
+    const hp = Number.isFinite(bot.health) ? Math.round(bot.health) : '?'
+    const food = Number.isFinite(bot.food) ? Math.round(bot.food) : '?'
+
     const bits = [
-      `血 ${Math.round(bot.health)}/20`,
-      `饿 ${Math.round(bot.food)}/20`,
+      `血 ${hp}/20`,
+      `饿 ${food}/20`,
       `手上是${held}`
     ]
     if (slots >= 32) bits.push('背包快满了')
@@ -381,12 +534,17 @@ class Perception {
    * 这是给模型看的"你现在看到了什么"。
    */
   snapshot (opts = {}) {
-    const terrain = this.describeTerrain()
-    const nearby = this.describeNearby(opts.radius || 26)
-    const threats = this.describeThreats(opts.threatRadius || 20)
-    const people = this.describePeople(opts.peopleRadius || 48)
-    const recent = this.describeRecent(opts.recentSeconds || 45)
-    const self = this.describeSelf()
+    // 每一项单独兜底：一项挂了不该把整张快照拖没
+    const safe = (fn, fallback) => {
+      try { return fn() } catch (e) { return fallback }
+    }
+
+    const terrain = safe(() => this.describeTerrain(), '（地形描述失败）')
+    const nearby = safe(() => this.describeNearby(opts.radius || 26), '（附近描述失败）')
+    const threats = safe(() => this.describeThreats(opts.threatRadius || 20), '')
+    const people = safe(() => this.describePeople(opts.peopleRadius || 48), '（看不清）')
+    const recent = safe(() => this.describeRecent(opts.recentSeconds || 45), '')
+    const self = safe(() => this.describeSelf(), '（自己状态读不到）')
 
     const lines = []
     lines.push(`【你在哪】${terrain}`)
@@ -396,18 +554,27 @@ class Perception {
     if (recent) lines.push(`【刚才】${recent}`)
     lines.push(`【自己】${self}`)
 
+    // 地下 / 露天 —— 这是"我该往上爬还是继续挖"的直接依据
+    const ug = safe(() => this.isUnderground(), null)
+    if (ug === true) lines.push('【在不在洞里】在地下')
+    else if (ug === false) lines.push('【在不在洞里】在地面上')
+    else lines.push('【在不在洞里】看不清（区块没加载），别当自己在地面上')
+
     return lines.join('\n')
   }
 
   /** 简版快照，给需要省 token 的地方用 */
   brief () {
+    const safe = (fn, fallback) => {
+      try { return fn() } catch (e) { return fallback }
+    }
     const lines = []
-    lines.push(this.describeTerrain())
-    const threats = this.describeThreats(14, 3)
+    lines.push(safe(() => this.describeTerrain(), '不知道自己在哪'))
+    const threats = safe(() => this.describeThreats(14, 3), '')
     if (threats) lines.push('威胁：' + threats)
-    const people = this.describePeople(32)
+    const people = safe(() => this.describePeople(32), '看不清')
     lines.push('人：' + people)
-    lines.push(this.describeSelf())
+    lines.push(safe(() => this.describeSelf(), '状态读不到'))
     return lines.join('；')
   }
 }

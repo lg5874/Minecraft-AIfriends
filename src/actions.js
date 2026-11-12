@@ -871,8 +871,42 @@ class Actions {
         }
         break
       }
+      // ===== 可达性预筛（关键）=====
+      // 之前按距离排序直接取最近的，不管能不能走到。
+      // 结果：目标在封闭矿洞里 -> goto 失败 -> digAt 报"够不到" -> 试8个放弃。
+      // 日志里 576 次"走不通"和 575 次"够不到"一一对应，就是这么来的。
+      //
+      // 现在：先按距离排序，然后逐个检查是否真的能挖到（视线/相邻空位），
+      // 挑第一个可达的。全不可达就换地方，不再硬试。
       cands.sort((a, b) => a.position.distanceTo(p) - b.position.distanceTo(p))
-      target = cands[0]
+
+      const reachable = []
+      for (const c of cands) {
+        // canDigBlock 会检查工具等级和方块硬度
+        try {
+          if (!this.bot.canDigBlock(c)) continue
+        } catch (e) { continue }
+        // 检查周围有没有可以站人的空位（能走过去才挖得到）
+        let hasStand = false
+        for (const [ox, oy, oz] of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[1,1,0],[-1,1,0],[0,1,1],[0,1,-1]]) {
+          const nb = this.bot.blockAt(c.position.offset(ox, oy, oz))
+          if (nb && (nb.name === 'air' || nb.name === 'cave_air')) { hasStand = true; break }
+        }
+        if (hasStand) reachable.push(c)
+        if (reachable.length >= 5) break   // 够用了，别全扫
+      }
+
+      if (!reachable.length) {
+        this.log(`[mine] ${cands.length} 个 ${blockName} 都够不到，换地方`)
+        if (got === 0) {
+          await this.wander(30)
+          await this.ensureChunks(3000)
+          // 防止无限找：试过 3 次就走人
+          if (failed.length > 3) break
+        } else break
+        continue
+      }
+      target = reachable[0]
 
       const ok = await this.digAt(target)
       if (ok) {
@@ -933,8 +967,17 @@ class Actions {
           for (const pos of candidates) {
             const key = `${pos.x},${pos.y},${pos.z}`
             if (tried.includes(key)) continue
-            found = this.bot.blockAt(pos)
-            if (found) break
+            const cand = this.bot.blockAt(pos)
+            if (!cand) continue
+            // 可达性预筛：周围要有站人的空位，不然走过去也砍不到
+            let hasStand = false
+            for (const [ox, oy, oz] of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[1,1,0],[-1,1,0],[0,1,1],[0,1,-1]]) {
+              const nb = this.bot.blockAt(cand.position.offset(ox, oy, oz))
+              if (nb && (nb.name === 'air' || nb.name === 'cave_air')) { hasStand = true; break }
+            }
+            if (!hasStand) continue
+            found = cand
+            break
           }
           if (found) break
         }
