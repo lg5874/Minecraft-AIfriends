@@ -1,0 +1,65 @@
+{
+  "account": "XJJ_E2E",
+  "at": "2026-11-12T20:54:25.072Z",
+  "rate": 25,
+  "ok": 2,
+  "total": 8,
+  "results": [
+    {
+      "name": "移动",
+      "ok": true,
+      "detail": "移动了 3.9 格",
+      "need": ">3 格",
+      "secs": 2
+    },
+    {
+      "name": "挖泥土",
+      "ok": false,
+      "detail": "泥土 2 -> 2",
+      "need": "增加",
+      "secs": 2
+    },
+    {
+      "name": "挖石头",
+      "ok": false,
+      "detail": "没有镐子，跳过（这本身是个问题）",
+      "need": "镐子",
+      "secs": 0
+    },
+    {
+      "name": "砍树",
+      "ok": false,
+      "detail": "原木 2 -> 2",
+      "need": "增加",
+      "secs": 26
+    },
+    {
+      "name": "做木棍",
+      "ok": false,
+      "detail": "木棍 4 -> 4",
+      "need": "增加",
+      "secs": 1
+    },
+    {
+      "name": "放箱子",
+      "ok": false,
+      "detail": "做不出箱子（没木板）",
+      "need": "有箱子",
+      "secs": 5
+    },
+    {
+      "name": "从地下爬出来",
+      "ok": true,
+      "detail": "本来就在地面，无需爬",
+      "need": "在地面",
+      "secs": 0
+    },
+    {
+      "name": "找食物",
+      "ok": false,
+      "detail": "饥饿 20 -> 20，背包有食物: false",
+      "need": "食物增加或有存货",
+      "secs": 41
+    }
+  ]
+}

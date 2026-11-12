@@ -645,8 +645,11 @@ class Actions {
         ? bot.pathfinder.bestHarvestTool(block)
         : null
 
-      if (best) {
-        // 已经拿在手上就不换
+      // 关键：只接受真正的工具。
+      // bestHarvestTool 在没有合适工具时会返回手边任意物品
+      // （实测它把 stick 当成工具去挖草方块），必须过滤掉。
+      const isRealTool = best && /_pickaxe$|_axe$|_shovel$|_hoe$|_sword$|shears$/.test(best.name)
+      if (best && isRealTool) {
         if (bot.heldItem && bot.heldItem.name === best.name) {
           return { ok: true, tool: best.name, reason: '已经在手上' }
         }
