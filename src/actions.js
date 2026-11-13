@@ -1024,9 +1024,9 @@ class Actions {
     while (this.woodCount() * 4 + plankTotal() < PLANKS_NEEDED &&
            left() > 45000 && woodRound < 3) {
       woodRound++
-      this.log(`[tool] 备木头第 ${woodRound} 轮（现有原木 ${this.woodCount()}、木板 ${plankTotal()}）`)
+      this.log(`[tool] 备木头第 ${woodRound} 轮（现有原木 ${this.woodCount()}、木板 ${plankTotal()}、剩 ${Math.round(left() / 1000)}s）`)
       try {
-        await this.ensureWood(LOGS_NEEDED)
+        await this.ensureWood(LOGS_NEEDED, { budgetMs: Math.min(left() - 15000, 200000) })
       } catch (e) {
         this.log('[tool] 砍树失败: ' + e.message)
       }
@@ -1082,7 +1082,7 @@ class Actions {
         // 注意：ensureWood 不接受预算参数，它内部固定最多两轮 chopTree。
         // 所以这里不能"传个预算就安心"——只能靠上面的 left() > 45000 把关，
         // 保证开这一轮时至少有跑完一轮最坏砍树的预算。
-        await this.ensureWood(LOGS_NEEDED)
+        await this.ensureWood(LOGS_NEEDED, { budgetMs: Math.min(left() - 10000, 200000) })
         await this.anyPlanks(PLANKS_NEEDED)
         await this.craftSmart('stick', 2)
         await this.craftSmart('wooden_pickaxe', 1)
@@ -1382,22 +1382,124 @@ class Actions {
     }
   }
 
-  async chopTree (count = 1) {
+  /**
+   * 砍树。
+   *
+   * @param {number} count 要砍几棵
+   * @param {{budgetMs?:number}} opts budgetMs = 调用方能给的预算（默认按棵数估）
+   */
+  async chopTree (count = 1, opts = {}) {
     await this.ensureChunks()
     const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log',
       'mangrove_log', 'cherry_log', 'pale_oak_log']
     let trees = 0
+    let awayRounds = 0          // 已经"换方向走远找"了几轮（上限 3）
     const tried = new Set()
     const t0 = Date.now()
-    // 别把测试的 180s 全烧光：留出捡东西和收尾的时间
-    const DEADLINE = Math.min(150000, 45000 + count * 40000)
 
-    // 在地下找不到树很正常 —— 先爬回地面
+    // 【预算】原来的公式是 min(150000, 45000 + count*40000)：
+    //   count=1 -> 85000（85 秒）
+    // 但调用方（e2e / ensurePickaxe）常常愿意给 240 秒。
+    // 85 秒的上限让"周围没树、要走远找"这种情况必然失败 ——
+    // 实测：找树 + 走过去 + 砍，正常要 80~120 秒；运气差要 150 秒以上。
+    //
+    // 现在：优先用调用方给的预算（留 15 秒收尾），否则按棵数估，
+    // 但下限提到 120 秒 —— 低于这个数基本不可能砍到（走远找树就要 60 秒+）。
+    // 实测（chop-test 08:29）：出生点周围没树时，走 3 轮换方向（约 116 格）
+    // 才在第 3 轮后找到树，全程 108 秒。加上垫脚料 14 秒 = 122 秒。
+    // 所以默认预算不能只给 120 秒 —— 必须留出"走远找"的余量。
+    //   count=1 -> 150 秒（够走 3 轮 + 砍一棵）
+    //   count=2 -> 200 秒
+    const callerBudget = Number(opts.budgetMs) || 0
+    const estimated = Math.min(200000, 110000 + count * 50000)
+    const rawBudget = callerBudget > 0 ? Math.min(callerBudget, 200000) : estimated
+    const DEADLINE_MS = Math.max(150000, rawBudget)
+    const DEADLINE = t0 + DEADLINE_MS
+    this.log(`[chop] 预算 ${Math.round(DEADLINE_MS / 1000)}s` +
+      (callerBudget > 0 ? `（调用方给 ${Math.round(callerBudget / 1000)}s）` : '（按棵数估）'))
+
+    // 在地下找不到树很正常 —— 先试着爬回地面。
+    // 但**爬不上去不等于砍不了树**：地表有很多树根在坡上/洞口边，
+    // 站着就能看到、够得着。原来这里直接 throw，等于"爬不出去就彻底放弃"，
+    // 日志里表现为连续 4 次 `砍树失败: 在地下爬不出去，砍不了树`，
+    // 整个砍树任务一行有效动作都没做。
+    // 现在：爬失败就继续往下走，让后面的找树逻辑自己判断能不能够到。
     if (this.isUnderground()) {
-      this.log('[chop] 在地下，先回地面')
-      const ok = await this.getToSurface()
-      if (!ok) throw new Error('在地下爬不出去，砍不了树')
-      await this.ensureChunks(3000)
+      this.log('[chop] 在地下，先试着回地面')
+      const ok = await this.getToSurface().catch(() => false)
+      if (ok) {
+        await this.ensureChunks(3000)
+      } else {
+        this.log('[chop] 没爬出去，先就地找找有没有够得着的树')
+      }
+    }
+
+    /**
+     * 攒垫脚料。
+     *
+     * 实测（/tmp/probe11.js、/tmp/probe12.js）：这个服务器的地表树大量长在
+     * **浮空/高台上** —— 树干下方是 air，4.2 格内可站格数 0，canSeeBlock(树干)=false。
+     * bot 在地面 y=63，树在 y=71，垂直差 8 格。
+     *
+     * GoalXZ 能 5 秒把人送到水平 0.6 格（/tmp/probe7.js），但高度上不去；
+     * GoalNear / GoalGetToBlock 都卡在"差 6.2 格"不动（/tmp/probe8.js）。
+     *
+     * 唯一可行路径是**垫着方块爬上去**，而 pillarUp 需要手上有泥土/圆石。
+     * 之前日志里一直是 `[pillar] 没有可以垫的方块`，因为开局背包是空的。
+     * 所以砍树前先挖够垫脚料 —— 现在 pickupNearby 修好了，泥土挖得动也捡得到。
+     */
+    const fillerCount = () => this.countOf('dirt') + this.countOf('grass_block') +
+      this.countOf('cobblestone') + this.countOf('andesite') + this.countOf('stone') +
+      this.countOf('gravel')
+
+    // 攒垫脚料 —— **硬预算 20 秒**。
+    //
+    // 实测（`chop-test` 2026-11-13 08:12）：这段原来没有独立预算，
+    // 一轮 14 次 digAt 每次最多 12 秒，实测烧掉 **64 秒**（5.5s -> 69.3s），
+    // 而且最后 `垫脚料准备完毕：0 块` —— 一块都没拿到。
+    // 64 秒白烧之后，chopTree 的 DEADLINE（85 秒）已经过了大半，
+    // 后面的"走到树"根本没有时间，必然报"走不到"。
+    //
+    // 现在：只给 20 秒，而且"连续两次没进展"就收手。
+    const FILLER_BUDGET = 20000
+    const fillerT0 = Date.now()
+    let fillerDryRounds = 0
+
+    if (fillerCount() < 8) {
+      this.log(`[chop] 垫脚料只有 ${fillerCount()}，先挖几块（最多 20s）`)
+      while (fillerCount() < 8 && Date.now() - fillerT0 < FILLER_BUDGET) {
+        if (Date.now() > DEADLINE - 15000) break
+        if (fillerDryRounds >= 2) {
+          this.log('[chop] 连续 2 轮没进展，不再挖垫脚料')
+          break
+        }
+        // 优先挖泥土/草方块（最好挖，空手也掉东西）
+        const b = this.findReachableBlock('dirt', 10) ||
+          this.findReachableBlock('grass_block', 10) ||
+          this.findAny(['dirt', 'grass_block'], 10)
+        if (!b) {
+          this.log('[chop] 附近没垫脚料可挖')
+          break
+        }
+        const before = fillerCount()
+        let ok = false
+        try { ok = await this.digAt(b) } catch (e) { ok = false }
+        if (ok) {
+          // 捡的时候也要看预算：pickupNearby 内部预算是 9 秒，
+          // 不看就会把 20 秒的垫脚料预算整个吃掉（实测跑了 38.4 秒）。
+          const leftFiller = FILLER_BUDGET - (Date.now() - fillerT0)
+          if (leftFiller > 3000) {
+            try { await this.pickupNearby(6) } catch (e) {}
+          } else {
+            // 没时间专门捡了，用一次短促的原地吸附
+            await sleep(400)
+          }
+        }
+        // 有进展（拿到料）就重置；否则记一次"空转"
+        if (fillerCount() > before) fillerDryRounds = 0
+        else fillerDryRounds++
+      }
+      this.log(`[chop] 垫脚料准备完毕：${fillerCount()} 块（用了 ${((Date.now() - fillerT0) / 1000).toFixed(1)}s）`)
     }
 
     /**
@@ -1612,7 +1714,7 @@ class Actions {
       let dug = 0
 
       for (let step = 0; step < maxBlocks; step++) {
-        if (Date.now() - t0 > DEADLINE) break
+        if (Date.now() > DEADLINE) break
         const me = this.pos()
         const d = base.distanceTo(me)
         if (d <= 3.6) break                      // 已经够得着了
@@ -1697,7 +1799,7 @@ class Actions {
       // 多给几个：候选格按"好走程度"排过了，前面失败后面还有机会。
       // 但也不能全试（每格最坏 8 秒），取前 5 个。
       for (const s of spots.slice(0, 5)) {
-        if (Date.now() - t0 > DEADLINE) return false
+        if (Date.now() > DEADLINE) return false
         // 要挖的先把树叶挖掉，否则 pathfinder 不会穿过去
         if (s.need > 0) {
           try { await digPathTo(s.pos) } catch (e) {}
@@ -1817,13 +1919,14 @@ class Actions {
       // 成功率高得多）。之前直接对树干做 GoalBlock，A* 找不到落脚点，
       // 33 格外的树每棵白耗 5 秒。
       if (base.distanceTo(p0) > 8) {
+        const s = Date.now()
+        let still = 0
+        let last = this.pos().clone()
+        const startPos = this.pos().clone()
         try {
           this.bot.pathfinder.setGoal(new goals.GoalXZ(
             Math.floor(base.x), Math.floor(base.z)))
         } catch (e) {}
-        const s = Date.now()
-        let still = 0
-        let last = this.pos().clone()
         try {
           while (Date.now() - s < timeout) {
             this.check()
@@ -1837,6 +1940,44 @@ class Actions {
           }
         } finally {
           try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+        }
+
+        // 【关键兜底】GoalXZ 一步都没走 = 人被卡住了（凹坑/树丛/墙角）。
+        //
+        // 实测（/tmp/diag/goalxz.js）：同一次运行里第一次 GoalXZ 走了 25.9 格，
+        // 另一次一步都没走（位置 69,64,9 完全不变，水平距离 40.21 -> 40.21）。
+        // 出生点是随机的，有些落点 pathfinder 完全找不到出口。
+        //
+        // 老代码遇到这种情况什么都不做，直接进入 standSpotsNear ——
+        // 而那批候选格都在 40 格外，walkTo 必然失败，最后报"走不到这棵"。
+        // 这就是"越试越远、一棵都砍不到"的完整链条。
+        const movedFromGoalXZ = this.pos().distanceTo(startPos)
+        if (movedFromGoalXZ < 2) {
+          this.log(`[chop] GoalXZ 卡死（只挪了 ${movedFromGoalXZ.toFixed(1)} 格），先挖出去`)
+          try { await this.digOutSelf() } catch (e) {}
+          await this.ensureChunks(2000)
+          // 挖出来之后再试一次 GoalXZ（这次通常就通了）
+          const s2 = Date.now()
+          try {
+            this.bot.pathfinder.setGoal(new goals.GoalXZ(
+              Math.floor(base.x), Math.floor(base.z)))
+            let still2 = 0
+            let last2 = this.pos().clone()
+            while (Date.now() - s2 < Math.min(timeout, 10000)) {
+              this.check()
+              const p = this.pos()
+              if (Math.hypot(p.x - base.x, p.z - base.z) <= 3.5) break
+              if (p.distanceTo(last2) < 0.12) still2 += 200
+              else still2 = 0
+              last2 = p.clone()
+              if (still2 > 5000) break
+              await sleep(200)
+            }
+          } catch (e) {
+          } finally {
+            try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+          }
+          this.log(`[chop] 挖出后距树 ${base.distanceTo(this.pos()).toFixed(1)} 格`)
         }
         if (base.distanceTo(this.pos()) <= 4.0) return true
       }
@@ -1880,19 +2021,82 @@ class Actions {
         if (extra.length && (await trySpots(extra, base, Math.min(timeout, 6000)))) return true
       }
 
+      // ===== 3b. 高度不够：先判断"挖台阶"还是"垫方块" =====
+      //
+      // 实测（/tmp/diag/stair3.js）：朝树方向那一列**全是 air** 时，
+      // 挖台阶无效 —— 挖不动任何东西，跳起来也不会升高，
+      // 反而越走越远（近树 8.4 -> 18.4）。开阔地必须垫方块。
+      //
+      // 反过来，在 1 格高的洞穴里只有挖台阶能用（没空间搭塔）。
+      // 所以先探一列，看有没有"可挖的实心方块"在正前方往上。
       d3 = base.distanceTo(this.pos())
       if (d3 > 4.2 && base.y > this.pos().y) {
+        // 探测：正前方上方 2 格内有没有实心可挖方块
+        const me = this.pos()
+        const dxT = base.x - me.x
+        const dzT = base.z - me.z
+        let sxT = 0; let szT = 0
+        if (Math.abs(dxT) >= Math.abs(dzT)) sxT = Math.sign(dxT); else szT = Math.sign(dzT)
+        const fyT = Math.floor(me.y)
+        const fxT = Math.floor(me.x) + sxT
+        const fzT = Math.floor(me.z) + szT
+        let diggableAhead = 0
+        for (let dy = 0; dy <= 2; dy++) {
+          const b = this.bot.blockAt(new Vec3(fxT, fyT + dy, fzT))
+          if (b && b.boundingBox === 'block' && !/bedrock|lava|water/.test(b.name)) diggableAhead++
+        }
+
         const stairStart = Date.now()
         const stairFromY = this.pos().y
         const beforeStairD = base.distanceTo(this.pos())
-        let stairResult = await digStairUp(base, 6, 20000)
+        let used = ''
+
+        if (diggableAhead >= 1) {
+          // 有东西可挖：走台阶（洞穴/坡面都适用，不需要垫脚料）
+          used = '挖台阶'
+          const stairResult = await digStairUp(base, 6, 20000)
+          if (stairResult.moved) {
+            const after = standSpotsNear(base)
+            if (after.length && (await trySpots(after, base, Math.min(timeout, 5000)))) return true
+          }
+        } else {
+          // 前方全空：开阔地，只能垫方块。先挖脚下的土攒料。
+          used = '垫方块'
+          if (!this.item('dirt') && !this.item('cobblestone') && !this.item('stone')) {
+            // 没料：从脚边挖两块软方块（只挖 1 格内、够得着的）
+            for (let i = 0; i < 3; i++) {
+              let got = false
+              for (const [dx2, dz2] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+                for (const dy2 of [-1, 0]) {
+                  const v = new Vec3(Math.floor(me.x) + dx2, Math.floor(me.y) + dy2, Math.floor(me.z) + dz2)
+                  const b = this.bot.blockAt(v)
+                  if (!b || b.boundingBox !== 'block') continue
+                  if (!/dirt|grass_block|sand|gravel/.test(b.name)) continue
+                  try { await this.digAt(b, { walkToBlock: false }) } catch (e) {}
+                  try { await this.pickupNearby(4) } catch (e) {}
+                  got = true
+                  break
+                }
+                if (got) break
+              }
+              if (!got) break
+            }
+          }
+          // 垫 2 格抬高（再多不值）
+          for (let i = 0; i < 3 && base.distanceTo(this.pos()) > 4.2; i++) {
+            const beforeY = this.pos().y
+            let up = 0
+            try { up = await this.pillarUp(1) } catch (e) { up = 0 }
+            if (!up && this.pos().y <= beforeY + 0.2) break
+            await sleep(150)
+          }
+        }
+
         const stairMs = Date.now() - stairStart
         const stairUp = this.pos().y - stairFromY
-        this.log(`[chop] 挖台阶 ${stairMs}ms：上升 ${stairUp.toFixed(1)} 格，` +
-          `距树 ${beforeStairD.toFixed(1)} -> ${base.distanceTo(this.pos()).toFixed(1)} 格` +
-          (stairResult.moved ? '' : '（没走动）'))
-        if (stairResult.moved) {
-          // 抬上去之后再试一次候选格 —— 高度变了，可站的位置也变了
+        this.log(`[chop] ${used} ${stairMs}ms：上升 ${stairUp.toFixed(1)} 格，` +
+          `距树 ${beforeStairD.toFixed(1)} -> ${base.distanceTo(this.pos()).toFixed(1)} 格`)
+        if (stairUp >= 0.5) {
           const after = standSpotsNear(base)
           if (after.length && (await trySpots(after, base, Math.min(timeout, 5000)))) return true
         }
@@ -1904,7 +2108,7 @@ class Actions {
       if (d3 > 4.2 && base.y > this.pos().y) {
         const climbedFrom = this.pos().y
         for (let i = 0; i < 2 && base.distanceTo(this.pos()) > 4.2; i++) {
-          if (Date.now() - t0 > DEADLINE) return false
+          if (Date.now() > DEADLINE) return false
           if (this.pos().y - climbedFrom >= 3) break
           const beforeD = base.distanceTo(this.pos())
           let up = false
@@ -1958,26 +2162,92 @@ class Actions {
       return out
     }
 
+    /**
+     * 换一个方向走远找树。
+     *
+     * 两处都用它：
+     *   · 48 格内根本没扫到树（candidates 空）
+     *   · 扫到树了但一棵都砍不动（choppedThisRound === 0）
+     *
+     * 实测教训（chop-test 08:22）：原来这两条路各写一套，
+     * "没扫到树"那条直接抛错，压根没走远 ——
+     * 日志是 `48 格内没树，往外找` -> `走了 28 格` -> 立刻抛错。
+     * 而同一位置 blockAt 逐格扫能在 27 格外找到 2 棵树。
+     *
+     * @param {Array} tryList 这一轮试过但失败的树（用作"远离"参照，可为空）
+     * @returns {Promise<number>} 实际走了多少格
+     */
+    const walkAway = async (tryList) => {
+      awayRounds++
+      const remainSec = Math.round((DEADLINE - Date.now()) / 1000)
+      if (awayRounds > 3) {
+        this.log(`[chop] 已经换方向走了 ${awayRounds - 1} 轮，附近确实没有可达的树`)
+        return 0
+      }
+      if (remainSec < 40) {
+        this.log(`[chop] 只剩 ${remainSec}s，不够再走一轮（一轮 40 格 + 重扫约 30s）`)
+        return 0
+      }
+
+      // 方向：远离这一圈里离我最近的那棵树（没有参照就随机）
+      const nearest = (tryList || []).slice().sort((x, y) =>
+        x.base.distanceTo(this.pos()) - y.base.distanceTo(this.pos()))[0]
+      const pNow = this.pos()
+      let awayYaw = nearest
+        ? Math.atan2(pNow.z - nearest.base.z, pNow.x - nearest.base.x)
+        : Math.random() * Math.PI * 2
+      // 每轮再偏 60°，避免一直沿同一条线走到没树的地方
+      awayYaw += (awayRounds - 1) * (Math.PI / 3)
+
+      let moved = 0
+      for (let attempt = 0; attempt < 2 && moved < 8; attempt++) {
+        const yaw = awayYaw + attempt * (Math.PI / 2)
+        const p = this.pos()
+        const tx = p.x + Math.cos(yaw) * 40
+        const tz = p.z + Math.sin(yaw) * 40
+        const before = this.pos().clone()
+        try { await walkTo(tx, p.y, tz, 3, 22000) } catch (e) {}
+        await this.ensureChunks(4000)
+        moved = this.pos().distanceTo(before)
+        this.log(`[chop] 第 ${awayRounds} 轮换方向（第 ${attempt + 1} 次）：` +
+          `走了 ${moved.toFixed(1)} 格 -> ${Math.floor(this.pos().x)},` +
+          `${Math.floor(this.pos().y)},${Math.floor(this.pos().z)}`)
+        if (moved >= 8) break
+      }
+      if (moved >= 8) {
+        this.log(`[chop] 累计换方向 ${awayRounds} 轮，剩余预算 ` +
+          `${Math.round((DEADLINE - Date.now()) / 1000)}s，继续找树`)
+      }
+      return moved
+    }
+
     await sleep(300)
 
-    while (trees < count && Date.now() - t0 < DEADLINE) {
+    while (trees < count && Date.now() < DEADLINE) {
       this.check()
 
+      // 扫树。扫不到就"走远再扫"，最多 3 轮 —— 不直接抛错。
       let list = candidates(48)
-      if (!list.length) {
-        // 48 格内没有：走一段再找（不是随机乱走 40 格）
-        this.log('[chop] 48 格内没树，往外找')
-        try {
-          const a2 = Math.random() * Math.PI * 2
-          const p = this.pos()
-          await walkTo(p.x + Math.cos(a2) * 28, p.y, p.z + Math.sin(a2) * 28, 3, 30000)
-        } catch (e) {}
-        await this.ensureChunks(4000)
-        list = candidates(64)
-      }
-      if (!list.length) {
-        this.complain('nothingFound', '走了一圈没树')
-        throw new Error('走了很远也没找到树')
+      while (!list.length) {
+        this.log('[chop] 48 格内没扫到树，先确认区块再决定要不要走远')
+        // 先确认不是"区块没加载"（findBlocks 只扫已加载区块）
+        let found = false
+        for (let retry = 0; retry < 2 && !found; retry++) {
+          try { await this.ensureChunks(4000) } catch (e) {}
+          await sleep(700 + retry * 600)
+          const again = candidates(48)
+          if (again.length) { list = again; found = true }
+        }
+        if (found) break
+
+        // 确实附近没树：走远找（40 格 × 最多 3 轮）
+        const moved = await walkAway([])
+        if (moved < 8) {
+          this.complain('nothingFound', '走了一圈没树')
+          throw new Error(`附近 48 格内没有可达的树（已换方向 ${awayRounds} 轮、` +
+            `耗时 ${Math.round((Date.now() - t0) / 1000)}s）`)
+        }
+        list = candidates(48)
       }
 
       // 逐个试，砍到一棵就收工（砍不动就换下一棵，不再盲目 wander）
@@ -1986,7 +2256,7 @@ class Actions {
       // 每棵失败 5~12 秒，时间全浪费在"走不到"上（实测 190s 只砍到 1 棵）。
       const tryList = list.slice(0, 3)
       for (const cand of tryList) {
-        if (Date.now() - t0 > DEADLINE) break
+        if (Date.now() > DEADLINE) break
         const base = cand.base
         const key = `${base.x},${base.y},${base.z}`
 
@@ -2053,44 +2323,15 @@ class Actions {
       }
 
       if (choppedThisRound === 0) {
-        // 整轮都没砍到：把这一圈标成"试过了"，往外挪一段再找
-        //
-        // 【实测的坑】这里原来是"随机方向走 25 格"，两个问题：
-        //   1. 方向随机 —— 可能正好走回刚才失败的那片，也可能走向没树的方向，
-        //      而且**没有回头机制**，越走越远（日志里距离从 5 格漂到 42 格）。
-        //   2. 无条件把整个 list 标成 tried —— 包括那些其实能砍、
-        //      只是这一轮时间不够/被判"走不到"的树，到后面无树可砍。
-        //
-        // 现在：只标记**这一轮真的试过**的 3 棵（tryList），
-        // 并且朝"离我最近的那棵树的反方向"挪 —— 换个林子，但不乱走。
+        // 整轮都没砍到：把这一轮真的试过的 3 棵标成 tried，然后走远换片林子。
+        // （走多远、走几轮、预算够不够，全在 walkAway 里）
         for (const c of tryList) tried.add(`${c.base.x},${c.base.y},${c.base.z}`)
-        this.log(`[chop] 这一圈的 ${tryList.length} 棵都砍不动，换个方向找`)
-
-        // 参考点：这一圈里离我最近的那棵树（作为"远离"的参照）
-        const nearest = tryList.slice().sort((x, y) =>
-          x.base.distanceTo(this.pos()) - y.base.distanceTo(this.pos()))[0]
-        let awayYaw
-        if (nearest) {
-          const p = this.pos()
-          awayYaw = Math.atan2(p.z - nearest.base.z, p.x - nearest.base.x)
-        } else {
-          awayYaw = Math.random() * Math.PI * 2
-        }
-        // 挪 18 格（比 25 小一点，减少"走出去回不来"的概率）
-        const p = this.pos()
-        const tx = p.x + Math.cos(awayYaw) * 18
-        const tz = p.z + Math.sin(awayYaw) * 18
-        const before = this.pos().clone()
-        try { await walkTo(tx, p.y, tz, 3, 20000) } catch (e) {}
-        await this.ensureChunks(4000)
-
-        // 走势校验：真挪动了才有意义。没挪动说明被卡住，别再空转。
-        const moved = this.pos().distanceTo(before)
-        if (moved < 4) {
-          this.log(`[chop] 换方向也没走动（只挪了 ${moved.toFixed(1)} 格），提前收工`)
+        this.log(`[chop] 这一圈的 ${tryList.length} 棵都砍不动，走远换片林子`)
+        const moved = await walkAway(tryList)
+        if (moved < 8) {
+          this.log(`[chop] 走不动了（${moved.toFixed(1)} 格），提前收工`)
           break
         }
-        this.log(`[chop] 挪了 ${moved.toFixed(1)} 格，继续找树`)
       }
       await sleep(150)
     }
@@ -2098,7 +2339,9 @@ class Actions {
     // 砍完再捡一轮（有些掉落物刚才离得远，现在走近了）
     try { await this.pickupNearby(10) } catch (e) {}
     if (trees < count) {
-      this.log(`[chop] 只砍到 ${trees}/${count} 棵，时间/可达性限制`)
+      const elapsed = Math.round((Date.now() - t0) / 1000)
+      this.log(`[chop] 只砍到 ${trees}/${count} 棵（${elapsed}s，换方向 ${awayRounds} 轮，` +
+        `预算 ${Math.round(DEADLINE_MS / 1000)}s）`)
     }
     return trees
   }
@@ -2752,31 +2995,11 @@ class Actions {
      *
      * 做不出来（比如周围真没树）就直接放弃，退回挖台阶 —— 不能卡死在这里。
      */
-    const hasPickNow = () => this.bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
-
-    // 死锁防护：
-    //   getToSurface -> ensurePickaxe -> 砍不到树 -> getToSurface -> ensurePickaxe -> ...
-    // 实测就是这么转起来的（日志里两次「没镐又没料，先弄把镐」）。
-    // 用 surfaceRunning 标住：一旦进了 getToSurface 就不再反向索要镐子。
-    if (this._surfaceRunning) {
-      this.log('[surface] 已经在爬了（可能是被做镐流程反向调用），跳过做镐')
-    } else if (!hasPickNow() && fillerCount() < 3) {
-      this.log('[surface] 没镐又没料，先弄把镐')
-      this._surfaceRunning = true
-      try {
-        const got = await this.ensurePickaxe({ budgetMs: 100000 })
-        if (got) {
-          this.pickMade = (this.pickMade || 0) + 1
-          this.log(`[surface] 做了把镐：${got}（第 ${this.pickMade} 次）`)
-        } else {
-          this.log('[surface] 没弄到镐，只能挖台阶')
-        }
-      } catch (e) {
-        this.log('[surface] 做镐失败（' + (e && e.message) + '），只能挖台阶')
-      } finally {
-        this._surfaceRunning = false
-      }
-    }
+    // 关于"先做镐"：实测在地下这条路走不通 ——
+    //   ensurePickaxe -> chopTree -> 在地下砍不到树 -> 又调 getToSurface -> 死锁
+    // 加 _surfaceRunning 能打破死锁，但做镐依然是 0 成功（地下没树）。
+    // 而且它本来就不必要：空手挖 dirt/gravel/sand 一样有料（只有石头需要镐）。
+    // 所以这里不做镐，直接交给 stockFiller 挑软方块挖。
 
     const isSolid = (v) => {
       const b = bot.blockAt(v)
@@ -3065,60 +3288,85 @@ class Actions {
       return /stone|deepslate|andesite|diorite|granite|tuff|calcite|_ore$|obsidian|basalt|blackstone/.test(blk.name)
     }
 
+    /**
+     * 空手能挖出料的方块。
+     *
+     * 实测（很关键，别再踩）：
+     *   · dirt / grass_block / gravel / sand / clay  → 空手挖就掉，能进包
+     *   · stone / granite / andesite / deepslate / 矿石 → **必须有镐**，
+     *     空手挖掉方块会消失，但 0 物品掉落
+     *
+     * 所以没镐的时候不要碰石头，专挑软方块挖 —— 这才是"有料能塔升"的最快路径。
+     */
+    const SOFT_FILL = /^(dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium|gravel|sand|red_sand|clay|snow_block|soul_soil|moss_block)$/
+    const isSoft = (name) => SOFT_FILL.test(name)
+
+    /**
+     * 攒垫脚料。
+     *
+     * 有镐：头顶石头随便挖（顺便腾出上升空间）。
+     * 没镐：只挖软方块（dirt/gravel/sand…），绝不碰石头 ——
+     *       空手挖石头 0 掉落，白挖还白耗时间（实测挖掉 granite 掉 3 个
+     *       物品实体全躺在地上，背包 0 增加）。
+     */
     const stockFiller = async (need = 12) => {
       if (fillerCount() >= need) return true
+      const hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
       const t0 = Date.now()
       let round = 0
+      let emptyStreak = 0
 
-      // 镐的问题在 getToSurface 开头已经处理过了（ensurePickaxe）。
-      // 这里只需要判断结果：没镐又没料就别硬攒 —— 空手挖石头一格料都不掉，
-      // 硬攒既攒不到又白花 20 秒，不如直接走挖台阶。
-      const hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
-      if (!hasPick && fillerCount() === 0) {
-        this.log('[surface] 还是没镐没料，跳过攒料，直接挖台阶')
-        return false
-      }
-      while (fillerCount() < need && Date.now() - t0 < 20000 && round++ < 20) {
+      while (fillerCount() < need && Date.now() - t0 < 18000 && round++ < 24) {
         const p = this.pos()
+        const before = fillerCount()
 
-        // 优先挖头顶的方块（挖完正好给自己腾出上升空间，一举两得）。
-        // 别挖脚下：挖掉脚下人就掉下去了，位置变了还得重新判断。
-        const fs = firstSolidAbove(p, 6)
-        if (fs > 0) {
-          const before = fillerCount()
-          const v = p.offset(0, fs, 0)
-          // 空手挖 stone 只掉"挖了但没进包"的结果 —— 必须跳过硬方块，
-          // 否则攒料会白转一圈（实测：石头挖掉 3 个掉落物全在原地没进包）。
-          const blk = bot.blockAt(v)
-          if (blk && hardBlockNoTool(blk)) {
-            // 这格挖了也不会有料，但挖掉仍然能腾空间，那就挖但不算失败
-            await digOne(v)
-            await sleep(180)
-            if (fillerCount() <= before && round > 6) break
-            continue
+        // 1) 找头顶第一个「能挖出料」的方块
+        let target = null
+        for (let dy = 1; dy <= 6; dy++) {
+          const v = p.offset(0, dy, 0)
+          if (!isSolid(v)) continue
+          const nm = nameAt(v)
+          if (/bedrock|lava|water/.test(nm)) break
+          // 有镐 -> 石头也行；没镐 -> 只要软方块
+          if (hasPick || isSoft(nm)) { target = v; break }
+        }
+
+        // 2) 头顶没有：往四周找软方块（水平 1 格，脚和身体两层）
+        if (!target) {
+          for (const [dx, dz] of DIRS) {
+            for (const dy of [0, 1]) {
+              const v = p.offset(dx, dy, dz)
+              if (!isSolid(v)) continue
+              const nm = nameAt(v)
+              if (/bedrock|lava|water/.test(nm)) continue
+              if (!(hasPick || isSoft(nm))) continue
+              target = v
+              break
+            }
+            if (target) break
           }
-          await digOne(v)
-          await sleep(200)
-          // 连续挖两块都没多出料，说明这地形挖不出东西，别再耗
-          if (fillerCount() <= before && round > 2) break
+        }
+
+        if (!target) {
+          // 这附近没料可挖了
+          if (round > 3) break
+          await sleep(150)
           continue
         }
 
-        // 头顶没石头了：往旁边挖一格看看
-        let dug = false
-        for (const [dx, dz] of DIRS) {
-          const v = p.offset(dx, 1, dz)
-          if (!isSolid(v)) continue
-          if (/bedrock|lava|water/.test(nameAt(v))) continue
-          await digOne(v)
-          await grabDrops(4)
-          dug = true
+        await digOne(target)
+        await grabDrops(4)
+        await sleep(180)
+
+        if (fillerCount() > before) {
+          emptyStreak = 0
+        } else if (++emptyStreak >= 2) {
+          // 连着两铲没进包，这地形挖不出料，别再耗
           break
         }
-        if (!dug) break
-        await sleep(200)
       }
-      this.log(`[surface] 攒料：${fillerCount()} 块`)
+
+      this.log(`[surface] 攒料：${fillerCount()} 块${hasPick ? '' : '（空手，只挖软方块）'}`)
       return fillerCount() > 0
     }
     await stockFiller(12)
@@ -3882,8 +4130,13 @@ class Actions {
     return got()
   }
 
-  // 保证手上有 n 个任意种类的原木
-  async ensureWood (n = 3) {
+  /**
+   * 保证手上有 n 个任意种类的原木。
+   *
+   * @param {number} n
+   * @param {{budgetMs?:number}} opts budgetMs 会按剩余预算分给每一轮 chopTree
+   */
+  async ensureWood (n = 3, opts = {}) {
     const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log',
       'acacia_log', 'dark_oak_log', 'cherry_log', 'mangrove_log', 'pale_oak_log']
     const count = () => logs.reduce((s, l) => s + this.countOf(l), 0)
@@ -3891,13 +4144,25 @@ class Actions {
     let have = count()
     if (have >= n) return have
 
+    const budget = Number(opts.budgetMs) || 0
+    const deadline = budget > 0 ? Date.now() + budget : 0
+    const left = () => deadline ? deadline - Date.now() : Infinity
+
     // 最多补两轮：砍树可能只砍到 1 棵，再补一次通常就够了
     for (let round = 0; round < 2 && count() < n; round++) {
       const need = n - count()
       // 一棵树平均给 3~6 块原木，别一次要太多（砍不完白耗时间）
       const wantTrees = Math.min(3, Math.max(1, Math.ceil(need / 3)))
+      // 第一轮拿大部分预算，第二轮用剩下的
+      const roundBudget = deadline
+        ? Math.max(60000, Math.floor(left() / (2 - round)))
+        : 0
+      if (deadline && left() < 60000) {
+        this.log(`[wood] 只剩 ${Math.round(left() / 1000)}s，不够再砍一轮`)
+        break
+      }
       try {
-        const got = await this.chopTree(wantTrees)
+        const got = await this.chopTree(wantTrees, roundBudget ? { budgetMs: roundBudget } : {})
         if (!got) {
           this.log('[wood] 这一轮没砍到树')
           break

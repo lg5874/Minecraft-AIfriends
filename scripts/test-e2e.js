@@ -204,9 +204,19 @@ const TASKS = [
       const before = a.woodCount()
       let ret = null
       let err = null
-      try {
-        ret = await a.chopTree(1)
-      } catch (e) { err = e.message }
+      // 给 3 次机会：出生点可能运气不好，周围没树
+      // 但总预算不变（240s），所以每次最多 80s
+      for (let i = 0; i < 3 && a.woodCount() <= before; i++) {
+        try {
+          ret = await a.chopTree(1)
+        } catch (e) { err = e.message }
+        if (a.woodCount() > before) break
+        // 没砍到：走远一点再试
+        if (i < 2) {
+          try { await a.wander(35) } catch (e) {}
+          try { await a.ensureChunks(3000) } catch (e) {}
+        }
+      }
 
       await sleep(1200)
       const after = a.woodCount()
