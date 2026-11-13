@@ -178,13 +178,15 @@ class Reflex {
     const why = this.lastDamage && now - this.lastDamage.at < 4000
       ? `被 ${this.lastDamage.name}`
       : '来源不明'
-    const from = this.lastHpText(opts.hp, drop)
-    this.logThrottled(`[reflex] 掉血 ${drop.toFixed(0)}（${from}，3 秒内）—— ${why}，先退开 2 格 + 跳一下`, 3000)
-  }
-
-  lastHpText (hp, drop) {
-    if (typeof hp !== 'number') return '?'
-    return `${Math.round(hp + drop)}→${Math.round(hp)}`
+    // 两个数都要说实话：窗口累计（3 秒掉多少）和最近一下（9→8）。
+    // 只写累计会变成"掉血 5（12→8）"—— 12 是窗口最高点，不是上一下。
+    const cur = typeof opts.hp === 'number' ? Math.round(opts.hp) : null
+    const prev = typeof this.lastHp === 'number' ? Math.round(this.lastHp) : null
+    const pair = (prev != null && cur != null && prev !== cur) ? prev - cur : 0
+    const shown = Math.max(1, drop, pair)
+    const detail = pair > 0 ? `（最近一下 ${prev}→${cur}）` : ''
+    if (cur != null && cur <= 0) return          // 已经死了，弹开没意义
+    this.logThrottled(`[reflex] 3 秒内掉 ${shown.toFixed(0)} 血${detail} —— ${why}，先退开 2 格 + 跳一下`, 3000, 'recoil')
   }
 
   /** 最近一次伤害的来源位置：真实体 -> 位置 -> 最近敌对 -> null */
@@ -200,12 +202,12 @@ class Reflex {
     return near ? near.position : null
   }
 
-  logThrottled (msg, gapMs) {
+  logThrottled (msg, gapMs, key) {
     const now = Date.now()
     this._logAt = this._logAt || {}
-    const key = msg.slice(0, 24)
-    if (now - (this._logAt[key] || 0) < (gapMs || 5000)) return
-    this._logAt[key] = now
+    const k = key || msg.slice(0, 24)
+    if (now - (this._logAt[k] || 0) < (gapMs || 5000)) return
+    this._logAt[k] = now
     try { this.ctx.log(msg) } catch (e) {}
   }
 
@@ -242,6 +244,8 @@ class Reflex {
     const bot = this.bot
     const now = Date.now()
     const hp = bot.health
+    // 已经死了（这一下就是致命的）：别再刷"紧急保命"，死因由 main.js 记
+    if (typeof hp === 'number' && hp <= 0) return
 
     // 【别让"血低"把正在处理的险情顶掉】
     // tick 每 800ms 叫一次 `sos(this.sosKind || 'lowhp')`，而 onPain 那边按伤害类型
@@ -373,7 +377,8 @@ class Reflex {
       const LETHAL = kind === 'drown' || kind === 'lava' || kind === 'on_fire' ||
         kind === 'in_fire' || kind === 'suffocate' || kind === 'out_of_world' ||
         !!(info && info.continuous)
-      if (hp <= this.SOS_HP || (LETHAL && hp <= 10)) {
+      // 血已经归零（这一下就是致命的）就别再喊保命了，死因由 main.js 那边记
+      if (hp > 0 && (hp <= this.SOS_HP || (LETHAL && hp <= 10))) {
         // 环境伤害（溺水/岩浆）等不起节流窗口，直接 urgent
         this.sos(LETHAL ? (kind || name) : (name || kind), { urgent: true })
       }
@@ -451,7 +456,8 @@ class Reflex {
     }
 
     // 换档才打日志（20 秒一次心跳），别把日志刷满
-    if (lvl !== this.lastThreatLog || now - this.lastThreatLogAt > 20000) {
+    // 换档立刻报；同一档 60 秒提醒一次（20 秒太吵：低血蹲着等回血时会刷屏）
+    if (lvl !== this.lastThreatLog || now - this.lastThreatLogAt > 60000) {
       this.lastThreatLog = lvl
       this.lastThreatLogAt = now
       const what = lvl === 4 ? '跑 + 吃东西 + 不接新任务'

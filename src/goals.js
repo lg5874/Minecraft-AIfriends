@@ -857,6 +857,16 @@ class Goals {
     }
     this._restLogged = false
 
+    // actions 连续 3 次砍树被地形挡住（没挖开也没挪动）：这片林子够不着。
+    // 手上不管在做什么，都先放下，改去 explore（往外走）。
+    try {
+      const act = this.ctx && this.ctx.actions
+      if (this.goal && act && act._forceExploreUntil > this.now() && this.goal.key !== 'explore') {
+        this.log('[goals] 砍树连续被地形挡住，先放下手上的事，出去找别的地方')
+        this.abandon('砍树连续被地形挡住，先出去找别的地方', { urgent: true })
+      }
+    } catch (e) {}
+
     // 手上已经有个没做完的，接着干
     if (this.goal && !this.goal.done) return this.goal
 

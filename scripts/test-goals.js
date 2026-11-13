@@ -898,6 +898,19 @@ console.log('\n[二十三、卡死看门狗 + 连续挖不动 → 强制 explore
     ok(cs[0] && cs[0].key === 'explore', 'forceExplore 标记 → explore 排第一（冷却中也放行）',
       cs.slice(0, 3).map(c => c.key + '(' + c.score + ')').join(' '))
   }
+
+  // 手上有目标也放下：ensure() 会先扔掉当前目标，再选 explore
+  {
+    const t = 9000000
+    const actions = { _lastLogAt: t, cancel: false, _forceExploreUntil: t + 60000 }
+    const g = mkGoal(t, actions)
+    g.llm = null
+    const ng = await g.ensure(st(0))
+    const h = g.history[g.history.length - 1]
+    ok(h && /地形挡住/.test(h.reason || '') && ng && ng.key === 'explore',
+      '连续被地形挡住 → 放下手上目标，改去 explore',
+      JSON.stringify({ history: h && h.reason, goal: ng && ng.key }))
+  }
 }
 
 // ================================================================

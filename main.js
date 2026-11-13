@@ -17,6 +17,7 @@ const { Actions, sleep } = require('./src/actions')
 const { Coder } = require('./src/coder')
 const { LLM } = require('./src/llm')
 const Reflex = require('./src/reflex')
+const damage = require('./src/damage')   // 伤害类型表（服务端 registry 优先，实测快照兜底）
 const Talk = require('./src/talk')
 const Will = require('./src/will')
 const persona = require('./src/persona')
@@ -140,6 +141,10 @@ class Bot {
     })
     this.bot = bot
     bot.loadPlugin(pathfinder)
+    // 1.20.5+ 的 damage_type 注册表由服务端在 login 阶段下发，mineflayer 只收
+    // chat/biome/dimension 三类，damage_type 被丢掉 —— 只能自己拦 registry_data。
+    // 拦不到也不影响：src/damage.js 里有实测快照表。
+    damage.attach(bot)
 
     bot.once('spawn', () => this.onSpawn())
     bot.on('respawn', () => this.onRespawn())
@@ -229,23 +234,18 @@ class Bot {
     //     于是打印"你被不知道什么东西打了"，几十条刷屏。
     //
     //  3) 环境伤害（摔/淹/饿/岩浆）根本没有来源实体，不该走"被谁打了"这条文案。
-    const DAMAGE_KIND = {
-      9: 'lava', 10: 'fall', 11: 'drown', 12: 'starve', 13: 'suffocate',
-      14: 'cactus', 15: 'freeze', 16: 'lightning', 17: 'on_fire',
-      18: 'in_fire', 19: 'out_of_world', 20: 'fly_into_wall'
-    }
-    const DAMAGE_TEXT = {
-      lava: '被岩浆烫了', fall: '摔下来了', drown: '快淹死了', starve: '饿坏了',
-      suffocate: '被埋在方块里', cactus: '被仙人掌扎了', freeze: '冻伤了',
-      lightning: '被雷劈了', on_fire: '身上着火', in_fire: '被火烧了',
-      out_of_world: '掉出世界了', fly_into_wall: '撞到墙上了'
-    }
+    // 【2026-11-14 · 实测事故】原来这里有两张手写的 id 表，**整体错位**：
+    //   9 其实是 explosion（老表写 lava）、11 是 falling_anvil（老表写 drown）、
+    //   24 才是 lava。于是 `[dmg] 未知类型 sourceTypeId=35` 满屏，
+    //   死因只会写"受了点伤"，应对自然也选不对。
+    // 现在一律走 src/damage.js：服务端 registry（`[registry_data] minecraft:damage_type`，
+    // 实测 50 条）优先，拿不到就用实测快照。名字 / 中文文案 / 死因三件事都由它给。
     // 同一类伤害的节流：摔一次游戏会连推好几包，别每条都当新事件
     let lastDmgAt = 0
     let lastDmgKind = ''
-    // 未知 damage type 每个 id 只打一次。骷髅连射一秒能推两包，
-    // 不过滤就是刷屏；而补表只需要每个 id 见到一次。
-    const seenUnknownDmg = new Set()
+    // 每一种伤害类型只打一行（骷髅连射一秒能推两包，不过滤就是刷屏）。
+    // 打的是**可读名字**，不是裸 id —— 排查死因全靠这几行。
+    const seenDmgType = new Set()
 
     bot._client.on('damage_event', (pkt) => {
       try {
@@ -254,21 +254,25 @@ class Bot {
         // causeId 是 entity id 本身。0 = 没有来源实体（环境伤害）。
         const causeId = pkt.sourceCauseId || 0
         const ent = causeId > 0 ? bot.entities[causeId] : null
-        const kind = DAMAGE_KIND[pkt.sourceTypeId] || null
-        // 【补表用】表里没有这个 id 就原样打出来 —— 下次才能补表。
-        // 1.21.11 的 sourceTypeId 是服务端 registry 下标，minecraft-data 没有
-        // damageTypes 表可查（实测 keys 里 /damage/i 一个都没有），只能现场采样反推。
-        // cause=0 是环境伤害（摔/淹/饿），cause>0 说明有来源实体 —— 骷髅箭就是靠这个分的。
-        if (!kind && !seenUnknownDmg.has(pkt.sourceTypeId)) {
-          seenUnknownDmg.add(pkt.sourceTypeId)
-          this.log(`[dmg] 未知类型 sourceTypeId=${pkt.sourceTypeId} cause=${pkt.sourceCauseId || 0} direct=${pkt.sourceDirectId || 0}`)
+        // sourceTypeId 是服务端 damage_type 注册表下标（实测：28=mob_attack、0=arrow、
+        // 24=lava、10=fall、6=drown、40=starve）。解析成名字 + 大类（人打的/环境）。
+        const info = damage.infoOf(pkt.sourceTypeId)
+        // 每个类型第一次出现打一行可读的 —— 验收/对账都靠它，且不会刷屏。
+        if (!seenDmgType.has(pkt.sourceTypeId)) {
+          seenDmgType.add(pkt.sourceTypeId)
+          const cause = pkt.sourceCauseId || 0
+          const direct = pkt.sourceDirectId || 0
+          const same = cause > 0 && cause === direct     // 同一个实体 = 直接被打
+          const ids = [cause ? 'cause=' + cause : '', direct ? 'direct=' + direct : ''].filter(Boolean).join(' ')
+          this.log(`[dmg] ${info.name}(${pkt.sourceTypeId}) ${info.cat === 'env' ? '环境' : '攻击'}${same ? ' 同实体' : ''}${ids ? ' ' + ids : ''}${info.known ? '' : ' [registry 里没有这个 id]'}`)
         }
 
         // 有实体来源 -> 就是"被谁打了"
         if (ent) {
-          const from = ent.username || ent.name || '什么东西'
           const isPlayer = ent.type === 'player'
-          this.lastDamageKind = isPlayer ? 'player' : 'mob'
+          // 怪用中文名（zombie -> 僵尸），玩家用 id
+          const from = isPlayer ? (ent.username || '有人') : damage.mobCn(ent.name)
+          this.lastDamageKind = info.name
           this.lastDamageFrom = from
           if (this.events) {
             this.events.push(
@@ -279,8 +283,28 @@ class Bot {
           }
           // 【死因】把这一下的来源存下来 —— onDeath() 靠它说人话。
           // 原来只有 lastDeathMsg（服务端死亡消息），消息一丢就"不知道怎么回事"。
-          this._lastDamage = { at: Date.now(), kind: this.lastDamageKind, text: `被${from}打了`, by: from, sourceTypeId: pkt.sourceTypeId }
-          if (this.reflex) this.reflex.onHurt(ent, bot.health)
+          this._lastDamage = {
+            at: Date.now(),
+            kind: info.name,
+            text: `被${from}打了`,
+            // 死因要能说清"被僵尸打死"，不是"受了点伤"
+            deathText: damage.deathTextOf(pkt.sourceTypeId, from),
+            by: from,
+            sourceTypeId: pkt.sourceTypeId
+          }
+          // 第 4 个参数给反射层：类型/大类/来源实体 —— 它据此决定"跑/打/退"。
+          // 不传也能跑（反射层还有掉血速率那条通用触发）。
+          if (this.reflex) {
+            this.reflex.onHurt(ent, bot.health, info.name, {
+              id: pkt.sourceTypeId,
+              name: info.name,
+              attack: true,
+              cat: info.cat,
+              causeId: pkt.sourceCauseId || 0,
+              directId: pkt.sourceDirectId || 0,
+              pos: pkt.sourcePosition || null
+            })
+          }
           // 【痛觉】血到线以下就真的停手，不是提示词里写一句
           this.onPain(bot.health, this._lastDamage.text)
           return
@@ -289,14 +313,14 @@ class Bot {
         // 没有实体来源 -> 环境伤害。别再说"被打了"。
         // 节流：1.5 秒内同一种环境伤害只记一次（摔落会连推多包）。
         const now = Date.now()
-        const key = kind || ('type' + pkt.sourceTypeId)
+        const key = info.name
         if (key === lastDmgKind && now - lastDmgAt < 1500) return
         lastDmgAt = now
         lastDmgKind = key
-        this.lastDamageKind = kind || 'unknown'
+        this.lastDamageKind = info.name
         this.lastDamageFrom = null
 
-        const text = DAMAGE_TEXT[kind] || '受了点伤'
+        const text = info.cn
         if (this.events) {
           // 【踩坑】原来推的类型是 'damage_env'，而 events.js 的 TYPES 表里
           // 根本没有这个键（表里叫 'damage'，注释就写着"伤害来源是环境"）。
@@ -306,17 +330,34 @@ class Bot {
           // 但 what 每次都更新成最新血量 —— 急件不刷屏，又不能报到旧数字。
           this.events.push(
             'damage',
-            { kind, health: bot.health },
+            { kind: info.name, health: bot.health },
             `${text}，血剩 ${Math.round(bot.health)}`,
-            { cooldown: 6000, whatUpdate: true, dedupeKey: 'env:' + (kind || 'unknown') }
+            { cooldown: 6000, whatUpdate: true, dedupeKey: 'env:' + info.name }
           )
         }
         // 【死因】环境伤害同样要落一条，否则淹死/摔死也会变成"不知道怎么回事"
-        this._lastDamage = { at: Date.now(), kind: kind || 'unknown', text: text, by: null, sourceTypeId: pkt.sourceTypeId }
+        this._lastDamage = {
+          at: Date.now(),
+          kind: info.name,
+          text,
+          deathText: damage.deathTextOf(pkt.sourceTypeId),
+          by: null,
+          sourceTypeId: pkt.sourceTypeId
+        }
         // 【痛觉】环境伤害更容易"眼睁睁看着死"（L547 连挖到第 12 层）
         this.onPain(bot.health, text)
         // 环境伤害也要走反射层 —— 溺水/摔落一样会死
-        if (this.reflex) this.reflex.onHurt(null, bot.health, kind)
+        if (this.reflex) {
+          this.reflex.onHurt(null, bot.health, info.name, {
+            id: pkt.sourceTypeId,
+            name: info.name,
+            attack: info.attack,
+            cat: info.cat,
+            causeId: pkt.sourceCauseId || 0,
+            directId: pkt.sourceDirectId || 0,
+            pos: pkt.sourcePosition || null
+          })
+        }
       } catch (e) {}
     })
 
@@ -935,6 +976,7 @@ class Bot {
       : ''
     const LETHAL = lethalKind === 'drown' || lethalKind === 'lava' ||
       lethalKind === 'on_fire' || lethalKind === 'in_fire' ||
+      lethalKind === 'in_wall' || lethalKind === 'cramming' ||
       lethalKind === 'suffocate' || lethalKind === 'out_of_world'
     const stopLine = LETHAL ? WARN : STOP
 
@@ -964,7 +1006,9 @@ class Bot {
       let kind = 'lowhp'
       try {
         if (this._lastDamage && now - this._lastDamage.at < 3000) kind = this._lastDamage.kind || 'lowhp'
-        if (kind === 'mob' || kind === 'player') kind = 'lowhp'
+        // 被打（近战/远程/玩家/爆炸/药水）对反射层来说都只是"有人在弄你"，
+        // 具体怎么应对由它自己按血量分档决定。
+        if (kind === 'mob' || kind === 'player' || /^(mob_attack|mob_attack_no_aggro|mob_projectile|arrow|player_attack|player_explosion|spear|mace_smash|thrown|trident|fireball|fireworks|wind_charge|sonic_boom|sting|spit|explosion|magic|indirect_magic|wither|wither_skull|thorns)$/.test(String(kind))) kind = 'lowhp'
       } catch (e) {}
       try { this.reflex.sos(kind, { urgent: true }) } catch (e) {}
     }
@@ -992,7 +1036,7 @@ class Bot {
 
     if (this._lastDamage && now - this._lastDamage.at < 20000) {
       return {
-        text: this._lastDamage.text,
+        text: this._lastDamage.deathText || this._lastDamage.text,
         kind: this._lastDamage.kind || 'unknown',
         by: this._lastDamage.by || null,
         sourceTypeId: this._lastDamage.sourceTypeId,
@@ -1732,6 +1776,11 @@ class Bot {
     //    回家也算在干活：它自己管 busy，但万一被别处误清过，
     //    这里再兜一次，保证主循环不会趁虚插进来抢寻路。
     if (this.busy) return
+
+    // 6.05 血 <= 5：不接新任务。
+    //      这时候再起一个"去挖矿"，等于让他走去送；逃跑/吃东西在 reflex 的
+    //      独立定时器里跑，不受这个闸门影响 —— 这里只挡"开新任务"这一件事。
+    if (this.reflex && this.reflex.blocksNewTasks()) return
 
     // 6.4 被人叫去跟着走的时候，不许自己开新任务。
     //     否则就是"两个东西并排走"：他在跟人，同时又决定去挖矿。

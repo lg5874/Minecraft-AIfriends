@@ -41,7 +41,7 @@ const GLOBAL_SAY = { lastAt: 0, window: [] }
  * 之前 test-bot-identity 里硬编了旧值，改阈值以后测试测的是空气。
  */
 const SAY_DEFAULTS = {
-  sayGapMs: 2500,       // 常规：2.5 秒内最多 1 条
+  sayGapMs: 2000,       // 常规：2 秒内最多 1 条
   fastSayGapMs: 1200,   // 被点名（话里带我的名字）时放宽
   sayWindowMs: 20000,
   sayWindowMax: 8       // 服务器阈值是 20 秒 20 条，这里留一半余量
@@ -106,11 +106,59 @@ const INSTRUCTION_PREFIX = /^(?:(?:答|说|回|讲|喊|喊话|告诉|回复|回�
 
 const INSTRUCTION_TAIL = /[。！？!?；;，,]\s*(?:直接说|直接回答|直接回|一句话就行|说一句就行|简短点说|别多说)[。！!]?$/
 
+/**
+ * 整句是「场景描述 + 第二人称指令」（2026-11-14，实机抓到）。
+ *
+ * 【现场】voice-owner 的自然采样 nat2 里，模型说出口的是：
+ *   [say] 有人问了一句，你要在游戏公屏上说一句
+ * 前半截是提示词里的**场景描述**，后半截是**给我的指令**，整句合起来被当正文念了。
+ *
+ * 【为什么前两条没拦住】
+ *   INSTRUCTION_PREFIX 要求指令在**开头** —— 这句开头是"有人问了一句"；
+ *   INSTRUCTION_TAIL 要求指令在**结尾且前面有标点** —— 这句"说一句"后面什么都没有。
+ *   两句都是「整句 = 场景 + 指令」，所以单独加一条。
+ *
+ * 【判据】同时满足才算：
+ *   ① 有第二人称指令（你要/你需要/你应该/你得）
+ *   ② 有"说/回/答"这个动作
+ *   ③ 有"一句/句话/公屏"这类限定
+ * 三条同时命中才拦 —— "你要去挖矿吗"（没有②③）、"他跟我说了一句就走"
+ * （没有①）都放行。
+ */
+/**
+ * 元话语：把自己的处境/前文当正文讲（2026-11-14，长跑抓到）。
+ *
+ * 【现场 · /tmp/soak2.log 02:04:08】17 分钟长跑里 3 句 say，2 句是这个：
+ *   [say] 前一句你刚说要接着挖，现在冒出个人在你旁边杵
+ *   [say] 诶 又来一个，不太认识啊，简单打个招呼吧
+ * 第一句是**提示词里的情境描述**被当正文念了；
+ * 更糟的是紧跟着 [intent] 把它记成了"刚说的计划"，会污染后面所有行为。
+ *
+ * 【为什么前面的判据都没拦住】
+ *   INSTRUCTION_PREFIX/TAIL/WHOLE 都在找"指令"（你要…说…一句）；
+ *   这两句一个是指令都没有，一个是"简单打个招呼吧"换个说法。
+ *   它们共同的特征不是"命令句"，是**在描述自己当下的处境**。
+ *
+ * 【判据】正常说话的人不会说：
+ *   "前一句你刚说要接着挖" —— 没人这么讲话，这是在读上下文
+ *   "简单打个招呼吧"       —— 这是给自己的待办
+ */
+const META_RECAP = /(前一句|上一句|前面那句|上一条你)/
+const META_SELF_CMD = /(简单|随便|主动)?\s*打(个|声)?招呼吧|打个招呼就行|说句招呼/
+
+const INSTRUCTION_WHOLE = (() => {
+  const you = /(?:你|您)(?:要|需要|应该|得|必须)/
+  const act = /(?:说|回|答|喊|讲)/
+  const limit = /(?:一句|两句话|句话|公屏|简短|别多)/
+  return (t) => you.test(t) && act.test(t) && limit.test(t)
+})()
+
 /** 这句话是不是把提示词里的指令当正文说出来了 */
 function isInstructionLeak (text) {
   const t = String(text || '').trim()
   if (!t) return false
-  return INSTRUCTION_PREFIX.test(t) || INSTRUCTION_TAIL.test(t)
+  return INSTRUCTION_PREFIX.test(t) || INSTRUCTION_TAIL.test(t) || INSTRUCTION_WHOLE(t) ||
+    META_RECAP.test(t) || META_SELF_CMD.test(t)
 }
 
 /**
@@ -213,7 +261,7 @@ class Talk {
     //   「天黑这么快」「来了啊」「看见你上来了」「玩不玩啊」，间隔 2196~4643ms。
     // 真人聊天间隔 2~4 秒是常态，5 秒的闸门把正常话全拦了，方向反了。
     // 定 2000：2 秒间隔 = 20 秒 10 条，离服务器的 20 条/20 秒还有一半余量。
-    this.sayGapMs = Talk.DEFAULTS.sayGapMs          // 常规：2.5 秒内最多 1 条
+    this.sayGapMs = Talk.DEFAULTS.sayGapMs
     this.fastSayGapMs = Talk.DEFAULTS.fastSayGapMs  // 被点名（话里带我的名字）时放宽到 1.2 秒
     // 硬窗口保持不变：Paper 的 spam 阈值是「20 秒内 20 条」（实测被踢前 20s 说了 21~27 条）。
     // 现在 20 秒最多 8 条，比阈值低一半还多 —— 正常对话过的去，刷屏过不去。
@@ -1396,6 +1444,9 @@ Talk.prototype.looksLikeBot = function (username) {
   //    这里只认"带编号或带下划线后缀"的。
   if (/^XJJ\d+$/i.test(name)) return true
   if (/^XJJ[_-][A-Za-z0-9_]{2,}$/i.test(name)) return true
+  // 全大写后缀、无分隔符的那种（XJJSESSION / XJJGA147）——
+  // 主账号 XJJ 本身上面 self 检查已挡掉，真人也不会管自己叫 XJJ+一串大写
+  if (/^XJJ[A-Z]{3,}$/i.test(name)) return true
 
   return false
 }

@@ -611,7 +611,7 @@ class Actions {
    * 就是 digUpOne 里那行裸 `await bot.dig()` 挂死，把整个 420 秒任务窗口吃光。
    * 这不是「发呆」，是**挂死** —— 所以 idleThinkSeconds 调了也没用。
    */
-  async digWithTimeout (block, ms = 9000) {
+  async digWithTimeout (block, ms = 15000) {
     if (!block) return false
     let timer = null
     const timeout = new Promise(resolve => { timer = setTimeout(() => resolve('timeout'), ms) })
@@ -1329,7 +1329,7 @@ class Actions {
           if (/bedrock/.test(blk.name)) continue
           try {
             await this.bestToolFor(blk)
-            await this.digWithTimeout(blk, 9000)
+            await this.digWithTimeout(blk, 15000)
             await sleep(200)
           } catch (e) {}
         }
@@ -1490,7 +1490,13 @@ class Actions {
         if (/lava|water/.test(below.name)) return false
         if (below.name === 'bedrock') return false
       }
-      // 检查通过，允许挖脚下（digStone 靠这个往下走）
+      // 【摔死修复 · 2026-11-14 02:58 实测】上面这段只查了「3 格内有没有岩浆/水」，
+      // **没查下面是空的**。砍树攒垫脚料时 findReachableBlock 会把脚下的泥土块
+      // 当成目标，digAt 一挖，下面是 23 格深的洞 → 直接自由落体。
+      //   [01:58:39] [chop] 预算 200s
+      //   [01:58:43] [fall] 落差 23.3 格：y 73→50   血 20 死
+      // 现在：挖脚下前先探 8 格，落差 >3 格就不挖（和 _checkStuck 用同一套判据）。
+      if (!this.safeToDigBelow()) return false
     }
     // 目标旁边是岩浆就不挖（挖开会流过来）
     for (const d of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]) {
@@ -2957,11 +2963,17 @@ class Actions {
      * 这里直接把目标交给 pathfinder，让它的爬坡/搭桥逻辑去处理。
      */
     const walkTo = async (x, y, z, range = 2, timeout = 25000) => {
+      // 【2026-11-14 02:45】canDig=false 那版按 Lead 准入门槛撤掉：
+      // 它改的是 pathfinder 既有路径，而 15 分钟实机里没有出现砍树走树的样本，
+      // 验不完就不进。保留下面的「掉超过 4 格立即停手」——纯增量。
+      const y0 = this.pos().y
       try {
         this.bot.pathfinder.setGoal(range <= 0
           ? new goals.GoalBlock(Math.floor(x), Math.floor(y), Math.floor(z))
           : new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range))
-      } catch (e) { return false }
+      } catch (e) {
+        return false
+      }
       const s = Date.now()
       let last = this.pos().clone()
       let still = 0
@@ -2971,6 +2983,11 @@ class Actions {
           const p = this.pos()
           const dxz = Math.hypot(p.x - x, p.z - z)
           if (dxz <= range + 1 && Math.abs(p.y - y) <= 2) return true
+          // 走树途中往下掉超过 4 格 = 走空了，立刻停，别等落到底
+          if (p.y < y0 - 4) {
+            this.log(`[chop] 走树途中掉了 ${(y0 - p.y).toFixed(1)} 格，停手`)
+            break
+          }
           if (p.distanceTo(last) < 0.12) still += 200
           else still = 0
           last = p.clone()
@@ -3162,6 +3179,7 @@ class Actions {
       const softName = (n) => /leaves|short_grass|tall_grass|fern|vine|snow|dirt|grass_block|sand|gravel|clay/.test(n)
       const trunkXZ = `${base.x},${base.z}`
       let dug = 0
+      const startPos = this.pos().clone()
 
       /**
        * 清出 (fx,fz) 的脚+头两格。
@@ -3261,14 +3279,18 @@ class Actions {
       //
       // 一次挖不动可能是这一棵的位置不好；连着 3 次都挖不动（被石头/悬崖挡住），
       // 说明整片林子都够不着。打标记，让 goals 把 explore 顶上来（往外走）。
-      if (dug > 0) {
+      // 只有"没挖开、也没挪动"才算一次被地形挡住。
+      // 绕路时虽然没挖方块（侧移走的是空格），但人确实靠近了 —— 不能算失败，
+      // 否则绕着绕着就被误判成"这片林子够不着"。
+      const moved = startPos.distanceTo(this.pos())
+      if (dug > 0 || moved > 1.0) {
         this._chopBlockedCount = 0
         this._forceExploreUntil = 0
       } else {
         this._chopBlockedCount = (this._chopBlockedCount || 0) + 1
         if (this._chopBlockedCount >= 3) {
           this._forceExploreUntil = Date.now() + 5 * 60 * 1000
-          this.log(`[chop] 连续 ${this._chopBlockedCount} 次被地形挡住（挖不动），先出去找别的地方`)
+          this.log(`[chop] 连续 ${this._chopBlockedCount} 次被地形挡住（没挖开也没挪动），先出去找别的地方`)
         }
       }
       return dug
@@ -3425,7 +3447,7 @@ class Actions {
           try { this.bot.setControlState(k, false) } catch (e) {}
         }
         try {
-          await this.digWithTimeout(b, 9000)
+          await this.digWithTimeout(b, 15000)
           await sleep(130)
           try { await this.pickupNearby(4) } catch (e) {}
           return true
@@ -5372,7 +5394,7 @@ class Actions {
       if (/bedrock|lava|water/.test(b.name)) return false
       try {
         await this.bestToolFor(b)
-        await this.digWithTimeout(b, 9000)
+        await this.digWithTimeout(b, 15000)
         await sleep(130)
       } catch (e) {
         // 挖一半被打断很常见，看最终结果说话
@@ -6079,7 +6101,7 @@ class Actions {
         await sleep(60)
         // 【挂死修复】这里原来是裸 await bot.dig()：服务端不回包就永久挂住，
         // 实测卡了 6 分 09 秒，直到 420 秒任务硬超时。
-        if (!await this.digWithTimeout(b, 9000)) return false
+        if (!await this.digWithTimeout(b, 15000)) return false
         any++
       } catch (e) {}
       await sleep(120)
@@ -6122,7 +6144,7 @@ class Actions {
           if (!nb || nb.boundingBox !== 'block') continue
           if (!SOFT.test(nb.name)) continue
           try {
-            await this.digWithTimeout(nb, 9000)
+            await this.digWithTimeout(nb, 15000)
             await sleep(200)
             try { await this.pickupNearby(4) } catch (e) {}
             await sleep(150)
@@ -6231,7 +6253,7 @@ class Actions {
         if (b && b.boundingBox === 'block' && !/bedrock|lava|water/.test(b.name)) {
           try {
             await this.bestToolFor(b)
-            await this.digWithTimeout(b, 9000)
+            await this.digWithTimeout(b, 15000)
             await sleep(110)
           } catch (e) {}
         }

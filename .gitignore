@@ -47,3 +47,6 @@ data/probe*.json
 data/tmp-*/
 # 探针用的独立数据目录（XJJ_XXX 之类的测试账号）
 data/XJJ_*/
+# 编辑器的备份副本，不该入库
+*.orig.js
+*.bak.js
