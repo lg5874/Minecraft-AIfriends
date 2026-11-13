@@ -137,7 +137,19 @@ class Bot {
       version: c.version,
       hideErrors: false,
       checkTimeoutInterval: 120000,
-      viewDistance: 'short'
+      // 【视距 = 能不能找到树】2026-11-14
+      //
+      // 原来是 'short' = 4 区块 = 64 格。而 findBlocks 只扫**已加载区块**，
+      // 所以半径设成 96 也没用 —— 64 格外的东西根本没加载。
+      //
+      // 实测证据：`[02:09:47] [act] [chop] 砍下 1 块原木（birch_log @133,75,116）`
+      // 离家 66,64,-92 大约 **70 格** —— 树就在那儿，只是超出了 short 的加载范围。
+      //
+      // 这就是"背包有 22 根原木却做不出木镐"的另一半真相：
+      // 不是 craft 链坏了，是**在他能看见的半径里确实没有木头**。
+      //
+      // 'normal' = 8 区块 = 128 格，够覆盖 70 格的树。代价是内存和带宽略增。
+      viewDistance: 'normal'
     })
     this.bot = bot
     bot.loadPlugin(pathfinder)
@@ -527,7 +539,16 @@ class Bot {
         //   [session] 今天到此为止，回去歇着
         //   [goals]  换法子（目标不变）：找块够平的地方…   ← 收工了还在派人
         // 跟"休息窗口里启动 5 个任务"是同一个病，只是信号源从 mood.resting 换成 session.phase。
-        get session () { return this.session }
+        get session () { return this.session },
+        // 【让看门狗从"猜"变成"读"】2026-11-14
+        //
+        // goals 的 30 秒看门狗原来只能靠"最后一条 [act] 日志 + 位移"猜他在不在干活，
+        // 于是把「任务刚收尾 + 下一个任务正在跑」这 37 秒也算成"没动作"——
+        // 实测误判：03:20:16 完成 → 03:20:43 重立 → 03:20:53 判卡死 → 放弃整个盖房目标。
+        //
+        // 接上 busy / taskSince 之后它直接读，不用猜。纯 additive，不改任何控制流。
+        get busy () { return self.busy },
+        get taskSince () { return self._taskStartAt }
       }
     })
     // 代价层挂上去：放弃时结算、选目标时读记忆、提示词里带上"最近的亏"。

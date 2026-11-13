@@ -554,6 +554,13 @@ class Goals {
     this.lastStatus = null  // 最近一次观察到的状态（算进度用）
     this._lastSurfaceAt = 0 // 上一次确认"人在露天"的时间（刚上来的约束用）
     this._savedAt = 0
+    // ===== 看门狗用的两个时间戳（判据见 observe 的"卡死看门狗"一段）=====
+    // 最后一次任务回报（成功/失败都算）：一趟收尾本身就是"他动过"的证据。
+    this._lastTaskAt = 0
+    // 上层最后一次问"现在该干什么"的时刻。will 派活之前一定会先问 current()，
+    // 所以这就是"这一趟任务大概什么时候开始"的最近证据 ——
+    // goals 看不到 main 的锁，只能认这个（有 ctx.taskSince() 时优先用那个）。
+    this._askedAt = 0
     this.load()
   }
 
@@ -1190,6 +1197,9 @@ ${list}
     const method = mi > 0 ? ways[mi] : null
     // 搁起来了：说"干点别的"，别再念那条已经试过三遍的任务。
     const park = s.parked ? PARK_TEXTS[(s.attempts || 0) % PARK_TEXTS.length] : null
+    // 上层马上会拿这句话去派活（main 拿到 will.think() 的结果就 acquire task 锁，
+    // 日志里紧接着就是 `>>> 开始`）。记下来，看门狗才知道"这一趟"什么时候起的。
+    this._askedAt = this.now()
     return {
       // 【#7】换过法子之后，交给上层的是"换个法子怎么干"，
       // 不是把同一句话原样再说一遍 —— will 拿它去派活，
@@ -1265,8 +1275,128 @@ ${list}
     return lines.join('\n')
   }
 
-  // ------------------------------------------------ 记进度
+  // ------------------------------------------------ 看门狗用的外部信号
 
+  /**
+   * 上层到底忙不忙。
+   *
+   * goals 拿不到 main 的锁，能问就问一声（ctx.busy 是可选的接线）；
+   * 问不到返回 null —— 表示"不知道"，**不等于空闲**。
+   */
+  _busyNow () {
+    try {
+      const c = this.ctx || {}
+      if (typeof c.busy === 'function') return !!c.busy()
+    } catch (e) {}
+    return null
+  }
+
+  /**
+   * 这一趟任务是什么时候开始的。
+   *
+   * 优先问上层（ctx.taskSince()，可选接线）；
+   * 没有就退回"最近一次被问『现在该干什么』"的时刻 —— will 派活之前一定先问
+   * current()，所以它跟日志里那条 `>>> 开始` 基本是同一秒。
+   * 两个都没有就是 0，判据里不占位置。
+   */
+  _taskSince () {
+    try {
+      const c = this.ctx || {}
+      if (typeof c.taskSince === 'function') {
+        const v = Number(c.taskSince())
+        if (isFinite(v) && v > 0) return v
+      }
+    } catch (e) {}
+    return this._askedAt || 0
+  }
+
+  // ------------------------------------------------ 过一步
+
+  /**
+   * 这一阶段够了 -> 往前走一步（observe 和 onTaskResult 共用这一套动作）。
+   *
+   * 【为什么必须两条路都走这里 · 2026-11-14 03:20 现场】
+   *   03:20:16 <<< 完成（阶段其实已经够了）
+   *   03:20:43 >>> 开始：先弄一小堆…   ← 同一阶段又立了一遍
+   * 因为结算只在 observe() 里做，而 main 把 observe 节流成 30 秒一次：
+   * 中间这 27 秒里 will 一 ask，拿到的还是同一个没结算的阶段。
+   * 现在任务一收尾就结算，不用等下一轮观察。
+   *
+   * trivial（本来就不用做）跳过，但**不记成他做到了** ——
+   * goals.json 里不留零动作完成的阶段。
+   */
+  _advanceStage (s, p, status) {
+    const isLast = this.goal.stageIndex >= this.goal.stages.length - 1
+    if (p && p.trivial) {
+      this.log(`[goals] 跳过「${s.title}」：${p.text}`)
+      this.journal(`「${s.title}」本来就不用做，跳过`)
+      if (isLast) {
+        this.completeGoal()
+        return { stageCompleted: true, goalCompleted: true, ratio: 1, abandoned: false, trivial: true }
+      }
+      this.goal.stageIndex++
+      const nextS = this.currentStage()
+      if (nextS) {
+        try { nextS.base = makeBase(nextS, status) } catch (e) {}
+        nextS.startedAt = this.now()
+      }
+      this.save(true)
+      return { stageCompleted: true, goalCompleted: false, ratio: 1, abandoned: false, trivial: true }
+    }
+    s.doneAt = this.now()
+    this.journal(`搞定了「${s.title}」`)
+    if (isLast) {
+      this.completeGoal()
+      return { stageCompleted: true, goalCompleted: true, ratio: 1, abandoned: false }
+    }
+    this.goal.stageIndex++
+    const ns = this.currentStage()
+    if (ns) {
+      try { ns.base = makeBase(ns, status) } catch (e) {}
+      ns.startedAt = this.now()
+    }
+    this.journal(ns ? `接下来：${ns.title}` : '')
+    this.save(true)
+    this.log(`[goals] 过了一步：「${s.title}」→ 下一步「${ns ? ns.title : '完了'}」`)
+    return { stageCompleted: true, goalCompleted: false, ratio: 1, abandoned: false }
+  }
+
+  /**
+   * 任务收尾时用的"这一阶段真的够了吗"。
+   *
+   * 跟 stageProgress 只差一处：gather 的某一项如果**立这一步的时候背包里就够了**
+   * （base.inv 已经 >= 需求），不再要求"再攒一批"。
+   *
+   * 【为什么必须留这个口子 · 2026-11-14 03:20 现场】
+   *   阶段要 {石头 8, 木头 6}，立起来时背包里已经有 22 根原木
+   *   -> 任务按绝对存量判「这一小堆够了」，硬判据是石头 +8（唯一真缺的那样）
+   *   -> goals 按增量判 8/14 = 57%，阶段不过
+   *   -> will 27 秒后又立一遍同一个阶段，背包当然不涨，10 秒失败
+   * 任务兑现的就是"还缺的那部分"，这边就得认账。
+   *
+   * 这不是放水：真的缺的每一项仍然要拿够增量（"存量不算"那条口径没动，
+   * 见 test-goals 里"开局 130 块圆石也不算攒够"）。全都在背包里的阶段
+   * 依旧是 0 进度，绝不白送。
+   */
+  _stageMet (s, status) {
+    const p = stageProgress(s, status)
+    if (p.trivial || p.ratio >= 1 - 1e-9) return p
+    if (s.kind !== 'gather') return p
+    const need = s.need || {}
+    const keys = Object.keys(need).filter(k => (Number(need[k]) || 0) > 0)
+    if (!keys.length) return p
+    const inv = (status && status.inventory) || {}
+    const baseInv = (s.base && s.base.inv) || {}
+    for (const k of keys) {
+      const want = Number(need[k]) || 0
+      if (Math.max(0, itemCount(baseInv, k)) >= want) continue // 立这一步时就有了
+      if (peakHave(s, inv, k) >= want) continue               // 这一阶段真攒到了
+      return p                                                // 还缺 -> 没够
+    }
+    return { ratio: 1, text: p.text + '（手上已有的那几样不用再攒）' }
+  }
+
+  // ------------------------------------------------ 记进度
   /**
    * 扫一眼状态，更新进度。主循环里隔一会儿调一次就行。
    * 返回 { stageCompleted, goalCompleted, ratio, abandoned }
@@ -1323,7 +1453,25 @@ ${list}
     // busy 一直是 true，70 秒只有心跳、没有一条 [act] 日志。
     // 用户看到的就是"站着不动"。
     //
-    // 判据：任务在跑，但 30 秒里既没有动作日志（_lastLogAt）、也没有位移。
+    // ===== 【实测 · 2026-11-14 03:20 —— 这次是误判】=====
+    //
+    //   03:20:16 <<< 完成（上一趟收尾）
+    //   03:20:43 >>> 开始：先弄一小堆…（中间 27 秒是发会儿呆，上层故意的 idle）
+    //   03:20:53 <<< 失败（这一趟只跑了 10 秒；跑的是缓存技能，没有一条 [act] 日志）
+    //   03:20:53 [goals] 卡死：37 秒没有任何动作   ← 把"任务正在跑"数成了"没动作"
+    //
+    // 病根：判据只认 [act] 日志和位移，两头都不认"任务边界"。
+    // 一次观察的窗口横跨「上一趟收尾 → 发呆 → 下一趟起跑」，
+    // 中间的 idle 和这一趟刚起的 10 秒，全被算成了安静。
+    //
+    // 所以判据取这几样里**最大的那个**：
+    //   · 最后一次 >0.5 格位移
+    //   · 最后一条 [act] 日志（_lastLogAt）
+    //   · 这一阶段开始（阶段边界）
+    //   · 最后一次任务回报（收尾本身就是"他动过"的铁证）
+    //   · 这一趟任务的开始时间（见 _taskSince()）
+    // 另外：任务在跑、又拿不到"这一趟什么时候开始"时，不判 ——
+    // 那种情况由上层 main 的 [stall] 一分钟检查（任务级、会打断）说了算。
     // 证据是 duration 的阶段（守着/站一会儿）除外 —— 那本来就不该动。
     try {
       const pNow = posOf(status)
@@ -1334,10 +1482,21 @@ ${list}
       }
       const act = this.ctx && this.ctx.actions
       const lastAct = act && Number(act._lastLogAt) ? Number(act._lastLogAt) : 0
-      const last = Math.max(this._watchMoveAt || 0, lastAct, s.startedAt || this.goal.createdAt || 0)
+      const threshold = this.cfg.stuckActionMs || 30000
+      const busyNow = this._busyNow()
+      const taskSince = this._taskSince()
+      const last = Math.max(
+        this._watchMoveAt || 0,
+        lastAct,
+        s.startedAt || this.goal.createdAt || 0,
+        this._lastTaskAt || 0,
+        taskSince
+      )
       const quiet = this.now() - last
       const watchable = s.evidence !== 'duration'
-      if (watchable && quiet > (this.cfg.stuckActionMs || 30000) && !this.isResting()) {
+      // 只知道"在忙"、不知道这一趟何时开始：判据不成立，别抢上层的 [stall]
+      const blindWhileBusy = busyNow === true && !taskSince
+      if (watchable && !blindWhileBusy && quiet > threshold && !this.isResting()) {
         const reason = `卡死：${Math.round(quiet / 1000)} 秒没有任何动作，先放下`
         this.log('[goals] ' + reason)
         this.journal(reason)
@@ -1371,43 +1530,9 @@ ${list}
     // 回地面上、往回走到目标高度这类阶段，如果立起来的时候人已经在那儿，
     // 那就是没走过。直接跳过去，但**不记"搞定了"** —— 不然
     // goals.json 里又会多一条零动作完成的阶段。
-    if (p.trivial) {
-      const isLast = this.goal.stageIndex >= this.goal.stages.length - 1
-      this.log(`[goals] 跳过「${s.title}」：${p.text}`)
-      this.journal(`「${s.title}」本来就不用做，跳过`)
-      if (isLast) {
-        this.completeGoal()
-        return { stageCompleted: true, goalCompleted: true, ratio: 1, abandoned: false, trivial: true }
-      }
-      this.goal.stageIndex++
-      const nextS = this.currentStage()
-      if (nextS) {
-        nextS.base = makeBase(nextS, status)
-        nextS.startedAt = this.now()
-      }
-      this.save(true)
-      return { stageCompleted: true, goalCompleted: false, ratio: 1, abandoned: false, trivial: true }
-    }
+    if (p.trivial) return this._advanceStage(s, p, status)
 
-    if (p.ratio >= 1 - 1e-9) {
-      s.doneAt = this.now()
-      this.journal(`搞定了「${s.title}」`)
-      const isLast = this.goal.stageIndex >= this.goal.stages.length - 1
-      if (isLast) {
-        this.completeGoal()
-        return { stageCompleted: true, goalCompleted: true, ratio: 1, abandoned: false }
-      }
-      this.goal.stageIndex++
-      const ns = this.currentStage()
-      if (ns) {
-        ns.base = makeBase(ns, status)
-        ns.startedAt = this.now()
-      }
-      this.journal(ns ? `接下来：${ns.title}` : '')
-      this.save(true)
-      this.log(`[goals] 过了一步：「${s.title}」→ 下一步「${ns ? ns.title : '完了'}」`)
-      return { stageCompleted: true, goalCompleted: false, ratio: 1, abandoned: false }
-    }
+    if (p.ratio >= 1 - 1e-9) return this._advanceStage(s, p, status)
 
     // 太久没动静：这事可能干不成，或者他不想干了
     const idle = this.now() - (this.goal.lastProgressAt || this.goal.createdAt)
@@ -1431,6 +1556,10 @@ ${list}
    */
   onTaskResult ({ ok, text, status, progress } = {}) {
     if (status) this.lastStatus = status
+    // 一趟任务收尾了。这是看门狗判据里的"他刚动过" ——
+    // 不记这一笔，紧接着的观察会拿"阶段开始到现在"去算安静，
+    // 把"刚跑完的一趟"算成"37 秒没动作"（2026-11-14 03:20 的误判）。
+    this._lastTaskAt = this.now()
     if (!this.goal || this.goal.done) return { advanced: false }
     const s = this.currentStage()
     if (!s) return { advanced: false }
@@ -1493,6 +1622,20 @@ ${list}
         }
       }
       s.fails = 0
+
+      // ===== 【判据连接】这一趟成了、阶段按硬证据也够了 -> 当场过下一步 =====
+      //
+      // 别的结算都可以等下一轮 observe()，但 main 把 observe 节流成 30 秒一次。
+      // "够了"这件事这一秒就知道，再等那 27 秒，will 就会把同一阶段重立一遍
+      // （2026-11-14 03:20 现场：完成 -> 27 秒后又「先弄一小堆」）。
+      if (status) {
+        const pDone = this._stageMet(s, status)
+        if (pDone.trivial || pDone.ratio >= 1 - 1e-9) {
+          const adv = this._advanceStage(s, pDone, status)
+          adv.advanced = true
+          return adv
+        }
+      }
 
       // ===== 防空转：说"成了"但进度一点没动 =====
       //

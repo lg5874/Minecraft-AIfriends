@@ -4427,15 +4427,30 @@ class Actions {
           table = await this.placeNearby('crafting_table')
         }
       }
-      if (!table) throw new Error('弄不到工作台')
+      if (!table) { try { this.log('[craft] ' + name + ' 弄不到工作台') } catch (e) {} ; throw new Error('弄不到工作台') }
       await this.goto(table.position.x, table.position.y, table.position.z, 3)
       recipes = this.bot.recipesFor(id, null, 1, table)
     }
-    if (!recipes || !recipes.length) throw new Error('材料不够做 ' + name)
+    if (!recipes || !recipes.length) { try { this.log('[craft] ' + name + ' 材料不够（有工作台也做不了）') } catch (e) {} ; throw new Error('材料不够做 ' + name) }
 
     const recipe = recipes[0]
     const times = Math.ceil(count / recipe.result.count)
-    await this.bot.craft(recipe, times, table)
+    // 【别静默失败】2026-11-14
+    //
+    // 实测：工作台找到了（`[craft] 工作台在 3.5 格内，可以合`）、配方也找到了，
+    // 但 `木镐状态：还是没有` —— 而生成代码里是 `.catch(() => false)`，
+    // bot.craft() 抛的错全被吞掉，日志里一个字都没有。
+    //
+    // 这是今晚第五个"没连上"：错误发生了，但没有任何地方记录它。
+    try {
+      await this.bot.craft(recipe, times, table)
+    } catch (e) {
+      try {
+        const dist = table && this.pos ? Math.round(this.pos().distanceTo(table.position) * 10) / 10 : '?'
+        this.log(`[craft] ${name} bot.craft 失败：${e && e.message}（工作台距离 ${dist} 格，次数 ${times}）`)
+      } catch (e2) {}
+      throw e
+    }
     return true
   }
 
@@ -4467,7 +4482,18 @@ class Actions {
     if (!cands.length) {
       try { cands = this.bot.recipesAll(id, null, null) || [] } catch (e) { cands = [] }
     }
-    if (!cands.length) throw new Error('没有 ' + name + ' 的配方')
+    if (!cands.length) {
+      // 【别静默失败】2026-11-14
+      // 实测：背包有原木 22 / 木板 19，却做不出 wooden_pickaxe，
+      // 而生成代码里写的是 `.catch(() => false)` —— 错误全被吞掉，
+      // 日志只剩一句「木镐状态：还是没有」，看不出为什么。
+      // 这里补一行，让"没配方"这件事在日志里看得见。
+      try {
+        this.log(`[craft] ${name} 找不到配方（木棍 ${this.countOf('stick')}、` +
+          `木板 ${this.plankTotal ? this.plankTotal() : '?'}、木头 ${this.woodCount ? this.woodCount() : '?'}）`)
+      } catch (e) {}
+      throw new Error('没有 ' + name + ' 的配方')
+    }
 
     // 2. 木板统一成"手上能做的种类"，避免去凑樱桃木板这种
     //
