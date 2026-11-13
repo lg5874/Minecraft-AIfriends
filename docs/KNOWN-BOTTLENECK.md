@@ -108,3 +108,35 @@
 2. `digAt` 加 `walkToBlock` 选项（挖树干时禁止自己 goto 漂移）
 3. 修 `gotoVertical` 随机漂移
 **实测**：砍树从 113s 失败 → 27s 成功（原木 1→2）。
+
+---
+
+## 当前死结（2026-11-13 10:30）
+
+### `craftSmart` 不会自动做木棍
+
+**现象**：`木板 16 / 木棍 0` 时，`craftSmart('wooden_pickaxe')` 失败。
+木镐 = 3 木板 + 2 木棍，木棍 = 1 木板 → 4 木棍。有 16 张木板绝对够。
+
+**实测（ensurePickaxe 160 秒）**：
+```
+[chop] 砍下 4 块原木 @86,76,73
+[planks] oak_log -> oak_planks x16
+[tool] 木板 16 / 木棍 0 / 原木 0
+[tool] 做木镐失败: 合成 wooden_pickaxe 后背包没变化（0/1）
+[tool] 再补一轮原木
+[tool] 补料后做成了木镐        ← 补一轮就成
+```
+
+**影响**：挡住 3 个任务（挖石头 / 做木镐 / 做石镐）。
+现在要 160 秒 + 砍两轮树；修好后应该 80 秒一轮。
+
+**疑似根因**：`craftSmart` 递归调用时，`recomputeNeeds` / `pick` / `times0`
+这几个变量的作用域可能串了（木镐的配方上下文和木棍的配方上下文混在一起）。
+
+### 已修的前置条件
+
+1. `ensurePickaxe` 加了"先攒垫脚料"步骤（空手能挖 dirt/grass_block/gravel/sand/clay）
+2. `digAt` 的挖脚下检查误杀（下面没方块时 continue，不再 return false）
+   —— 之前砍树时报"这棵砍不动（差 1.1 格）"，1.1 格明明够得着
+3. `chopTree` 的扫描半径逐级放大（48 → 64 → 80），实测"半径放大到 64 格后找到 2 棵"
