@@ -361,7 +361,74 @@ class SkillLibrary {
     if (typeof s.fail !== 'number') s.fail = 0
     if (!Array.isArray(s.runs)) s.runs = []
     if (!Array.isArray(s.tags)) s.tags = []
+    this.reconcileUses(s)
     return s
+  }
+
+  /**
+   * 【层2 记账守恒】把"复用了但没留下判定"的次数单独分出来。
+   *
+   * 哨兵审计（HEAD 80f9302）：
+   *   有的技能 uses=54、runs 20/20 全过，但 ok=0 fail=0
+   *   —— 四个大技能各有 34–54 次复用根本没有判定记录。
+   *
+   * 原因不是 markUse 没写，是**历史上的版本只数了 uses，没记 ok/fail**：
+   *   · 早期 SkillLibrary 只有 uses 计数器
+   *   · 后来 markUse 才同时记 ok/fail
+   * 于是 uses 和 ok+fail 两个账本从某个时间点起就对不上了。
+   *
+   * 这里不编造结果，也不假装没发生：把差额记进 legacyUses，
+   * 并让 uses 只表示**有判定记录的复用次数**。这样
+   *   uses === ok + fail + Σretired
+   * 成为恒等式，`uses>0 && ok+fail===0` 的技能数会归零。
+   */
+  reconcileUses (s) {
+    const recorded = (s.ok || 0) + (s.fail || 0)
+    const retiredSum = (s.retired || []).reduce((a, r) => a + (r.ok || 0) + (r.fail || 0), 0)
+    const accounted = recorded + retiredSum
+    if ((s.uses || 0) > accounted) {
+      s.legacyUses = (s.legacyUses || 0) + ((s.uses || 0) - accounted)
+      s.uses = accounted
+    }
+    if ((s.uses || 0) < accounted) s.uses = accounted
+
+    // 【三方对账】uses / runs / ok+fail 必须能对上。
+    //
+    // 哨兵实测：换版时把 ok/fail 清零、runs 却留着 ——
+    //   k_mwds22uu uses=1 / runs=20 / ok+fail=1，runs 里 20 条 ok:true 还在。
+    // 计数器清零不等于历史消失，但**也不能让两个账本互相矛盾**。
+    // 现在：runs 只保留"这一版"的明细（长度 ≤ ok+fail），多出来的记进 runsArchived。
+    const runs = Array.isArray(s.runs) ? s.runs : []
+    if (runs.length > recorded) {
+      s.runsArchived = (s.runsArchived || 0) + (runs.length - recorded)
+      // 【坑】slice(-0) === slice(0) —— 会返回整个数组。
+      // 第一版就这么写的，结果"裁剪"完 runs 还是 7 条、ok+fail 是 0。
+      s.runs = recorded > 0 ? runs.slice(-recorded) : []
+    }
+    if (!Array.isArray(s.runs)) s.runs = []
+    return s
+  }
+
+  /**
+   * 记账体检：返回哪些技能"有复用没判定"。
+   * 供 scripts/audit-skill-ledger.js 和 CI 用。
+   */
+  audit () {
+    const bad = []
+    let legacy = 0
+    for (const s of this.data.skills) {
+      this.migrate(s)
+      legacy += s.legacyUses || 0
+      const recorded = (s.ok || 0) + (s.fail || 0)
+      const retiredSum = (s.retired || []).reduce((a, r) => a + (r.ok || 0) + (r.fail || 0), 0)
+      if ((s.uses || 0) > 0 && recorded + retiredSum === 0) {
+        bad.push({ name: s.name, desc: s.desc, uses: s.uses, ok: s.ok, fail: s.fail, legacyUses: s.legacyUses || 0 })
+      }
+      if ((s.uses || 0) !== recorded + retiredSum) {
+        bad.push({ name: s.name, desc: s.desc, mismatch: true, uses: s.uses, ok: s.ok, fail: s.fail, retired: retiredSum })
+      }
+    }
+    return { total: this.data.skills.length, bad, legacyUses: legacy }
   }
 
   save () {
@@ -415,6 +482,7 @@ class SkillLibrary {
           codeHash: hit.codeHash,
           ok: hit.ok || 0,
           fail: hit.fail || 0,
+          runs: (hit.runs || []).length,   // 明细条数也归档，别让 runs 和 ok/fail 打架
           at: Date.now()
         })
         if (hit.retired.length > 5) hit.retired = hit.retired.slice(-5)
@@ -429,6 +497,7 @@ class SkillLibrary {
         hit.lifetimeFail = (hit.lifetimeFail || 0) + (hit.fail || 0)
         hit.ok = 0
         hit.fail = 0
+        hit.runs = []              // 明细跟着换版一起清，旧的已归档进 retired
         hit.replaced = (hit.replaced || 0) + 1
         // 换版次数过多说明这个意图的代码一直不稳，标出来
         if (hit.replaced >= 3) hit.unstable = true
@@ -493,6 +562,39 @@ class SkillLibrary {
       const safe = name.replace(/[^\w\u4e00-\u9fa5]/g, '_')
       fs.writeFileSync(path.join(this.codeDir, safe + '.js'), code, 'utf8')
     } catch (e) {}
+  }
+
+  /**
+   * 这个技能的结尾是不是「无条件 return 成功」？
+   *
+   * 【#8】这是假成功的源头。
+   *
+   * 坏例子 k_mwe74ysb（"在附近地上捡够垫脚的石头"）：
+   *   const finalCobble = actions.countOf('cobblestone') + ...
+   *   return '现在手上有圆石' + actions.countOf('cobblestone') + '个，...够垫脚用了'
+   * 不管捡到没捡到，最后一句永远是"够垫脚用了"。
+   * 它被复用 74 次、ok 74 / fail 0，而世界毫无变化。
+   *
+   * 判据：函数体最后一条**顶层** return 是否被 if/else/try 保护。
+   * 缩进 > 2 的 return 视为在 try 块里（有保护，因为 catch 会走另一条路）。
+   */
+  hasUnconditionalReturn (code) {
+    const lines = String(code || '').split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = /^(\s*)return\b/.exec(lines[i])
+      if (!m) continue
+      const indent = m[1].length
+      if (indent > 2) return false        // 在 try/块里，算有保护
+      // 往上找缩进更小的控制语句
+      for (let j = i - 1; j >= 0; j--) {
+        const pl = lines[j]
+        if (!pl.trim()) continue
+        const pi = pl.length - pl.trimStart().length
+        if (pi < indent && /^\s*(if|else|for|while|try|switch)\b/.test(pl)) return false
+      }
+      return true
+    }
+    return false
   }
 
   // ---------- 记账 ----------
@@ -632,8 +734,21 @@ class SkillLibrary {
       const rate = successRate(s)
       // 成功率的影响：0% → -2，50% → 0，100% → +2
       const rateBonus = (rate - 0.5) * 4
-      // 用得多说明稳定，但别让老技能霸榜
-      const useBonus = Math.min((s.uses || 0) / 20, 1)
+
+      // 【#8】复用次数不能再当"稳定"的加分项。
+      //
+      // 老逻辑 useBonus = min(uses/20, 1)：用得越多分越高。
+      // 问题是"成功"本身是假的（无条件 return 文案），
+      // 于是 k_mwe74ysb 复用 74 次、ok 74、useBonus 满分、rateBonus 满分，
+      // 长期霸榜 —— 越假越被优先复用，这是正反馈的坑。
+      //
+      // 现在：复用次数只给很小的权重，且**结尾无条件 return 成功的技能直接重罚**。
+      const useBonus = Math.min((s.uses || 0) / 100, 0.3)
+
+      // 结尾无条件 return 成功的技能：它自己不会报失败，成功率不可信
+      const unconditional = this.hasUnconditionalReturn(s.code)
+      // 罚 3.5 分：比"不适用"(6 分) 轻，但足以让它排到诚实技能后面
+      const fakePenalty = unconditional ? 3.5 : 0
 
       const rel = charScore * 10 + sim * 8 + sub + tagHit + en + intentHit
 
@@ -642,7 +757,7 @@ class SkillLibrary {
       // 不适用的技能仍保留（可以当写法参考），但排到后面
       const appPenalty = app.ok ? 0 : 6
 
-      const score = rel + rateBonus + useBonus - appPenalty
+      const score = rel + rateBonus + useBonus - appPenalty - fakePenalty
       return { s, score, rel, app }
     })
       .filter(x => x.score >= 2.2)
@@ -655,6 +770,7 @@ class SkillLibrary {
       out._applicable = x.app.ok
       out._why = x.app.reason
       out._score = Math.round(x.score * 100) / 100
+      out._unconditionalReturn = this.hasUnconditionalReturn(x.s.code)
       return out
     })
   }
@@ -667,6 +783,9 @@ class SkillLibrary {
 
     const cands = this.search(goal, 8, ctx, { exclude })
       .filter(s => s._applicable)
+      // 标脏的（跑满过超时 / 没有无进展出口）不进候选：
+      // 不改它的代码，只是让它再也进不了库、选不上。
+      .filter(s => !s.dirty)
       .filter(s => s._score >= minRel)
 
     if (!cands.length) return null
@@ -686,7 +805,16 @@ class SkillLibrary {
         return { s, conf, tested, rate, runs, lifeRate, lifeRuns }
       })
       // 三次拦：本版成功率、累计成功率、换版次数
-      .filter(x => !x.tested || x.rate >= minRate)
+      //
+      // 【越失败越窄 修】原来第一拦是 `!tested || rate >= minRate`，
+      // 配上拉普拉斯平滑 rate=(ok+1)/(ok+fail+2)：
+      //   0 ok / 1 fail -> 1/3 = 0.33 < 0.45 -> **永久排除**
+      //   0 ok / 2 fail -> 1/4 = 0.25 -> 永久排除
+      // 一次失败就把方法永久删掉 —— 真人不会这样，真人试两次不成就换法子，
+      // 但过一阵还会想起来再试。38 条库里实测筛完只剩一两条能用，
+      // 于是他反复做同一件事（这跟"成功被放大"是同一个病的反面）。
+      // 现在：**失败次数不到 2 次的不做成功率筛选**。
+      .filter(x => !x.tested || x.runs < 2 || x.rate >= minRate)
       .filter(x => x.lifeRuns < 2 || x.lifeRate >= minRate)
       .filter(x => !(x.s.replaced >= 3 && x.lifeRate < 0.5))
       .sort((a, b) => b.conf - a.conf)

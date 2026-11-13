@@ -161,6 +161,54 @@ const MOB_NAMES = new RegExp(`^(${MOB_WORD})$`)
 // 代词 / 泛指 —— 绝不是具体的人
 const PRONOUN = /^(我|你|他|她|它|我们|你们|他们|她们|咱们|大家|自己|别人|有人|某人|谁|人家|对方)$/
 
+// ============================================================
+// 测试小号过滤（UNHUMAN-SCAN #13）
+//
+// 实测 data/runtime/memory.json 的"认识的人"里 5 个有 4 个是测试号：
+//   XJJHOME6 / XJJINTG / XJJHOME87 / XJJVER6
+// 它们 importance 0.6、衰减很慢，会长期占着 peopleDigest 的位置 ——
+// 玩家问"你还记得谁"，他会报出一串不存在的名字。
+//
+// 判据只在**强特征**上：XJJ + 4 位以上大写字母/数字（带用途后缀）。
+// 主账号（cfg.bot.username，默认 XJJ）本身不匹配，但仍显式放行一次，
+// 免得以后主账号改名成 XJJMAIN 之类被自己滤掉。
+// ============================================================
+const TEST_ACCOUNT_RE = /^XJJ[_-]?[A-Z0-9]{4,}$/i
+
+/**
+ * 这个用户名是不是测试小号。
+ * @param {string} name
+ * @param {string} [mainAccount] 主账号名（永不算测试号）
+ */
+function isTestAccount (name, mainAccount) {
+  const n = String(name || '').trim()
+  if (!n) return false
+  if (mainAccount && n.toLowerCase() === String(mainAccount).trim().toLowerCase()) return false
+  return TEST_ACCOUNT_RE.test(n)
+}
+
+// ============================================================
+// 地名不是人（UNHUMAN-SCAN #13 的尾巴）
+//
+// 实测 memory.json 里 `people` 混进了 "标记起点"：
+//   notes: ["起点 (100.48,59,14.3) 开始做路标"]
+// 它是 coder 写的 `memory.note('标记起点', ...)` 造出来的 —— 于是
+// peopleDigest 会把他自己的路标当成"认识的人"念进提示词：
+//   - 标记起点（一般）：起点 (100.48,59,14.3) 开始做路标
+//
+// 判据分两层，名字特征词只是**辅助**，主判据在 index.js：
+//   名字带地点词 + 从没说过话/没有互动 -> 不记成"人"
+// 真人玩家 ID 里也可能带"标记"，所以只看名字会误杀 —— 说过话的一律放行。
+// ============================================================
+const PLACE_WORD_RE = /(起点|终点|标记|路标|基地|矿洞|矿口|营地|集合点|传送点|路口|门口|入口|出口)/
+
+/** 名字看起来像地名（只是辅助判据，单靠它会误杀真人） */
+function looksLikePlaceName (name) {
+  const n = String(name || '').trim()
+  if (!n) return false
+  return PLACE_WORD_RE.test(n)
+}
+
 /** 不是人名的词 */
 const NAME_STOP = new Set([
   '我们', '他们', '你们', '咱们', '大家', '自己', '别人', '有人', '某人',
@@ -391,10 +439,12 @@ function firstPlace (text) {
   return best ? best.w : null
 }
 
-function normalizeWho (given, text, known) {
+function normalizeWho (given, text, known, mainAccount) {
   const arr = Array.isArray(given) ? given.filter(Boolean) : (given ? [given] : [])
-  if (arr.length) return arr.slice(0, 6)
-  return extractPeople(text, known)
+  const src = arr.length ? arr : extractPeople(text, known)
+  // 测试小号不挂在谁头上（UNHUMAN-SCAN #13）：
+  // 混在真人里的测试号也摘掉，免得「XJJHOME6 和 老王」变成两条人际关系。
+  return src.filter(n => !isTestAccount(n, mainAccount)).slice(0, 6)
 }
 
 /** 情绪强度 */
@@ -532,7 +582,7 @@ function condense (text) {
  * @returns {{social,grievance,promise,danger,placeWord,placeKnowledge,resource,lesson,discovery,gain,emotion,any,strong,who,where}}
  */
 function scan (t, ctx = {}) {
-  const who = normalizeWho(ctx.who, t)
+  const who = normalizeWho(ctx.who, t, null, ctx.mainAccount)
   const where = ctx.where || firstPlace(t)
 
   const social = SIG.social.test(t)
@@ -635,12 +685,23 @@ function admit (input = {}) {
   const t = stripped.trim()
 
   if (t.length < 2) return drop('too short')
+
+  // ---- A00. 测试小号不进记忆（UNHUMAN-SCAN #13） ----
+  // 「第一次见到 XJJHOME6」这类条目只有测试号一个 who，直接丢掉，
+  // 不进 entries、也不进"认识的人"。
+  const givenWho = Array.isArray(input.who) ? input.who.filter(Boolean)
+    : (input.who ? [input.who] : [])
+  const guessWho = givenWho.length ? givenWho : extractPeople(t)
+  if (guessWho.length && guessWho.every(n => isTestAccount(n, input.mainAccount))) {
+    return drop('test account')
+  }
+
   for (const re of CHITCHAT) if (re.test(t)) return drop('chitchat')
 
   // ---- A0. 死亡：机器写的死法翻成人话，这是真记忆 ----
   const death = normalizeDeath(t)
   if (death) {
-    const who = normalizeWho(input.who, t)
+    const who = normalizeWho(input.who, t, null, input.mainAccount)
     const where = input.where || firstPlace(t)
     return keep(
       where ? `${where}那儿${death.text}` : death.text,
@@ -657,7 +718,7 @@ function admit (input = {}) {
 
   // ---- A1. 别种写法的死：'草，被僵尸挠死了' ----
   if (isSelfDeath(t)) {
-    const who = normalizeWho(input.who, t)
+    const who = normalizeWho(input.who, t, null, input.mainAccount)
     const where = input.where || firstPlace(t)
     return keep(
       condense(t).slice(0, 60),
@@ -679,7 +740,7 @@ function admit (input = {}) {
   if (lf) {
     const rule = lessonFrom(lf[1], lf[2])
     if (!rule) return drop('task result')
-    const who = normalizeWho(input.who, t)
+    const who = normalizeWho(input.who, t, null, input.mainAccount)
     return keep(rule, KINDS.SKILL, {
       who, importance: 0.7, emotion: 0, reason: 'lesson'
     })
@@ -763,6 +824,8 @@ function judge (text, ctx = {}) {
 module.exports = {
   admit,
   judge,
+  isTestAccount,
+  looksLikePlaceName,
   scan,
   condense,
   isTaskLog,

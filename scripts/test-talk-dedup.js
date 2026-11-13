@@ -104,6 +104,13 @@ function mkTalk (opts = {}) {
   const llm = mkLLM(opts.lines || [])
   const mem = opts.mem || mkMem()
   const talk = new Talk(bot, llm, mem, mkCtx(dir, opts.ctx))
+  // 这个文件测的是**去重**（同一条只回一次 / 不同的话都要回），不是发言速率。
+  // 发言限速（5 秒 1 条）是另一条线（B 方案），会让"不同的话都回"这种用例
+  // 在 5 秒内被限速拦掉 —— 那是限速在正常工作，不是去重坏了。这里关掉它再测。
+  talk.sayGapMs = 0
+  talk.fastSayGapMs = 0
+  talk.sayWindowMax = 1e9
+  talk.sayWindow = []
   return { talk, sent, bot, llm, mem, dir }
 }
 

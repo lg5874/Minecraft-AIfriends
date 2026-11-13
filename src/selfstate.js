@@ -31,6 +31,43 @@ const TOOL_CN = {
   pickaxe: '镐子', axe: '斧头', shovel: '铲子', sword: '剑'
 }
 
+/**
+ * 游戏内时间说人话。
+ *
+ * MC 一天 24000 tick = 20 分钟现实时间：
+ *   0      清晨/日出
+ *   6000   正午
+ *   12000  日落开始
+ *   13000  天黑
+ *   18000  深夜（怪物最多）
+ *   23000  天快亮
+ *
+ * 【2026-11-13 UNHUMAN-SCAN #12】这段原来只藏在 perceive.js 的
+ * describeTerrain() 里，而那段在正常路径上根本不执行。
+ * 挪到 selfstate 后每轮都进提示词。
+ */
+function describeTod (tod) {
+  if (tod === null || tod === undefined || !isFinite(tod)) return null
+  const t = ((tod % 24000) + 24000) % 24000
+  if (t < 1000) return { text: '天刚亮，太阳刚出来', phase: 'dawn', night: false }
+  if (t < 11000) return { text: '白天，太阳挂着', phase: 'day', night: false }
+  if (t < 12500) return { text: '太阳开始偏西，天要黑了', phase: 'dusk', night: false }
+  if (t < 13500) return { text: '天正在黑下来', phase: 'nightfall', night: true }
+  if (t < 22500) return { text: '天已经黑透了，外面危险', phase: 'night', night: true }
+  if (t < 23500) return { text: '天快亮了，再撑一会儿', phase: 'predawn', night: true }
+  return { text: '天亮了', phase: 'sunrise', night: false }
+}
+
+/**
+ * 当前活着的 Mood 实例（可能还没有 —— 构造顺序上 selfstate 在前）。
+ * 拿不到就当没有，绝不让提示词因为心情模块崩掉。
+ */
+let Mood = null
+try { Mood = require('./mood') } catch (e) {}
+function safeMood () {
+  try { return (Mood && typeof Mood.active === 'function') ? Mood.active() : null } catch (e) { return null }
+}
+
 class SelfState {
   constructor (bot, ctx) {
     this.bot = bot
@@ -91,6 +128,22 @@ class SelfState {
 
     const held = bot.heldItem ? bot.heldItem.name : null
 
+    // ===== 游戏内时间 =====
+    //
+    // 【2026-11-13 UNHUMAN-SCAN #12】25 分钟里"天亮了"两次，他完全无感。
+    // perceive.js 的 describeTerrain() 里其实算了 tod，但那段只在
+    // lookAround3D 失败时才会跑到 —— 正常情况根本不执行。
+    // 所以"天黑了/天亮了"从来没进过提示词。
+    //
+    // 这里放进 selfstate 的 snapshot：它的 prompt() 是**永远**在提示词里的
+    // （main.js 的 contextForTask 第一个拼的就是 selfBlock），
+    // 放这儿保证他每轮都知道现在是什么时候。
+    let tod = null
+    try {
+      const bt = bot.time && bot.time.timeOfDay
+      if (bt !== undefined && bt !== null) tod = Number(bt)
+    } catch (e) {}
+
     return {
       health: Math.round(bot.health),
       food: Math.round(bot.food),
@@ -100,6 +153,7 @@ class SelfState {
       tools,
       invSlots: items.reduce((a, b) => a + b.count, 0),
       slotsUsed: items.length,
+      tod,
       time: Date.now()
     }
   }
@@ -155,6 +209,43 @@ class SelfState {
       if (events) events.push('health_low', {}, msg)
     }
 
+    // ===== 天黑了 / 天亮了 =====
+    //
+    // 【2026-11-13 UNHUMAN-SCAN #12】
+    // 25 分钟里天亮了两次，他一次都没反应 —— 因为他只有一个静态的时间标签，
+    // 没有"变化"。真人不会盯着刻度看，但天暗下来那一下一定注意到了。
+    // 这里在相位翻转的那一刻记一条变化，进"刚刚发生"，他就能提一句。
+    const a = describeTod(prev.tod)
+    const b = describeTod(now.tod)
+    if (a && b && a.phase !== b.phase) {
+      const dawn = !a.night && b.night      // 白天 → 夜里
+      const msg = dawn ? '天黑了，外面开始刷怪' : (a.night && !b.night ? '天亮了，外面安全了' : null)
+      if (msg) {
+        this.changes.push({ at: Date.now(), what: msg, kind: dawn ? 'nightfall' : 'sunrise' })
+        log(`[tod] ${msg}（tod ${Math.round(prev.tod)} → ${Math.round(now.tod)}）`)
+      }
+    }
+
+    // ===== 累垮了 / 缓过来了 =====
+    //
+    // 【#10 行为后果】休息周期是 mood 里推进的，但"他自己注意到"这件事得有人写下来。
+    // 这里盯着转场打一行，同时进"刚刚发生" —— 这样他下一轮就知道自己刚歇过 / 该歇了。
+    const mood = safeMood()
+    if (mood) {
+      const rs = mood.restState()
+      if (rs.resting && !this._wasResting) {
+        this._wasResting = true
+        const msg = `你累垮了（精力 ${Math.round(mood.energy * 100)}%），自己停下来歇着了`
+        this.changes.push({ at: Date.now(), what: msg, kind: 'exhausted' })
+        log(`[rest] ${msg}`)
+      } else if (!rs.resting && this._wasResting) {
+        this._wasResting = false
+        const msg = `歇够了（精力 ${Math.round(mood.energy * 100)}%），可以起来干活了`
+        this.changes.push({ at: Date.now(), what: msg, kind: 'rested' })
+        log(`[rest] ${msg}`)
+      }
+    }
+
     // ===== 手上拿的东西变了 =====
     if (now.held !== prev.held && now.held) {
       // 只记"从工具换成非工具"这种情况（说明他在干别的）
@@ -206,6 +297,63 @@ class SelfState {
     // 状态
     lines.push(`血 ${s.health == null ? '?' : s.health}/20，饿 ${s.food == null ? '?' : s.food}/20，背包 ${s.slotsUsed == null ? '?' : s.slotsUsed}/36 格，手上是 ${s.held ? s.held.replace(/_/g, ' ') : '空手'}`)
 
+    // ===== 痛觉 =====
+    //
+    // 【BLIND-TEST L547 / L659】血 6 还在往下挖，一直挖到淹死。
+    // 血条早就在他"眼前"了（上面那行），但没人告诉他"这意味着什么、现在该干什么"。
+    // 只报数字不够 —— 跟时间那条一样，得给出后果。
+    if (s.health != null) {
+      if (s.health <= 6) {
+        lines.push('你现在伤得很重，随时会死。**别再挖了**：先离开水/岩浆/怪，吃东西回血。')
+      } else if (s.health <= 10) {
+        lines.push('你身上在疼，血不多了 —— 别接硬活，先保证自己不会死。')
+      }
+    }
+
+    // ===== 游戏内时间 =====
+    //
+    // 【2026-11-13 UNHUMAN-SCAN #12】他之前完全不知道现在是白天还是黑夜。
+    // 天黑躲藏的条件还绑在血量上（血全程 20/20，永不触发），
+    // 所以入夜了他照样在外面晃，一点反应都没有。
+    //
+    // 这里把时间摆到他眼前，并且天黑时直接给出"该干什么"的提示 ——
+    // 只报时间不够，他看完照样挖；要让他知道天黑意味着什么。
+    const todInfo = describeTod(s.tod)
+    if (todInfo) {
+      lines.push('时间：' + todInfo.text)
+      if (todInfo.night) {
+        lines.push('注意：外面在刷怪。要么回家，要么点个火把，别在黑地里硬待')
+        // 【REAL-STATUS】天黑原来只对"血少"的人有意义（血<=14 才躲）。
+        // 血满的人天黑之后毫无反应。这里按血量给不同的"该警觉到什么程度"。
+        if (s.health != null && s.health > 14) {
+          lines.push('你血是满的，不用慌着躲，但天黑了得留个心眼 —— 手上没火把就早点回屋，别在黑地里磨。')
+        }
+      }
+      // 【#12 可观测】光在代码里拼进去不算数，得能从日志里证明它真的进了提示词。
+      // 五分钟记一次，不刷屏。
+      const nowT = Date.now()
+      if (!this._lastTodLog || nowT - this._lastTodLog > 5 * 60 * 1000) {
+        this._lastTodLog = nowT
+        try {
+          const log = this.ctx && this.ctx.log
+          if (log) log(`[tod] 提示词含时间：${todInfo.text}（tod=${Math.round(s.tod)}${todInfo.night ? '，夜间' : '，白天'}）`)
+        } catch (e) {}
+      }
+    }
+
+    // ===== 身体感觉（精力/困） =====
+    //
+    // 【#10 · #11】累不是标签，得变成下一步做什么。
+    // 这里接 mood.bodyPrompt()：累垮了就说"这轮别接活、坐下歇着"，
+    // 凌晨就说"几点了，你其实想下"。原来这些只在聊天提示词里，
+    // 干活的提示词（contextForTask）里一个字都没有 —— 所以他照挖不误。
+    const mood = safeMood()
+    if (mood) {
+      let body = ''
+      try { body = mood.bodyPrompt() || '' } catch (e) {}
+      if (body) lines.push(body)
+    }
+
     // 最近发生的变化（他自己注意到的）
     const recent = (this.changes || []).filter(c => Date.now() - c.at < 120000).slice(-4)
     if (recent.length) {
@@ -231,3 +379,4 @@ class SelfState {
 }
 
 module.exports = SelfState
+module.exports.describeTod = describeTod

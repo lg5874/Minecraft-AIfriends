@@ -19,6 +19,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 const LEAF_ROW_PCT = 0.6
 
 /**
+ * 安全落差（格）。
+ *
+ * MC 摔伤公式：damage = floor(fallDistance - 3.0)。
+ * 也就是说 **3.0 格整好 0 伤，第 4 格开始掉血** —— 这里是硬边界，不是感觉。
+ * pathfinder 的 maxDropDown 默认是 4，main.js 已经调到 3；但 maxDropDown
+ * 只管"寻路走路"，管不到「站着挖掉自己脚下那一格」。所以挖穿检查和
+ * 手动前进都用这个常量，跟 main.js 的 3 保持一致。
+ */
+const SAFE_DROP = 3
+
+/**
  * 方块名 -> 挖掉后掉什么物品。
  * 这是个大坑：mine('lapis_ore') 挖掉了方块，但背包里收到的是 lapis_lazuli，
  * 所以 countOf('lapis_ore') 永远是 0，看起来像"挖到0块"。
@@ -109,9 +120,257 @@ class Actions {
     this.ctx = ctx
     this.cancel = false
     this.current = ''
+
+    // ===== 静止自救 watchdog（修 UNHUMAN-SCAN #5）=====
+    //
+    // 实测事故：站在 61,32,-10 这一格 270 秒（4.5 分钟），坐标一个数字没变，
+    // 同期日志刷着 482 次「走不通了」。玩家旁观 30 秒就知道这号卡了。
+    //
+    // 为什么光修 goto 不够：
+    //   goto 修好后，"走不通"会变少，但只要某个调用方在 while 里反复重试
+    //   同一个不可达目标，人还是会原地不动。所以需要一层**不依赖调用方**的兜底。
+    //
+    // 设计：每 3 秒看一次位置。连续 STUCK_MS 没挪窝就强制换个动作：
+    //   1. 挖脚下一格（最容易见效 —— 掉下去也是动了）
+    //   2. 挖前方一格
+    //   3. 随便走两步
+    //   4. 跳一下（至少坐标变了）
+    // 每次自救后重置计时，避免连续触发。
+    this.STUCK_MS = 20000          // 20 秒没动就自救（原 270 秒；验收要求 <30 秒，
+                                   // 阈值必须留出「每 3 秒检查一次 + 自救要 1~2 秒」的余量）
+    this._stuckPos = null
+    this._stuckSince = 0
+    this._lastRescueAt = 0
+    this._rescueCount = 0
+    this._watchdog = null
+    this._rescuing = false         // 自救进行中，别叠加（挖不动时 dig 可能挂着）
+    this._navIntentAt = 0          // 最近一次「真的要求他走路」的时间（goto / gotoVertical 设）
+    this._idleStill = 0            // 因「没有走路意图」而被忽略的静止次数（调试用）
+
+    // ===== 同一个目标连续走不通：退避 + 冷处理（修 #6 的刷屏）=====
+    //
+    // 实测（本地 Paper 1.21.11，300 秒死循环重试不可达目标）：
+    // 只有起步宽限时，仍然是每 1.56 秒一条「走不通了」——
+    // 因为宽限只让**单次** goto 不再假失败，挡不住调用方 while 重试。
+    //
+    // 所以按目标记账：连续失败 3 次 -> 冷处理 60 秒，
+    // 期间直接返回 false（不 setGoal，不抽搐，不刷日志）。
+    // 人走出 8 格以上就解除冷却（地形变了，可能又能走了）。
+    this._gotoFails = new Map()
   }
 
-  log (s) { if (this.ctx && this.ctx.log) this.ctx.log('[act] ' + s) }
+  log (s) {
+    // 留一份「最后一行在干什么」。摔死归因要用：this.current 只有 goto 会写，
+    // 大多数手动动作没写 current，但每个动作都会 log 一行 [act]。
+    this._lastLog = String(s)
+    this._lastLogAt = Date.now()
+    if (this.ctx && this.ctx.log) this.ctx.log('[act] ' + s)
+  }
+
+  /** 启动静止自救。main.js 在 spawn 后调用一次即可，重复调用无副作用。 */
+  startWatchdog () {
+    if (this._watchdog) return
+    this._watchdog = setInterval(() => {
+      try { this._checkStuck() } catch (e) {}
+    }, 3000)
+    // 别拖住进程退出
+    if (this._watchdog.unref) this._watchdog.unref()
+
+    // 落差观测：50ms 采样。摔死以后日志里能直接查到「摔之前多大落差、在干什么」。
+    this._fallTimer = setInterval(() => {
+      try { this.trackFall() } catch (e) {}
+    }, 50)
+    if (this._fallTimer.unref) this._fallTimer.unref()
+
+    // 死亡时补一句：死前 15 秒内有过坠落就把那次的落差/动作打出来。
+    // 不改 main.js 的 [death] 归因，只多一行证据。
+    try {
+      this.bot.on('death', () => {
+        const f = this.lastFall
+        if (f && Date.now() - f.at < 15000) {
+          this.ctx.log(`[fall] 死前 ${Math.round((Date.now() - f.at) / 1000)}s 内有过 ${f.drop} 格坠落（动作=${f.act}）@ ${f.x},${f.y},${f.z}`)
+        }
+      })
+    } catch (e) {}
+  }
+
+  stopWatchdog () {
+    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null }
+    if (this._fallTimer) { clearInterval(this._fallTimer); this._fallTimer = null }
+  }
+
+  /**
+   * 静止检测。超时就自救。
+   * 注意：这里**不抛错、不设 cancel**，只是换动作 ——
+   * 上层任务该继续跑就继续跑，自救只是把他挪出死格。
+   */
+  _checkStuck () {
+    const bot = this.bot
+    if (!bot || !bot.entity || !bot.entity.position) return
+    if (!this.ctx || typeof this.ctx.log !== 'function') return
+
+    const p = bot.entity.position
+    const now = Date.now()
+
+    // ===== 只在「确实要求他走路」的时候才判定卡住 =====
+    //
+    // 老版本不区分「卡住了」和「本来就该站着」：
+    // LLM 写 await actions.wait(60) 等模型、合成、看箱子、蹲着跟人说话，
+    // 20~30 秒后 watchdog 会往脚底下挖一格 —— 在家门口挖漏地板，
+    // 这是误触发，比不动更糟。
+    //
+    // 判据：goto / gotoVertical 最近 8 秒内设过寻路目标。
+    // 没有 -> 不是卡住，是正常静止；把计时器归零，别攒着旧账。
+    if (now - (this._navIntentAt || 0) > 8000) {
+      this._stuckPos = p.clone()
+      this._stuckSince = now
+      this._idleStill++
+      return
+    }
+    if (this._rescuing) return
+
+    if (!this._stuckPos) { this._stuckPos = p.clone(); this._stuckSince = now; return }
+
+    const moved = p.distanceTo(this._stuckPos)
+    if (moved > 0.6) {
+      // 动了，重置
+      this._stuckPos = p.clone()
+      this._stuckSince = now
+      return
+    }
+
+    const still = now - this._stuckSince
+    if (still < this.STUCK_MS) return
+    if (now - this._lastRescueAt < 8000) return    // 自救也有冷却，别自己把自己刷屏
+
+    this._lastRescueAt = now
+    this._stuckSince = now
+    this._stuckPos = p.clone()
+    this._rescueCount++
+    this.log(`[stuck] 同一格站了 ${Math.round(still / 1000)} 秒（${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}），强制换个动作（第 ${this._rescueCount} 次）`)
+    this._rescue().catch(() => {})
+  }
+
+  /** 卡住时换动作。按"最容易见效"排序，失败就下一个。 */
+  async _rescue () {
+    if (this._rescuing) return          // 上一次自救还没结束，别叠加
+    this._rescuing = true
+    try {
+      await this._rescueSteps()
+    } finally {
+      this._rescuing = false
+    }
+  }
+
+  /**
+   * 自救动作本体。
+   *
+   * 所有 dig 都套 timeout：基岩/黑曜石/服务器不回包的时候
+   * bot.dig 会一直挂着 —— 那样 _rescue 永远不返回，
+   * 自救就变成"卡死在一个 await 里"，比不动还糟。
+   */
+  async _rescueSteps () {
+    const bot = this.bot
+    const digSafe = async (blk, ms = 4000) => {
+      try {
+        await Promise.race([bot.dig(blk, true), sleep(ms)])
+        try { bot.stopDigging() } catch (e) {}
+      } catch (e) {}
+    }
+
+    const p0 = this.pos()
+
+    // 1. 挖脚下一格 —— 掉下去也是动了，而且常常直接打开新路
+    //
+    // 【2026-11-14 摔死修复】挖之前先探下面有多深。这条最早的自救分支
+    // 以前是「下面不是岩浆/水就挖」，下面是个峡谷/竖井也一样挖穿，
+    // 人直接自由落体 —— maxDropDown 管不到手动挖方块。
+    try {
+      const below = bot.blockAt(p0.offset(0, -1, 0))
+      if (below && below.boundingBox === 'block' &&
+          !/bedrock|lava|water/.test(below.name) &&
+          this.safeToDigBelow()) {
+        await this.bestToolFor(below)
+        await digSafe(below)
+        await sleep(500)
+        if (this.pos().distanceTo(p0) > 0.6) {
+          this.log('[stuck] 挖脚下生效')
+          return
+        }
+      }
+    } catch (e) {}
+
+    // 1.5 掉进坑里：挖出一级台阶再跳上去
+    //
+    // 老版本只会挖「脚边（dy=0）+ 头顶（dy=1）」同一层，
+    // 在 2 格深的坑里等于横着打洞 —— 越挖越出不来。
+    // 实测工作测试：卡在 (31,-61,50) 55 秒，自救 5 次都没出去。
+    //
+    // 正确做法：挖侧上方（dy=1）和再上面（dy=2），
+    // 挖完那一格的地面就是一级台阶，跳上去就出来了。
+    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5)) {
+      try {
+        const p = this.pos()
+        const step1 = bot.blockAt(p.offset(dx, 1, dz))   // 台阶面
+        if (!step1 || step1.boundingBox !== 'block') continue
+        const step2 = bot.blockAt(p.offset(dx, 2, dz))   // 台阶上方要留头
+        for (const b of [step1, step2]) {
+          if (!b || b.boundingBox !== 'block') continue
+          if (/bedrock|lava|water/.test(b.name)) continue
+          await this.bestToolFor(b)
+          await digSafe(b, 4000)
+          await sleep(200)
+        }
+        // 【摔死修复】原来是裸 forward 600ms + jump。挖出来的台阶下面
+        // 未必有底，走空就是白摔。manualStep 会先看前方落差（限 1 格）。
+        await this.manualStep(dx, dz, 900, { jump: true, maxDrop: 1 })
+        await sleep(300)
+        if (this.pos().distanceTo(p0) > 0.6) {
+          this.log('[stuck] 挖台阶跳上去了')
+          return
+        }
+      } catch (e) {}
+    }
+
+    // 2. 挖前方一格（挑一个方向）
+    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5)) {
+      try {
+        const p = this.pos()
+        for (const dy of [0, 1]) {
+          const b = bot.blockAt(p.offset(dx, dy, dz))
+          if (!b || b.boundingBox !== 'block') continue
+          if (/bedrock|lava|water/.test(b.name)) continue
+          await this.bestToolFor(b)
+          await digSafe(b, 3000)
+          await sleep(250)
+        }
+        await this.walkToward(dx, dz, 900)
+        await sleep(300)
+        if (this.pos().distanceTo(p0) > 0.6) {
+          this.log('[stuck] 挖前方生效')
+          return
+        }
+      } catch (e) {}
+    }
+
+    // 3. 随便走两步
+    try {
+      await this.wander(6)
+      if (this.pos().distanceTo(p0) > 0.6) {
+        this.log('[stuck] 走动生效')
+        return
+      }
+    } catch (e) {}
+
+    // 4. 最后兜底：跳一下（坐标至少变了，玩家看着不像死机）
+    try {
+      bot.setControlState('jump', true)
+      await sleep(300)
+      bot.setControlState('jump', false)
+      await sleep(300)
+    } catch (e) {}
+    this.log('[stuck] 挖不动也走不动，只跳了一下')
+  }
 
   // ---------------- 基础工具 ----------------
 
@@ -129,6 +388,195 @@ class Actions {
   }
 
   pos () { return this.bot.entity.position }
+
+  // ==================== 坠落防护 / 挖穿检查 ====================
+  //
+  // 【为什么补这一层 · 2026-11-14】
+  // 实测死因是 fall（p8-surface.log:568-569 `摔下来了，血剩 20`、
+  // `[hurt] 环境伤害 fall`），memory 里 `112,19那儿死了一回（摔下来了）`
+  // repeat=2。而 `moves.maxDropDown = 3` 只约束 **pathfinder 走路**时选的下落，
+  // 对下面两件事完全无效：
+  //
+  //   1. **站着挖掉自己脚下那一格**。下面是洞/竖井/峡谷时人直接自由落体。
+  //      `_checkStuck` 的自救第一招就是「挖脚下一格」（`[stuck] 挖脚下生效`），
+  //      这里以前**从来没看过下面有多深**；digStone 的「直接往下挖」、
+  //      mine 的 descend、gotoVertical 的下挖分支也一样。
+  //      maxDropDown 对它们一格都管不到 —— 这就是"调 maxDropDown 修不好摔死"的原因。
+  //   2. **7 处 `setControlState('forward')` 手动前进**：前方是悬崖也照走，
+  //      走空就是自由落体。
+  //
+  // 所以这里补三件东西：
+  //   - `dropAfterDigBelow()` / `safeToDigBelow()`：挖脚下之前先探下面几格是空的；
+  //   - `manualStep()`：手动前进的统一入口，走之前 + 走的过程中都看前方落差；
+  //   - `trackFall()`：每次离地→落地记一次落差，>=3 格写 `[fall]`（带动作/血量/
+  //     坐标），死了以后能直接回答「摔死前在干什么」。
+
+  /**
+   * 挖掉脚下这一格之后会往下掉几格。
+   *
+   * @returns {{drop:number, why:string}}
+   *   drop = 0..n 实际落差；99 = 下面有岩浆；-1 = 探不到底/脚下没方块（都当危险）
+   */
+  dropAfterDigBelow (x, y, z, probe = 8) {
+    const fx = Math.floor(x)
+    const fy = Math.floor(y)
+    const fz = Math.floor(z)
+    const under = this.bot.blockAt(new Vec3(fx, fy - 1, fz))
+    if (!under || under.boundingBox !== 'block') {
+      return { drop: -1, why: '脚下本来就没方块' }
+    }
+    for (let d = 2; d <= probe; d++) {
+      const b = this.bot.blockAt(new Vec3(fx, fy - d, fz))
+      if (!b) return { drop: -1, why: '区块没加载' }
+      // 先判液体再判碰撞盒：真实注册表里 water/lava 的 boundingBox 是 empty，
+      // 但顺序写反了（先判 block）就会把液体当成实地，所以这里写死顺序。
+      if (/lava/.test(b.name)) return { drop: 99, why: '下面有岩浆' }
+      if (/water/.test(b.name)) return { drop: 0, why: '下面有水，落水不摔' }
+      if (b.boundingBox === 'block') return { drop: d - 1, why: '' }
+    }
+    return { drop: -1, why: `往下 ${probe} 格还没探到底` }
+  }
+
+  /** 挖脚下这一格安全吗？不安全就打一行日志，调用方跳过这次挖掘。 */
+  safeToDigBelow (probe = 8) {
+    const p = this.pos()
+    const r = this.dropAfterDigBelow(p.x, p.y, p.z, probe)
+    if (r.drop >= 0 && r.drop <= SAFE_DROP) return true
+    const danger = r.drop === 99
+      ? '下面有岩浆'
+      : (r.drop > SAFE_DROP ? `挖穿要摔 ${r.drop} 格` : (r.why || '下面探不到底'))
+    this.log(`[dig] 不挖脚下了：${danger}`)
+    return false
+  }
+
+  /** 这一列从脚底往下第一块实地有多远（落差格数）；-1 = 探不到底/危险 */
+  dropBelow (x, y, z, probe = 5) {
+    const fy = Math.floor(y)
+    for (let d = 1; d <= probe; d++) {
+      const b = this.bot.blockAt(new Vec3(Math.floor(x), fy - d, Math.floor(z)))
+      if (!b) return -1
+      if (/lava/.test(b.name)) return 99
+      if (/water/.test(b.name)) return 0      // 落水不摔
+      if (b.boundingBox === 'block') return d - 1
+    }
+    return -1
+  }
+
+  /**
+   * 前方那一格能不能踩：落差 <= maxDrop 才放行。
+   * 1 格高的台阶（脚格是实的、头格是空的）算能走 —— 那是往上跳，不是走空。
+   */
+  canStepTo (dx, dz, maxDrop = 2) {
+    const p = this.pos()
+    const fy = Math.floor(p.y)
+    const nx = Math.floor(p.x) + dx
+    const nz = Math.floor(p.z) + dz
+    const feet = this.bot.blockAt(new Vec3(nx, fy, nz))
+    const head = this.bot.blockAt(new Vec3(nx, fy + 1, nz))
+    if (!feet || !head) return false              // 区块没加载，别冒险
+    if (head.boundingBox === 'block') return false
+    if (/lava|water/.test(feet.name)) return false
+    if (feet.boundingBox === 'block') {
+      // 1 格台阶：上面再盖一层就走不过去了，能过就是往上跳
+      const above = this.bot.blockAt(new Vec3(nx, fy + 2, nz))
+      if (!above || above.boundingBox === 'block') return false
+      return true
+    }
+    const drop = this.dropBelow(nx, p.y, nz, Math.max(3, maxDrop + 2))
+    if (drop < 0) return false
+    return drop <= maxDrop
+  }
+
+  /**
+   * 手动走一步（替代裸 `setControlState('forward')`）。
+   * 走之前看一眼前方，走的过程中每 60ms 再看一次；前方落差 > maxDrop 立刻松手。
+   * 返回 true = 真的挪动了。
+   */
+  async manualStep (dx, dz, ms = 400, opts = {}) {
+    const bot = this.bot
+    const maxDrop = opts.maxDrop == null ? 2 : opts.maxDrop
+    const sx = Math.sign(dx)
+    const sz = Math.sign(dz)
+    if (!sx && !sz) return false
+    const p0 = this.pos().clone()
+    if (!this.canStepTo(sx, sz, maxDrop)) {
+      this.log(`[step] 前方没落脚点（${sx},${sz}），不走`)
+      return false
+    }
+    try {
+      // yaw 约定（prismarine-physics: forward = (-sin yaw, -cos yaw)）：
+      // 朝向 (dx,dz) 的 yaw 是 atan2(-dx, -dz)。
+      // 老代码里有几处写成 atan2(-dx, +dz)，实际是**反方向**走 ——
+      // 日志里「距树 6.1 -> 9.4 格」就是它造成的。这里统一用正确公式。
+      if (!opts.keepLook) await bot.look(Math.atan2(-sx, -sz), 0, true)
+      bot.setControlState('forward', true)
+      if (opts.jump) bot.setControlState('jump', true)
+      const t0 = Date.now()
+      let unsafe = false
+      while (Date.now() - t0 < ms) {
+        await sleep(60)
+        if (this.cancel) break
+        if (!this.canStepTo(sx, sz, maxDrop)) { unsafe = true; break }
+      }
+      bot.setControlState('forward', false)
+      bot.setControlState('jump', false)
+      await sleep(120)
+      if (unsafe) this.log('[step] 前方落差超了，提前松手')
+      return this.pos().distanceTo(p0) > 0.2
+    } catch (e) {
+      try { bot.setControlState('forward', false) } catch (e2) {}
+      try { bot.setControlState('jump', false) } catch (e2) {}
+      return false
+    }
+  }
+
+  /**
+   * 离地→落地的落差观测。50ms 一次（physicsTick 太密又要自己处理解绑）。
+   * 只在 >= 2.5 格时写日志，避免刷屏；`lastFall`/`_recentFalls` 留给死亡归因。
+   */
+  trackFall () {
+    const bot = this.bot
+    const e = bot && bot.entity
+    if (!e || !e.position) return
+    const p = e.position
+
+    // 死亡/复活/传送是瞬移，别把位移算成坠落
+    if (this._fallPrev && (Math.abs(p.x - this._fallPrev.x) > 12 || Math.abs(p.z - this._fallPrev.z) > 12)) {
+      this._airFrom = null
+      this._airPeak = null
+    }
+    this._fallPrev = { x: p.x, y: p.y, z: p.z }
+
+    if (!e.onGround) {
+      if (this._airFrom == null) { this._airFrom = p.y; this._airPeak = p.y } else if (p.y > this._airPeak) this._airPeak = p.y
+      return
+    }
+    if (this._airFrom == null) return
+
+    const from = this._airPeak
+    const drop = from - p.y
+    this._airFrom = null
+    this._airPeak = null
+    if (!(drop >= 2.5)) return
+
+    const under = bot.blockAt(p.offset(0, -0.2, 0))
+    const inWater = !!(under && /water/.test(under.name))
+    const info = {
+      at: Date.now(),
+      drop: Math.round(drop * 10) / 10,
+      fromY: Math.round(from),
+      toY: Math.round(p.y),
+      x: Math.round(p.x),
+      y: Math.round(p.y),
+      z: Math.round(p.z),
+      act: this.current || (this._lastLog && Date.now() - (this._lastLogAt || 0) < 20000 ? this._lastLog : '(空闲)'),
+      health: Math.round(bot.health),
+      water: inWater
+    }
+    this.lastFall = info
+    this._recentFalls = (this._recentFalls || []).concat([info]).slice(-10)
+    this.log(`[fall] 落差 ${info.drop} 格：y ${info.fromY}→${info.toY} @ ${info.x},${info.z}｜动作=${info.act}｜血=${info.health}${inWater ? '｜落水' : ''}`)
+  }
 
   item (name) {
     return this.bot.inventory.items().find(i => i.name === name)
@@ -513,6 +961,32 @@ class Actions {
 
   // ---------------- 走 ----------------
 
+  /**
+   * 记一次「这个目标走不通」，连续 3 次就冷处理 60 秒。
+   * 见 constructor 里的注释：这是为了掐掉 while 重试造成的原地抽搐。
+   */
+  _noteGotoFail (key, x, z) {
+    const now = Date.now()
+    const rec = this._gotoFails.get(key) || { n: 0, at: 0, coolUntil: 0, x: 0, z: 0 }
+    // 两分钟没再失败过，算新的一轮
+    if (now - rec.at > 120000) { rec.n = 0; rec.coolUntil = 0 }
+    rec.n++
+    rec.at = now
+    rec.x = Math.round(x)
+    rec.z = Math.round(z)
+    if (rec.n >= 3 && now >= rec.coolUntil) {
+      rec.coolUntil = now + 60000
+      this.log(`[goto] 同一个目标连续 ${rec.n} 次走不通，先冷处理 60 秒（不再原地重试）`)
+    }
+    this._gotoFails.set(key, rec)
+    // 别让这张表无限长
+    if (this._gotoFails.size > 64) {
+      for (const [k, v] of this._gotoFails) {
+        if (now - v.at > 300000) this._gotoFails.delete(k)
+      }
+    }
+  }
+
   async goto (x, y, z, range = 1, timeoutMs = 30000) {
     this.check()
 
@@ -525,7 +999,35 @@ class Actions {
     this.current = `走到 ${Math.round(x)},${Math.round(y)},${Math.round(z)}`
 
     const p0 = this.pos()
+    const now0 = Date.now()
     const dy = Math.abs(y - p0.y)
+
+    // ===== 同一个目标连续走不通 -> 退避，别再抽搐 =====
+    //
+    // 实测（本地 Paper，2026-11-13）：只加起步宽限时，
+    // 调用方 while 重试一个不可达目标仍然是每 1.56 秒一条「走不通了」
+    // （50 秒 28 条）。人看着就是原地一下一下地抽。
+    //
+    // 这里按目标记账，连续 3 次失败就冷处理 60 秒：
+    //   · 期间直接返回 false，不 setGoal（没有抽搐动作）
+    //   · 不再刷「走不通了」
+    //   · 但 _navIntentAt 照样更新 —— 调用方确实还在要求走路，
+    //     watchdog 该救还是要救
+    //   · 自己走开 8 格以上就解除冷却（地形变了，也许又能走了）
+    const gkey = `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)},${range}`
+    const bad = this._gotoFails.get(gkey)
+    if (bad && bad.coolUntil) {
+      if (now0 - (bad.at || 0) > 120000 ||
+          Math.abs(Math.round(p0.x) - bad.x) + Math.abs(Math.round(p0.z) - bad.z) > 8) {
+        bad.coolUntil = 0
+        bad.n = 0
+      }
+    }
+    if (bad && now0 < bad.coolUntil) {
+      this._navIntentAt = now0
+      await sleep(1000)          // 别让调用方的 while 变成 CPU 死循环
+      return false
+    }
 
     // 目标跟自己不在同一层：先解决高度差，再水平走
     if (dy > 2) {
@@ -542,27 +1044,47 @@ class Actions {
         const canFix = this._canCloseGap(Math.round(y), Math.round(p0.y))
         if (!canFix) {
           this.log(`[goto] 高度差 ${Math.round(dy)} 格，没路可挖，不试了（目标 y=${Math.round(y)}，现在 y=${Math.round(p0.y)}）`)
+          this._noteGotoFail(gkey, p0.x, p0.z)
           return false
         }
       }
       const reached = await this.gotoVertical(y, timeoutMs)
       if (!reached) {
         this.log(`[goto] 高度到不了（目标 y=${Math.round(y)}，现在 y=${Math.round(this.pos().y)}）`)
+        this._noteGotoFail(gkey, p0.x, p0.z)
         return false
       }
     }
 
     const goal = new goals.GoalNear(Math.floor(x), Math.floor(y), Math.floor(z), range)
     this.bot.pathfinder.setGoal(goal)
+    this._navIntentAt = Date.now()
 
     const t0 = Date.now()
     let stillSince = 0
     let lastP = this.pos().clone()
     let lastStatus = ''
 
+    // ===== 起步宽限（P0-2 的真正根因，实测 2026-11-13）=====
+    //
+    // pathfinder.isMoving = () => path.length > 0，
+    // 而 path 要等**第一个 physics tick**（约 50ms）之后才被算出来。
+    // 老代码在 t=0 立刻检查 isMoving()，必然是 false；
+    // 再 sleep(200) 看位置没变，就立刻 `return false` ——
+    // 于是每次 goto 只活 200ms，调用方重试，再 200ms 再失败……
+    //
+    // 实测后果：482 次「走不通了」/1002 秒（每 2.08 秒一次），
+    // 最密的 3 秒各 9 次，玩家看到他在原地疯狂抽搐。
+    //
+    // 修法：给一个起步观察窗口。窗口内既不看 isMoving()，也不判卡住，
+    // 只看"位置有没有开始变"。
+    const STARTUP_GRACE_MS = 900
+    let goalSetAt = Date.now()
+
     try {
       while (Date.now() - t0 < timeoutMs) {
         this.check()
+        this._navIntentAt = Date.now()
 
         const p = this.pos()
         const moved = p.distanceTo(lastP)
@@ -581,40 +1103,57 @@ class Actions {
         const dyAbs = Math.abs(p.y - y)
         const tol = Math.min(range + 1, 3.5)
         if (dxz <= tol && dyAbs <= 2) {
+          this._gotoFails.delete(gkey)
           return true
+        }
+
+        // ===== 起步宽限期内不做失败判定 =====
+        // 这段时间里 pathfinder 可能还没算出路（path 要等第一个 tick），
+        // isMoving() 一定是 false。此时任何"没动"的结论都是假的。
+        const inGrace = Date.now() - goalSetAt < STARTUP_GRACE_MS
+        if (inGrace) {
+          // 只要位置开始变了，就提前结束宽限，进入正常监控
+          if (moved > 0.08) goalSetAt = 0
+          await sleep(120)
+          continue
         }
 
         // 2. pathfinder 说到了，就是到了（别等 goal_reached 事件，可能已错过）
         try {
           const pf = this.bot.pathfinder
           if (pf.isMoving && !pf.isMoving()) {
-            // 没在走：可能到了，也可能走不通
-            // 再等一小会儿确认（用 500ms）
-            await sleep(200)
+            // 没在走：可能到了，也可能走不通。
+            // 宽限期已过，再给一个 600ms 确认窗口（不是原来的 200ms）——
+            // 200ms 不足以让 pathfinder 从"刚停"过渡到"真的没路"。
+            const confirmFrom = this.pos().clone()
+            await sleep(600)
             const p2 = this.pos()
-            if (p2.distanceTo(p) < 0.15) {
-              // 真的停住了
-              const d2 = Math.hypot(p2.x - x, p2.z - z)
-              if (d2 <= range + 3) return true       // 差不多到了
-              // 没到但也不走了 -> 走不通
-              this.log(`[goto] 走不通了（差 ${d2.toFixed(1)} 格）`)
-              return false
+            if (p2.distanceTo(confirmFrom) > 0.15) {
+              // 这 600ms 里又动了：说明只是短暂停顿，继续走
+              continue
             }
-            continue
+            const d2 = Math.hypot(p2.x - x, p2.z - z)
+            if (d2 <= range + 3) { this._gotoFails.delete(gkey); return true }  // 差不多到了
+            // 真的停住了且没到 -> 走不通
+            this.log(`[goto] 走不通了（差 ${d2.toFixed(1)} 格）`)
+            this._noteGotoFail(gkey, p.x, p.z)
+            return false
           }
         } catch (e) {}
 
-        // 3. 卡住判定：连续 6 秒没挪窝
+        // 3. 卡住判定：连续 8 秒没挪窝（宽限期内不计）
         if (moved < 0.1) stillSince += 180
         else stillSince = 0
-        if (stillSince > 6000) {
+        if (stillSince > 8000) {
           this.log(`[goto] 卡住（${stillSince / 1000}秒没动，差 ${Math.hypot(p.x - x, p.z - z).toFixed(1)} 格）`)
+          this._noteGotoFail(gkey, p.x, p.z)
           return false
         }
 
         await sleep(180)
       }
       this.log(`[goto] 超时（${Math.round(timeoutMs / 1000)}秒）`)
+      this._noteGotoFail(gkey, this.pos().x, this.pos().z)
       return false
     } finally {
       try { this.bot.pathfinder.setGoal(null) } catch (e) {}
@@ -683,6 +1222,7 @@ class Actions {
 
     while (Date.now() - t0 < timeoutMs && guard++ < 40) {
       this.check()
+      this._navIntentAt = Date.now()      // 这也是「确实要求他走路」
       const p = this.pos()
       const diff = targetY - p.y
       if (Math.abs(diff) <= 2) return true
@@ -714,6 +1254,7 @@ class Actions {
       try {
         this.bot.pathfinder.setGoal(new goals.GoalNear(
           Math.floor(tx), Math.floor(targetY), Math.floor(tz), 2))
+        this._navIntentAt = Date.now()
         await sleep(1200)
       } catch (e) {}
 
@@ -738,18 +1279,13 @@ class Actions {
           } catch (e) {}
         }
         // 挖出一个能站的地方后跳上去
-        try {
-          await bot.look(0, 0, true)
-          bot.setControlState('jump', true)
-          bot.setControlState('forward', true)
-          await sleep(700)
-          bot.setControlState('jump', false)
-          bot.setControlState('forward', false)
-        } catch (e) {}
+        // 【摔死修复】统一走 manualStep，前方落差 >1 格就不起跳。
+        await this.manualStep(0, 1, 800, { jump: true, maxDrop: 1 })
       } else {
         // 往下挖
         const below = bot.blockAt(p.offset(0, -1, 0))
-        if (below && below.name !== 'air' && !/bedrock|lava|water/.test(below.name)) {
+        if (below && below.name !== 'air' && !/bedrock|lava|water/.test(below.name) &&
+            this.safeToDigBelow()) {
           try {
             await this.bestToolFor(below)
             await bot.dig(below, true)
@@ -2025,6 +2561,13 @@ class Actions {
           await this.wander(12)
           continue
         }
+        // 【摔死修复】挖穿前先看下面几格是不是空的：下面有洞/竖井时
+        // 这一铲子就是自由落体。maxDropDown 对 dig() 无效。
+        if (!this.safeToDigBelow()) {
+          if (got > 0) break
+          await this.wander(12)
+          continue
+        }
         const y0 = p.y
         _t = Date.now()
         const dug = await this.digAt(below)
@@ -2579,16 +3122,11 @@ class Actions {
         }
         // 真的挪一步进去（挖出来的通道要有人走）
         const yBeforeMove = this.pos().y
-        try {
-          const yaw = Math.atan2(-stepX, stepZ)
-          await this.bot.look(yaw, 0, true)
-          this.bot.setControlState('forward', true)
-          await sleep(420)
-          this.bot.setControlState('forward', false)
-          await sleep(160)
-        } catch (e) {
-          try { this.bot.setControlState('forward', false) } catch (e2) {}
-        }
+        // 【摔死修复 + 方向修复】manualStep 用正确的 yaw（atan2(-dx,-dz)），
+        // 老代码是 atan2(-stepX, +stepZ)，物理上正好反方向 ——
+        // 日志里「距树 6.1 -> 9.4 格」就是走反了。同时限落差 1 格。
+        await this.manualStep(stepX, stepZ, 420, { maxDrop: 1 })
+        await sleep(160)
         // 掉下去就停（说明挖穿了地板）
         if (this.pos().y < yBeforeMove - 1.2) {
           this.log('[chop]   挖通道时掉下去了，停手')
@@ -2788,18 +3326,8 @@ class Actions {
         }
 
         // 走进去（朝向 + forward + jump，不用 pathfinder）
-        try {
-          const yaw = Math.atan2(-sx, sz)
-          await this.bot.look(yaw, 0, true)
-          this.bot.setControlState('forward', true)
-          if (needUp) this.bot.setControlState('jump', true)
-          await sleep(needUp ? 680 : 460)
-          this.bot.setControlState('forward', false)
-          this.bot.setControlState('jump', false)
-        } catch (e) {
-          try { this.bot.setControlState('forward', false) } catch (e2) {}
-          try { this.bot.setControlState('jump', false) } catch (e2) {}
-        }
+        // 【摔死修复】统一走 manualStep：前方没落脚点就不迈步。
+        await this.manualStep(sx, sz, needUp ? 680 : 460, { jump: needUp, maxDrop: 1 })
         await sleep(160)
 
         const now = this.pos()
@@ -4752,16 +5280,14 @@ class Actions {
       try { bot.pathfinder.setGoal(null) } catch (e) {}
       if (this.pos().y >= y - 0.15) return true
 
-      try {
+      {
         const p = this.pos()
         await bot.look(Math.atan2(-(x - p.x), -(z - p.z)), 0, true)
-        bot.setControlState('jump', true)
-        bot.setControlState('forward', true)
-        await sleep(420)
-        bot.setControlState('jump', false)
-        bot.setControlState('forward', false)
+        // 【摔死修复】跳之前先看落点：前方落差 >1 格就别跳（跳下去 + 重力更高）
+        await this.manualStep(Math.sign(x - p.x) || 0, Math.sign(z - p.z) || 0, 420,
+          { jump: true, maxDrop: 1, keepLook: true })
         await sleep(450)
-      } catch (e) {}
+      }
       return this.pos().y >= y - 0.15
     }
 
@@ -5399,7 +5925,8 @@ class Actions {
       try {
         const below = bot.blockAt(p.offset(0, -1, 0))
         if (below && below.boundingBox === 'block' &&
-            !/bedrock|lava|water/.test(below.name)) {
+            !/bedrock|lava|water/.test(below.name) &&
+            this.safeToDigBelow()) {
           await this.digAt(below)
           await sleep(250)
           try { await this.pickupNearby(4) } catch (e) {}
@@ -5448,12 +5975,12 @@ class Actions {
     if (this.pos().y >= F + 0.9) return true
 
     // 兜底：手动跳
+    // 【摔死修复】按当前朝向前进，但前方落差 >1 格就不跳。
     try {
-      bot.setControlState('jump', true)
-      bot.setControlState('forward', true)
-      await sleep(420)
-      bot.setControlState('jump', false)
-      bot.setControlState('forward', false)
+      const yaw = bot.entity.yaw
+      const sx = Math.round(-Math.sin(yaw))
+      const sz = Math.round(-Math.cos(yaw))
+      await this.manualStep(sx, sz, 420, { jump: true, maxDrop: 1, keepLook: true })
       await sleep(400)
     } catch (e) {}
     return this.pos().y >= F + 0.9
@@ -6093,6 +6620,12 @@ class Actions {
         try { await this.wander(6) } catch (e) {}
         continue
       }
+      // 【摔死修复】「直接往下挖到石头层」是最容易挖穿地板的一条路：
+      // 脚下那格下面可能是洞穴/峡谷，挖掉就是长距离坠落。
+      if (!this.safeToDigBelow()) {
+        try { await this.wander(6) } catch (e) {}
+        continue
+      }
       try {
         // digAt 返回 false 表示没挖成（够不到/被挡/挖断了）。
         // 原来不管返回值都 depth++，所以日志里会出现「往上挖了0格」。
@@ -6321,6 +6854,90 @@ class Actions {
   }
 
   // 缺原料就去弄（木头/石头这类能从世界上直接拿的）
+  /**
+   * 弄到 n 个能做火把的燃料：优先挖煤，挖不到就烧木炭。
+   *
+   * @returns {number} 弄完以后 coal + charcoal 的总数
+   */
+  async ensureCoal (n) {
+    const have = () => this.countOf('coal') + this.countOf('charcoal')
+    if (have() >= n) return have()
+
+    // 1) 挖煤。coal_ore 从 y=320 往下都有，山地地表就能看见；
+    //    mine() 自己会 ensurePickaxe / 扫描 / 往下找，这里不重复实现。
+    const lack = Math.max(1, n - have())
+    this.log(`[gather] 挖煤 ${lack} 个`)
+    try {
+      await this.mine('coal_ore', lack)
+    } catch (e) {
+      this.log('[gather] 挖 coal_ore 失败：' + humanError(e))
+    }
+    // 深层是 deepslate_coal_ore，mine('coal_ore') 扫不到它
+    if (have() < n) {
+      this.log('[gather] 地表 coal_ore 不够，试深层 deepslate_coal_ore')
+      try { await this.mine('deepslate_coal_ore', Math.max(1, n - have())) } catch (e) {}
+    }
+    if (have() >= n) {
+      this.log(`[gather] 挖到煤，现在 ${have()} 个`)
+      return have()
+    }
+
+    // 2) 挖不到就烧木炭（原木 -> 木炭，配方里 charcoal 那条同样能做火把）
+    const lack2 = Math.max(1, n - have())
+    this.log(`[gather] 煤不够（${have()}），改烧木炭 ${lack2} 个`)
+    try {
+      await this.ensureCharcoal(lack2)
+    } catch (e) {
+      this.log('[gather] 烧木炭失败：' + humanError(e))
+    }
+    return have()
+  }
+
+  /**
+   * 烧木炭。木炭和煤一样能做火把（mcData 里 torch 有两份配方：
+   * coal+stick 和 charcoal+stick）。
+   */
+  async ensureCharcoal (n) {
+    const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log',
+      'acacia_log', 'dark_oak_log', 'cherry_log', 'mangrove_log', 'pale_oak_log']
+    const woodCount = () => logs.reduce((a, l) => a + this.countOf(l), 0)
+    if (woodCount() < n + 1) {
+      try { await this.ensureWood(n + 1) } catch (e) {}
+    }
+    if (woodCount() < 1) throw new Error('没有原木，烧不了木炭')
+
+    // 熔炉：有就用，没有就做（8 圆石）
+    let furnace = false
+    try { furnace = !!this.findBlock('furnace', 24) } catch (e) {}
+    if (!furnace && this.countOf('furnace') === 0) {
+      this.log('[gather] 没有熔炉，先做一个')
+      try { await this.craftSmart('furnace', 1) } catch (e) {
+        this.log('[gather] craftSmart(furnace) 失败：' + humanError(e))
+      }
+      // 【实测 23:56】只调一次 craftSmart('furnace')，失败就直接往下走，
+      // 结果 smelt() 抛「没有熔炉」。圆石不够时 craftSmart 就是会失败 ——
+      // 这里补一次"挖 8 圆石再做"，别让整条炭路白白断掉。
+      if (this.countOf('furnace') === 0) {
+        this.log('[gather] 熔炉还没有，先挖 8 个圆石')
+        try { await this.gather('cobblestone', 8) } catch (e) {}
+        try { await this.craftSmart('furnace', 1) } catch (e) {
+          this.log('[gather] 第二遍做熔炉也失败：' + humanError(e))
+        }
+      }
+    }
+    // 背包里有熔炉就放下来（smelt 需要世界里的方块）
+    try {
+      if (this.countOf('furnace') > 0) await this.placeFromInventory('furnace')
+    } catch (e) {}
+
+    const logName = logs.find(l => this.countOf(l) > 0)
+    if (!logName) throw new Error('没有原木')
+    // 燃料用另一根原木（smelt 不传 fuel 时会自己找煤/木板/原木）
+    this.log(`[gather] 烧木炭：${logName} ×${Math.min(n, this.countOf(logName))}`)
+    await this.smelt(logName, null, Math.min(n, this.countOf(logName)))
+    return this.countOf('charcoal')
+  }
+
   async gather (itemName, count) {
     // 木板 -> 对应原木
     if (/_planks$/.test(itemName)) {
@@ -6337,6 +6954,68 @@ class Actions {
         return n > 0 || this.countOf(itemName) > 0
       } catch (e) { return false }
     }
+    if (itemName === 'torch') {
+      // ===== 火把链 =====
+      //
+      // 【2026-11-13 · 玩家把服改成普通模式】
+      // 这条原来是 `return false` —— gather('torch') 恒失败。
+      // 而 goals 里 iron 要 8 个、diamond 要 16 个、盖房要 6 个火把，
+      // 于是所有要火把的目标都在第一步断掉：没火把 -> 洞里刷怪 -> 一直挨打，
+      // 挖矿也没照明。mining-researcher 早就报过"火把链完全缺失"。
+      //
+      // 完整链：coal / charcoal（1）+ stick（1） -> torch ×4
+      //   · 有煤有棍：直接 craftSmart
+      //   · 缺煤：挖 coal_ore（地表山地/洞里都有）；挖不到就烧木炭
+      //   · 缺棍：craftSmart('stick')
+      // 不自己写合成 —— 一律走 craftSmart（它会自己 ensureTable / 递归补料）。
+      try {
+        if (this.countOf('torch') >= count) return true
+
+        this.log(`[gather] 火把 目标 ${count}（现有 ${this.countOf('torch')}）`)
+
+        // 【顺序很重要】先备料，再合成。
+        //
+        // 实测（2026-11-13 23:32）：原来是"先 blindly craftSmart('torch') 一次，
+        // 失败了再备料"。结果 craftSmart('torch') 发现缺 coal，就递归去
+        // craftSmart('coal', …) —— 而 coal 根本没有配方，它却在候选里绕到 coal_block，
+        // 一路烧到 depth 上限才抛「合成链太深了: coal」，白花 30 秒。
+        // 空的背包 + 要 8 个火把 = 每次都在这个坑里空转。
+        //
+        // 现在：一次合成出 4 个，缺几份料就先备几份（煤 -> 挖/烧，棍 -> 做），
+        // 料齐了再调craftSmart，那条路一次就过。
+        const stillNeed = Math.max(1, Math.ceil((count - this.countOf('torch')) / 4))
+        let coalish = this.countOf('coal') + this.countOf('charcoal')
+        if (coalish < stillNeed) {
+          this.log(`[gather] 火把缺煤（有 ${coalish}，需要 ${stillNeed}），去挖 coal_ore`)
+          coalish = await this.ensureCoal(stillNeed - coalish)
+          this.log(`[gather] 煤/木炭现在 ${coalish} 个`)
+          if (coalish < 1) {
+            // 实测（23:56）：没煤也没炭时，后面的 craftSmart('torch') 会去
+            // 递归 craftSmart('coal') / coal_block，白转 30 秒才抛「合成链太深了」。
+            // 料都没有就别合成了，如实失败。
+            this.log('[gather] 火把做不了：煤和木炭都没有（挖不到煤，也没烧出炭）')
+            return false
+          }
+        }
+        if (this.countOf('stick') < stillNeed) {
+          this.log(`[gather] 火把缺木棍（有 ${this.countOf('stick')}，需要 ${stillNeed}），先做木棍`)
+          try { await this.craftSmart('stick', stillNeed) } catch (e) {
+            this.log('[gather] 做木棍失败：' + humanError(e))
+          }
+        }
+
+        try { await this.craftSmart('torch', count) } catch (e) {
+          this.log('[gather] 做火把失败：' + humanError(e))
+        }
+        const got = this.countOf('torch')
+        this.log(`[gather] 火把 ${got}/${count}`)
+        return got >= count
+      } catch (e) {
+        this.log('[gather] 火把链异常：' + humanError(e))
+        return false
+      }
+    }
+
     const map = {
       cobblestone: ['stone'], stone: ['stone'], cobbled_deepslate: ['deepslate'],
       coal: ['coal_ore'], raw_iron: ['iron_ore'], iron_ore: ['iron_ore'],
@@ -6383,7 +7062,6 @@ class Actions {
         await this.chopTree(Math.max(1, Math.ceil(count / 3)))
         return this.countOf(itemName) >= count
       }
-      if (itemName === 'torch') return false
       if (/_ore$/.test(src[0])) {
         const before = this.countOf(itemName)
         await this.mine(src[0], count)
@@ -7062,17 +7740,9 @@ class Actions {
 
   /** 朝某个方向走（会先转向） */
   async walkToward (dx, dz, ms = 900) {
-    // yaw 约定：0 = +Z，-PI/2 = +X
-    const yaw = Math.atan2(-dx, dz)
-    try {
-      await this.bot.look(yaw, 0, true)
-      await sleep(120)
-      this.bot.setControlState('forward', true)
-      await sleep(ms)
-      this.bot.setControlState('forward', false)
-    } catch (e) {
-      try { this.bot.setControlState('forward', false) } catch (e2) {}
-    }
+    // 统一走 manualStep：前方落差 >1 格就不走。
+    // 这个函数被 digOutSelf（脱困）当主力用，脱困时最常见的地形就是坑边/悬崖。
+    await this.manualStep(dx, dz, ms, { maxDrop: 1 })
   }
 
   /** 自己挖一条路出来（不依赖 reflex） */
@@ -7562,12 +8232,20 @@ class Actions {
           const dz = d.position.z - p2.z
           const len = Math.hypot(dx, dz)
           if (len > 0.3) {
-            await this.bot.look(Math.atan2(-dx, -dz), 0.6, true)
-            this.bot.setControlState('forward', true)
-            this.bot.setControlState('sneak', true)   // 蹲下走，别又从边上掉下去
-            await sleep(420)
-            this.bot.setControlState('forward', false)
-            this.bot.setControlState('sneak', false)
+            // 【摔死修复】这一段本来就是「主动往下走，让重力带过去」，
+            // 是全文件最危险的一处手动前进：先看落差，>2 格就宁可放弃这个物品。
+            const sx = Math.sign(dx) || 0
+            const sz = Math.sign(dz) || 0
+            if (!this.canStepTo(sx, sz, 2)) {
+              await sleep(200)
+            } else {
+              await this.bot.look(Math.atan2(-dx, -dz), 0.6, true)
+              this.bot.setControlState('forward', true)
+              this.bot.setControlState('sneak', true)   // 蹲下走，别又从边上掉下去
+              await sleep(420)
+              this.bot.setControlState('forward', false)
+              this.bot.setControlState('sneak', false)
+            }
           } else {
             // 已经在正上方：直接松手往下掉
             await sleep(300)

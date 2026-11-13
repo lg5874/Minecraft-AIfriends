@@ -130,6 +130,16 @@ class Impulse {
     // 精力低也容易
     if (mood.energy < 0.3) p += 0.1
 
+    // 【UNHUMAN-SCAN #4】刚宣布完计划就翻案，最像"说话不算数"。
+    // 实测：16:42:29 说「东西带齐了，下去转转」，16:42:38 就改成挖金矿。
+    // 不是硬拦 —— 真人也会改主意，但不会 2 秒就改。60 秒内把走神概率打到 1/4。
+    const it = this.ctx.intention ? this.ctx.intention() : null
+    if (it && it.text) {
+      const age = Math.round((Date.now() - (it.at || 0)) / 1000)
+      this.ctx.log(`[impulse] 刚说了「${it.text}」（${age} 秒前），这次走神概率 0.${String(Math.round(p * 100)).padStart(2, '0')} → 0.${String(Math.round(p * 25)).padStart(2, '0')}`)
+      p *= 0.25
+    }
+
     if (Math.random() > p) return null
 
     // 真要走神了：问他自己想干嘛

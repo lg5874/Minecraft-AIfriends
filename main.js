@@ -7,6 +7,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const judge = require('./src/judge')
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements } = require('mineflayer-pathfinder')
 
@@ -21,6 +22,8 @@ const Will = require('./src/will')
 const persona = require('./src/persona')
 const knowledge = require('./src/knowledge')
 const spontaneous = require('./src/spontaneous')
+const { Invite } = require('./src/invite')
+const { Watched: Audience } = require('./src/audience')
 const { Perception } = require('./src/perceive')
 const { PluginAdapter } = require('./src/plugin')
 const { EventQueue } = require('./src/events')
@@ -30,6 +33,12 @@ const Mood = require('./src/mood')
 const { Impulse, classify, judgeFeeling } = require('./src/impulse')
 const { Home } = require('./src/home')
 const { Goals } = require('./src/goals')
+// 代价层：放弃目标要结账、选目标要读记忆（src/cost.js）
+const { Cost } = require('./src/cost')
+// 实例锁：同一个数据目录只允许一个进程（不然 memory.json 会互相覆盖）
+const InstanceLock = require('./src/instance')
+const { ActionLock, REASON } = require('./src/actionlock')
+const { Session } = require('./src/session')
 
 const ROOT = __dirname
 // 数据目录：多实例时每个实例独立（记忆/品味/心情/技能互不干扰）
@@ -53,8 +62,13 @@ class Bot {
     this.running = true
 
     this.mem = new Memory(DATA)
+    // 代价层：账本存在 data/cost.json，记忆写 mem（通过它的公开接口）。
+    // 只记账，不参与主循环；挂了也只是少记一笔，不能把 bot 带崩。
+    this.cost = new Cost(DATA, { mem: this.mem, log: (s) => this.log(s) })
     this.skills = new SkillLibrary(DATA)
-    this.llm = new LLM(cfg.llm)
+    // 【实测 · 2026-11-14】原来没传 log，llm 的切换/失败日志一条都不会出现
+    // 在 main.js 日志里（实机 170s 里 [llm] 计数 = 0，不是没发生，是没打出来）
+    this.llm = new LLM(cfg.llm, (s2) => this.log(s2))
 
     this.actions = null
     this.coder = null
@@ -62,7 +76,18 @@ class Bot {
     this.talk = null
     this.will = null
 
-    this.busy = false
+    // 动作线仲裁：谁在占着 pathfinder。
+    // 老的 busy / _homing 全部接到这把锁上（Step 1 兼容层，调用点一行都没改）。
+    // busy 的 setter 每次打 `[lock] legacy busy=... @ main.js:行号` —— 那行就是迁移待办清单。
+    this.lock = new ActionLock({ log: (s) => this.log(s) })
+    // busy 只是锁的**只读**视图：谁占着、占多久去 lock.holders() 看。
+    // Step 2 之后没有 setter —— 再写 `this.busy = true` 会直接抛错（严格模式），
+    // 这是故意的：它逼你写清楚是哪条动作线，而不是又一个"谁都清得掉"的布尔。
+    Object.defineProperty(this, 'busy', {
+      configurable: true,
+      enumerable: true,
+      get: () => this.lock.busy
+    })
     this.taskDesc = ''
     this.deathCount = 0
     this.deathsSinceSafe = 0
@@ -94,6 +119,9 @@ class Bot {
 
   connect () {
     const c = this.cfg.bot
+    // 重连前把上一局的动作线全部作废：一条没走到 finally 的线会把新一局锁死
+    // （主循环看到 busy 就 return，人站着不动还查不出原因）。锁只在内存里，清掉不丢数据。
+    if (this.lock) this.lock.forceReleaseAll('重新连接')
     this.log(`连接 ${c.host}:${c.port} 作为 ${c.username}`)
 
     const bot = mineflayer.createBot({
@@ -130,6 +158,9 @@ class Bot {
         else this.events.push('chat_any', { who: username, message }, `${username} 说：${message}`)
       }
 
+      // 【能被邀请】先看这句是不是在叫他跟着走 / 别跟了
+      if (this.invite) { try { this.invite.handleChat(username, message) } catch (e) {} }
+
       if (!this.talk) return
       this.talk.onChat(username, message).catch(e => this.log('chat err ' + e.message))
     })
@@ -145,13 +176,23 @@ class Bot {
       if (this.spont) this.spont.push(spontaneous.onPlayerLeave(p.username))
     })
 
+    // 别人挨打 —— UNHUMAN-SCAN #14。
+    // spontaneous.onFriendInDanger 早就写好了，但全项目 0 处调用：
+    // 触发源里根本没有"别人受伤"这一类，于是他永远不会说"你怎么了"。
+    bot.on('entityHurt', (entity) => this.onEntityHurt(entity))
+
     bot.on('message', (msg) => {
       const t = msg.toString()
-      // 只认跟自己名字一起出现的死亡消息
+      // 跟自己名字一起出现的死亡消息
       if (!t.includes(bot.username)) return
-      if (/died|slain|drowned|blew up|fell|burned|starved|withered|hit the ground|was killed|shot|impaled|suffocated|froze|magma|void|kinetic/.test(t)) {
-        this.lastDeathMsg = t.replace(/^[^:]*:\s*/, '').trim()
-      }
+      // 【BLIND-TEST L1075】原来只认 died|slain|... 一串**英文**。
+      // 服务端说中文（"XJJ 被僵尸杀死了"/"XJJ 淹死了"）时整条丢掉，
+      // lastDeathMsg 永远是 null，于是写进记忆的是"死了：不知道怎么回事"。
+      // 现在中英文都认，并且留一个短缓冲：死亡包和死亡消息的先后顺序不保证。
+      const DEATH_MSG = /died|slain|drowned|blew up|fell|burned|starved|withered|hit the ground|was killed|shot|impaled|suffocated|froze|magma|void|kinetic|被.{0,12}(杀|打死|打|射|炸|咬|戳|烧|撞)|淹死|摔死|烧死|饿死|窒息|冻死|岩浆|爆炸|掉出世界|掉了下去|摔了下来|摔下去/
+      if (!DEATH_MSG.test(t)) return
+      this.lastDeathMsg = t.replace(/^[^:]*:\s*/, '').trim()
+      this._deathMsgs = (this._deathMsgs || []).concat([{ at: Date.now(), text: this.lastDeathMsg }]).slice(-5)
     })
 
     // ==================== 伤害来源识别 ====================
@@ -186,6 +227,9 @@ class Bot {
     // 同一类伤害的节流：摔一次游戏会连推好几包，别每条都当新事件
     let lastDmgAt = 0
     let lastDmgKind = ''
+    // 未知 damage type 每个 id 只打一次。骷髅连射一秒能推两包，
+    // 不过滤就是刷屏；而补表只需要每个 id 见到一次。
+    const seenUnknownDmg = new Set()
 
     bot._client.on('damage_event', (pkt) => {
       try {
@@ -195,6 +239,14 @@ class Bot {
         const causeId = pkt.sourceCauseId || 0
         const ent = causeId > 0 ? bot.entities[causeId] : null
         const kind = DAMAGE_KIND[pkt.sourceTypeId] || null
+        // 【补表用】表里没有这个 id 就原样打出来 —— 下次才能补表。
+        // 1.21.11 的 sourceTypeId 是服务端 registry 下标，minecraft-data 没有
+        // damageTypes 表可查（实测 keys 里 /damage/i 一个都没有），只能现场采样反推。
+        // cause=0 是环境伤害（摔/淹/饿），cause>0 说明有来源实体 —— 骷髅箭就是靠这个分的。
+        if (!kind && !seenUnknownDmg.has(pkt.sourceTypeId)) {
+          seenUnknownDmg.add(pkt.sourceTypeId)
+          this.log(`[dmg] 未知类型 sourceTypeId=${pkt.sourceTypeId} cause=${pkt.sourceCauseId || 0} direct=${pkt.sourceDirectId || 0}`)
+        }
 
         // 有实体来源 -> 就是"被谁打了"
         if (ent) {
@@ -209,7 +261,12 @@ class Bot {
               `你被${from}打了，血剩 ${Math.round(bot.health)}`
             )
           }
+          // 【死因】把这一下的来源存下来 —— onDeath() 靠它说人话。
+          // 原来只有 lastDeathMsg（服务端死亡消息），消息一丢就"不知道怎么回事"。
+          this._lastDamage = { at: Date.now(), kind: this.lastDamageKind, text: `被${from}打了`, by: from, sourceTypeId: pkt.sourceTypeId }
           if (this.reflex) this.reflex.onHurt(ent, bot.health)
+          // 【痛觉】血到线以下就真的停手，不是提示词里写一句
+          this.onPain(bot.health, this._lastDamage.text)
           return
         }
 
@@ -225,12 +282,23 @@ class Bot {
 
         const text = DAMAGE_TEXT[kind] || '受了点伤'
         if (this.events) {
+          // 【踩坑】原来推的类型是 'damage_env'，而 events.js 的 TYPES 表里
+          // 根本没有这个键（表里叫 'damage'，注释就写着"伤害来源是环境"）。
+          // 于是每挨一次环境伤害都只留一行「[event] 未知事件类型: damage_env」，
+          // 事件被丢掉 —— 他永远不知道"快淹死了，血剩 5"。
+          // 6 秒内同一种环境伤害合并成一条（溺水一秒一包），
+          // 但 what 每次都更新成最新血量 —— 急件不刷屏，又不能报到旧数字。
           this.events.push(
-            'damage_env',
+            'damage',
             { kind, health: bot.health },
-            `${text}，血剩 ${Math.round(bot.health)}`
+            `${text}，血剩 ${Math.round(bot.health)}`,
+            { cooldown: 6000, whatUpdate: true, dedupeKey: 'env:' + (kind || 'unknown') }
           )
         }
+        // 【死因】环境伤害同样要落一条，否则淹死/摔死也会变成"不知道怎么回事"
+        this._lastDamage = { at: Date.now(), kind: kind || 'unknown', text: text, by: null, sourceTypeId: pkt.sourceTypeId }
+        // 【痛觉】环境伤害更容易"眼睁睁看着死"（L547 连挖到第 12 层）
+        this.onPain(bot.health, text)
         // 环境伤害也要走反射层 —— 溺水/摔落一样会死
         if (this.reflex) this.reflex.onHurt(null, bot.health, kind)
       } catch (e) {}
@@ -329,13 +397,28 @@ class Bot {
       mem: this.mem,
       actions: this.actions
     })
+
+    // 静止自救：30 秒没挪窝就强制换动作（修 UNHUMAN-SCAN #5）
+    // 实测原来在 61,32,-10 站了 270 秒，玩家一眼看出这号卡了。
+    this.actions.startWatchdog()
+
     this.home.attach()
     this.coder = new Coder(bot, this.actions, this.llm, this.skills, {
       log: (s) => this.log(s),
       say: (m) => this.talk ? this.talk.say(m) : null,
       mem: this.mem,
       cfg: this.cfg,
-      dumpCode: (goal, code, attempt) => this.dumpCode(goal, code, attempt)
+      dumpCode: (goal, code, attempt) => this.dumpCode(goal, code, attempt),
+      // 白干的时间要能结算：技能层主动放弃时回调到这里
+      onNoProgress: (secs, goal) => {
+        try {
+          this.skills.data.stats = this.skills.data.stats || {}
+          this.skills.data.stats.noProgressAbandons = (this.skills.data.stats.noProgressAbandons || 0) + 1
+          this.skills.data.stats.noProgressSeconds = (this.skills.data.stats.noProgressSeconds || 0) + secs
+          this.skills.save()
+        } catch (e) {}
+        this.log(`[cost] 白干 ${secs}s（${String(goal).slice(0, 20)}）`)
+      }
     })
     this.talk = new Talk(bot, this.llm, this.mem, {
       log: (s) => this.log(s),
@@ -372,9 +455,25 @@ class Bot {
       ctx: {
         log: (s) => this.log(s),
         get taste () { return self.taste },
-        actions: this.actions
+        actions: this.actions,
+        // 【跨层闸门】session 在下面才构造，必须 getter 延迟取。
+        // goals.isResting() 要读它判断"今天是不是已经收工"。
+        // 实测冲突（run5 22:19-22:23）：
+        //   [session] 今天到此为止，回去歇着
+        //   [goals]  换法子（目标不变）：找块够平的地方…   ← 收工了还在派人
+        // 跟"休息窗口里启动 5 个任务"是同一个病，只是信号源从 mood.resting 换成 session.phase。
+        get session () { return this.session }
       }
     })
+    // 代价层挂上去：放弃时结算、选目标时读记忆、提示词里带上"最近的亏"。
+    // 用实例包装而不是改 goals.js —— 那边在改，而且 settle() 幂等，
+    // 将来挪进 goals.js 也不会重复记账。
+    // 注意：goals 每次上线都会重建，所以 attach 必须留在这里（connect 里）。
+    try {
+      this.cost.attach(this.goals)
+    } catch (e) {
+      this.log('[cost] 接线失败: ' + e.message)
+    }
     this.will = new Will(this.llm, this.mem, this.skills, {
       log: (s) => this.log(s),
       cfg: this.cfg,
@@ -430,14 +529,51 @@ class Bot {
     this.impulse = new Impulse({
       log: (s) => this.log(s),
       llm: this.llm,
-      actions: this.actions
+      actions: this.actions,
+      // 【UNHUMAN-SCAN #4】刚说出口的计划（60 秒内有效）。
+      // impulse.maybe() 读到它就把走神概率打 1/4 —— 不硬拦，只是别 2 秒就翻案。
+      // 懒取值：构造 Impluse 时 talk 可能还没建好。
+      intention: () => (this.talk && this.talk.recentIntention ? this.talk.recentIntention() : null)
     })
+
+    // 【被注视】显式接线，不再只靠 spontaneous.scanPeople 顺带喂。
+    // 一个实例、两个入口：main 每轮 tick 喂一次，scanPeople 也调 observe（内部 900ms 节流）。
+    this.audience = new Audience({
+      log: (s) => this.log(s),
+      busy: () => this.busy,
+      familiarOf: (n) => {
+        try { return this.mem && this.mem.people && this.mem.people[n] ? (this.mem.people[n].talkCount || 0) >= 3 : false } catch (e) { return false }
+      },
+      ignore: (n) => {
+        try { return this.spont && this.spont._looksLikeBot ? this.spont._looksLikeBot(n) : false } catch (e) { return false }
+      }
+    })
+    // attach 立刻装好 bot.dig 的节奏包装：不用等第一次扫人，
+    // 否则"开局就被盯着挖"的那几格节奏是没变化的。
+    this.audience.attach(bot)
 
     this.spont = new spontaneous.Spontaneity({
       log: (s) => this.log(s),
-      busy: () => this.busy
+      busy: () => this.busy,
+      watch: this.audience          // 共用同一个实例（别各扫各的）
     })
+
+    // 【能被邀请】玩家说"跟我来/过来"就跟着走。
+    // 只加状态，不动任务收尾：跟随期间主循环靠 invite.active 挡住"开新任务"。
+    this.invite = new Invite({
+      log: (s) => this.log(s),
+      speak: (situation, opts) => this.talk.speak(situation, opts),
+      isBotName: (n) => {
+        try { return this.spont && this.spont._looksLikeBot ? this.spont._looksLikeBot(n) : false } catch (e) { return false }
+      }
+    })
+    this.invite.attach(bot)
     this.lastInventory = this.snapshotInventory()
+
+    // ===== 「这一次上线」=====
+    // 进门先扫一眼家（东西还在不在、墙有没有被拆），再定今天干什么。
+    // 只动连接钩子这一层：不碰任务收尾判据，也不改 tick 的决策顺序。
+    await this.beginSession()
 
     // 上线：如果有人在，让他自己决定说不说、说什么
     const last = this.mem.lastSummary()
@@ -451,6 +587,50 @@ class Bot {
     }, 4000 + Math.random() * 4000)
 
     this.loop().catch(e => this.log('loop crash ' + e.message))
+  }
+
+  /**
+   * 「这一次上线」的接线。
+   *
+   * 上下文全部用 getter —— 断线重连后 this.bot / this.actions 会被换成新的，
+   * 把旧对象钉死在里面，第二次上线读到的就是上一次的尸体。
+   *
+   * 会话自己负责三件事（见 src/session.js）：
+   *   1. 上线结算：跟离线前的 snapshot 比，箱子少了什么 / 墙被拆没
+   *   2. 定方向：按家里的存货和上一趟的死活决定今天干什么（不走 goals 菜单）
+   *   3. 收工：活干够了就 todayDone -> 回家歇着 -> 歇够算新的一天
+   */
+  async beginSession () {
+    const self = this
+    if (!this.session) {
+      this.session = new Session({
+        dataDir: DATA,
+        cfg: this.cfg,
+        log: (s) => this.log(s),
+        get bot () { return self.bot },
+        get mem () { return self.mem },
+        get home () { return self.home },
+        get actions () { return self.actions },
+        get goals () { return self.goals },
+        get spont () { return self.spont },
+        // 收工要一条 rank 80 的动作线（见 src/actionlock.js）：能压过 task，
+        // 压不过 survive —— 被追的时候不收工。
+        get lock () { return self.lock },
+        get clock () { return self.mem ? self.mem.clock : null },
+        isBusy: () => this.busy,
+        status: () => this.statusWithUnderground(),
+        taskDesc: () => this.taskDesc,
+        snapshotInv: () => this.snapshotInventory(),
+        // 走主循环已有的 pendingTask 通道（跟"答应了别人要干的事"同一条路），
+        // 不去改 tick 里"先自救、再躲夜、再问自己想干嘛"的顺序。
+        setTask: (text) => { this.pendingTask = { text, since: Date.now(), done: false } }
+      })
+    }
+    try {
+      await this.session.begin()
+    } catch (e) {
+      this.log('[session] 上线结算出错: ' + e.message)
+    }
   }
 
   startClock () {
@@ -471,7 +651,14 @@ class Bot {
       const st = this.actions ? this.actions.status() : null
       const idle = this._taskProgress ? Math.round((Date.now() - this._taskProgress.at) / 1000) : 0
       const inv = st ? Object.keys(st.inventory).length : 0
-      this.log(`[hb] ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)} 血${st ? st.health : '?'} 饿${st ? st.food : '?'} 背包${inv}种 ${this.busy ? '忙:' + this.taskDesc + (idle > 20 ? `（${idle}秒没动）` : '') : '空闲'} 心情:${this.mood ? this.mood.state() : '?'}`)
+      // 收工状态直接从 session 读（原来是 `this._sessionResting`，只写不读的死标记，已删）
+      const sess = this.session ? this.session.status() : null
+      const sessText = sess
+        ? (sess.phase === 'resting'
+            ? `｜收工中(第${sess.day}天,还剩${Math.max(0, Math.ceil(sess.restLeftMs / 60000))}分钟)`
+            : `｜今天第${sess.day}趟`)
+        : ''
+      this.log(`[hb] ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)} 血${st ? st.health : '?'} 饿${st ? st.food : '?'} 背包${inv}种 ${this.busy ? '忙:' + this.taskDesc + (idle > 20 ? `（${idle}秒没动）` : '') : '空闲'}｜锁:${this.lock.describe()}${sessText} 心情:${this.mood ? this.mood.state() : '?'}`)
     }, 30000)
   }
 
@@ -479,6 +666,12 @@ class Bot {
 
   onEnd (reason) {
     this.log('断开: ' + reason)
+    // 这一趟到此为止：先结算，再拆上下文。
+    // 必须在 home.detach / mem.goOffline 之前 —— 那之后背包和坐标都读不到了。
+    // 不 await：断线路径不能等慢操作（里面自己会异步存盘）。
+    if (this.session) {
+      try { this.session.end('断开:' + reason) } catch (e) { this.log('[session] 下线结算出错: ' + e.message) }
+    }
     if (this.reflex) this.reflex.stop()
     if (this.selfState) this.selfState.stop()
     // 家有个 1.5 秒的记路定时器，不解绑的话重连后会有两个在跑
@@ -493,6 +686,193 @@ class Bot {
     this.reconnectTimer = setTimeout(() => { if (this.running) this.connect() }, d)
   }
 
+  // ==================== 动作线仲裁 ====================
+  //
+  // 这一节只做两件事：**发中断信号**和**换动作线**。
+  //
+  // 存在理由：`busy` 是个布尔，表达不了"两条线同时占着"。任务收尾无条件 busy=false，
+  // 把回家的忙状态误清，主循环立刻起新任务，两边抢 pathfinder ——
+  // 实测「107 → 105 → 107」原地打转。当时的修法是加 `if (!this._homing)` 例外，
+  // 再加 follow / session 就是四方抢，bug 会精确复现。
+  //
+  // 现在所有权都在 this.lock 里（见 src/actionlock.js），legacy busy=false 只清 __legacy__。
+
+  /**
+   * 唯一允许写 `actions.cancel = true` 的地方。
+   *
+   * stall / 硬超时 / 自救 / 死亡 / 以后新增的动作线，一律从这里（或 interruptCurrent）走。
+   * 守住这一条，`cancel` 就不会出现"谁都能置位、谁都能清掉"的四方抢。
+   */
+  _signalCancel (why) {
+    if (!this.actions) return false
+    // 已经置位就不重复打日志（tick/超时/stall 可能同时触发）
+    if (this.actions.cancel) return false
+    this.actions.cancel = true
+    this.log(`[lock] 中断信号 <- ${why || '未说明'}（持有：${this.lock.describe()}）`)
+    return true
+  }
+
+  /**
+   * 换动作线：先拿新的，再打断旧的，等旧的自己放手，超时才夺锁。
+   *
+   * 三种写错法对应三种后果：
+   *   release(from) → acquire(to)   中间有窗口，主循环看到 busy=false 就起新任务 → 107
+   *   release(from) 但不 cancel     旧动作还在跑，新动作已经开始 → 两条线抢 pathfinder
+   *   cancel 但没人 release         永久卡死（最严重，只能等 watchdog）
+   *
+   * 所以顺序只有这一种，**写进这里，外面不许手写**：
+   *   1. acquire(to)        —— 先保证任何时刻至少一方持有
+   *   2. _signalCancel()    —— 打断在跑的动作
+   *   3. 等 from 自己 release（它的 finally 会做），最多 timeoutMs
+   *   4. 超时 → forceRelease(from) + 打日志
+   *   5. 只有 !lock.busy 才复位 cancel —— 否则会清掉别人的中断信号
+   *
+   * 调用方只负责 `finally { this.lock.release(to) }`，永远不碰 actions.cancel。
+   *
+   * @returns {Promise<boolean>} 新线有没有成功上位（rank 抢不过时 false，什么都没动）
+   */
+  async interruptCurrent ({ from, to, why = '', timeoutMs = 8000, step = 50 } = {}) {
+    if (!to) {
+      this.log('[lock] interruptCurrent 缺少 to，忽略')
+      return false
+    }
+    const got = this.lock.acquire(to, why || `interruptCurrent ${from || '空线'} -> ${to}`)
+    if (!got) {
+      this.log(`[lock] interruptCurrent 上不了位：${to}（rank ${this.lock.rankOf(to)}）抢不过 ${this.lock.describe()}，保持原动作线`)
+      return false
+    }
+    this._signalCancel(`${from || '空线'} -> ${to}${why ? '：' + why : ''}`)
+    if (from && from !== to) {
+      const t0 = Date.now()
+      while (this.lock.isHolding(from) && Date.now() - t0 < timeoutMs) await sleep(step)
+      if (this.lock.isHolding(from)) {
+        this.log(`[lock] ${from} 超时未释放 ${((Date.now() - t0) / 1000).toFixed(1)}s，强制夺走（${this.lock.describe()}）`)
+        this.lock.forceRelease(from, 'timeout')
+      }
+    }
+    // 只有真的没人占着了才复位：否则会把别人（home/follow/session）的中断信号清掉
+    if (this.actions && !this.lock.busy) this.actions.cancel = false
+    return true
+  }
+
+  // ==================== 痛觉 ====================
+
+  /**
+   * 挨了一下之后：血到线以下就**真的停手**，不是提示词里写一句。
+   *
+   * 【BLIND-TEST L547 / L659，裁判原话】
+   *   `第3层挖石出错: 报错：快淹死了`          → 继续挖到第 12 层
+   *   `求救：血 6，紧急保命（血太少）`        → 边喊保命边继续挖矿直到淹死
+   *
+   * 查下来不是 reflex.sos() 没触发 —— 它触发了，也游了一下、也喊了，
+   * 但**在跑的挖掘任务是另一条线**：只要 `actions.cancel` 不被置位，
+   * 它的 dig 循环就一层层往下走，直到血归零。血越低越"看不见"。
+   *
+   * 真人这里不需要调度器批准：疼了就停。所以：
+   *   血 <= STOP(6)  -> 直接打断在跑的动作线（_signalCancel），清寻路，交给 reflex 保命
+   *   血 <= WARN(10) -> 推进事件队列，让他下一轮开口/知道自己在掉血
+   * 打断信号是全局的，任务代码里任何一个 await 都会抛「任务被中断」，
+   * 于是任务当场结束，主循环回到 checkSurvival()，走 lowhp 自救。
+   */
+  onPain (hp, causeText) {
+    const h = Number(hp)
+    if (!isFinite(h)) return
+    const now = Date.now()
+    const why = causeText || '受伤'
+    const WARN = 10
+    const STOP = 6
+
+    // 【按威胁类型决定停不停手，不只看血量】
+    // 血 7~10 继续干活是合理的（真人也会），但**正在淹死/在岩浆里**不是血量的
+    // 问题，是下一口就没了的问题 —— 这个档位也必须停。
+    const lethalKind = this._lastDamage && now - this._lastDamage.at < 5000
+      ? String(this._lastDamage.kind || '')
+      : ''
+    const LETHAL = lethalKind === 'drown' || lethalKind === 'lava' ||
+      lethalKind === 'on_fire' || lethalKind === 'in_fire' ||
+      lethalKind === 'suffocate' || lethalKind === 'out_of_world'
+    const stopLine = LETHAL ? WARN : STOP
+
+    // 血不高就推一条事件（20 秒最多一条，别刷屏）
+    if (h <= WARN && this.events && now - (this._lowHpAt || 0) > 20000) {
+      this._lowHpAt = now
+      this.events.push('health_low', { health: h, cause: why },
+        `${why}，血只剩 ${Math.round(h)}${h <= stopLine ? ' —— 撑不住了' : '，得小心点'}`)
+    }
+
+    if (h > stopLine) return
+
+    // 停手。两件事都得做：清寻路（否则 pathfinder 还在走）+ 打断动作线（否则 dig 循环还在挖）
+    this.painUntil = now + 60000
+    try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+    const interrupted = this._signalCancel(`受伤 ${Math.round(h)}（${why}）`)
+
+    // 30 秒最多一条日志：挨打是连续的（溺水一次推好几包），别刷屏
+    if (now - (this._painLogAt || 0) > 30000) {
+      this._painLogAt = now
+      const whyStop = LETHAL ? `${lethalKind === 'drown' ? '还在水里' : '还在危险环境里'}，先离开再干活` : '疼'
+      this.log(`[pain] 血 ${Math.round(h)}（${why}）—— ${whyStop}，停手${interrupted ? '（已打断当前任务）' : '（早就打断了）'}`)
+    }
+
+    // 保命动作照旧走反射层（游上去/跑/吃），urgent 不吃 1.2 秒节流
+    if (this.reflex) {
+      let kind = 'lowhp'
+      try {
+        if (this._lastDamage && now - this._lastDamage.at < 3000) kind = this._lastDamage.kind || 'lowhp'
+        if (kind === 'mob' || kind === 'player') kind = 'lowhp'
+      } catch (e) {}
+      try { this.reflex.sos(kind, { urgent: true }) } catch (e) {}
+    }
+  }
+
+  /**
+   * 这一回到底是怎么死的。
+   *
+   * 【BLIND-TEST L1075】`死了：不知道怎么回事`
+   *
+   * 原来的唯一来源是 lastDeathMsg（服务端的死亡消息），而那条路有两个断点：
+   *   1) 只认英文关键词，服务端说中文就整条丢掉
+   *   2) 死亡包和死亡消息谁先到不保证，先到就先读了 null
+   * 于是记忆里全是"不知道怎么回事"—— 死因写不进去，「上次在这片被僵尸弄死」
+   * 这类因果记忆永远长不出来，cost 结算也算不准。
+   *
+   * 现在按可靠性排序：
+   *   1) 死亡前 20 秒内的最后一次 damage_event（服务端必发，带类型/来源）
+   *   2) 死亡前 15 秒内的死亡消息（中英文都认）
+   *   3) 饿死（food=0）
+   *   4) 真不知道
+   */
+  resolveDeathCause () {
+    const now = Date.now()
+
+    if (this._lastDamage && now - this._lastDamage.at < 20000) {
+      return {
+        text: this._lastDamage.text,
+        kind: this._lastDamage.kind || 'unknown',
+        by: this._lastDamage.by || null,
+        sourceTypeId: this._lastDamage.sourceTypeId,
+        src: 'damage_event'
+      }
+    }
+
+    const msgs = (this._deathMsgs || []).filter(m => now - m.at < 15000)
+    if (msgs.length) {
+      const m = msgs[msgs.length - 1]
+      return { text: m.text, kind: 'death_msg', by: null, src: 'chat' }
+    }
+    if (this.lastDeathMsg) {
+      return { text: this.lastDeathMsg, kind: 'death_msg', by: null, src: 'chat' }
+    }
+
+    try {
+      if (this.bot && this.bot.food === 0) {
+        return { text: '饿死了', kind: 'starve', by: null, src: 'food' }
+      }
+    } catch (e) {}
+
+    return { text: '不知道怎么回事', kind: 'unknown', by: null, src: 'none' }
+  }
+
   // ==================== 死亡 ====================
 
   onDeath () {
@@ -501,14 +881,35 @@ class Bot {
     this._deathTimes = (this._deathTimes || [])
     this._deathTimes.push(Date.now())
 
-    const how = this.lastDeathMsg || '不知道怎么回事'
-    this.log('[death] ' + how)
-    if (this.events) this.events.push('death', { how }, `你死了（${how}）`)
+    // 【L1075】死因不再靠"猜"：优先用最后一次伤害，其次死亡消息
+    const cause = this.resolveDeathCause()
+    const how = cause.text
+    // 判据没命中时把 registry id 一起打出来：光有「受了点伤」三个字，
+    // 分不清是摔死、骷髅箭还是窒息 —— 而这三样的应对完全不同。
+    const rawId = (cause.kind === 'unknown' && cause.sourceTypeId != null) ? ` / sourceTypeId=${cause.sourceTypeId}` : ''
+    this.log(`[death] ${how}（来源：${cause.src}${cause.kind && cause.kind !== 'unknown' ? ' / ' + cause.kind : ''}${rawId}）`)
+    if (this.events) this.events.push('death', { how, kind: cause.kind, by: cause.by }, `你死了（${how}）`)
 
-    // 记住这次死
+    // 代价层：记下这次死在哪、被什么弄死的 —— 接下来一阵子别往那种地方钻
+    // （岩浆死 -> 25 分钟不选深层；摔死 -> 先别跑远；被怪弄死 -> 别一个人往黑地方去）
+    try {
+      const cp = this.bot && this.bot.entity ? this.bot.entity.position : null
+      if (this.cost) this.cost.onDeath({ how, pos: cp })
+    } catch (e) {}
+
+    // 记住这次死 —— 带上死因和坐标。
+    // 只有"死了"这一句是长不出因果记忆的；「上次在这片被僵尸弄死」需要地点 + 原因。
+    let where = null
+    try {
+      const p = this.bot && this.bot.entity && this.bot.entity.position
+      if (p) where = `${Math.round(p.x)},${Math.round(p.z)}`
+    } catch (e) {}
     this.mem.add({
+      // 地点只放 where 字段 —— 记忆层会自己拼成「55,-2那儿死了一回（<怎么死的>）」，
+      // 再在正文里写一遍坐标会变成「…（快淹死了（在 55,-2 附近））」这种叠字。
       text: '死了：' + how,
       kind: 'event',
+      where,
       emotion: 0.65,
       importance: 0.5
     })
@@ -522,15 +923,19 @@ class Bot {
       if (ev) this.spont.push(ev)
     }
     this.lastDeathMsg = null
+    // 死因用完就作废，别让下一回死继续复用上一次的伤害记录
+    this._lastDamage = null
+    this._deathMsgs = []
 
-    this.busy = false
+    // 死一次，所有动作线一起作废。
+    // 只清 busy/_homing 会漏掉后来加的 follow/session —— 漏掉的那条就永久卡死，
+    // 主循环的 `if (this.busy) return` 会一直把 tick 挡在门外。这是安全阀，必须整把锁清空。
+    this.lock.forceReleaseAll('死亡')
     this.taskDesc = ''
     this.seekingFood = false
     this.sheltered = false
-    // 死了就别硬走回家了（尸体在别处，走了也白走）
-    this._homing = false
     if (this.home) { try { this.home.stop() } catch (e) {} }
-    if (this.actions) { this.actions.cancel = true; this.actions.stop() }
+    if (this.actions) { this._signalCancel('死亡'); this.actions.stop() }
     if (this.will) this.will.finish()
     if (this.mood) this.mood.onEvent('death', 1)
   }
@@ -538,9 +943,10 @@ class Bot {
   async onRespawn () {
     this.log('复活了')
     if (this.reflex) this.reflex.reset()
-    this._homing = false
+    // 复活 = 重开一局：可能没经过 onDeath（比如 /spawn），所有动作线一起作废。
+    // 只清 busy/_homing 会漏掉 follow/session，漏掉的那条就永久卡住主循环。
+    this.lock.forceReleaseAll('复活')
     if (this.actions) { this.actions.cancel = false; this.actions.stop() }
-    this.busy = false
     setTimeout(() => this.afterRespawn(), 3000)
   }
 
@@ -620,7 +1026,7 @@ class Bot {
    */
   tryHeadHome () {
     if (!this.home || !this.bot || !this.bot.entity) return false
-    if (this.busy || this._homing) return false
+    if (this.busy) return false
     // 别每 4 秒问一次就走 —— 刚放弃过一次，给它一点缓冲
     if (Date.now() - (this._lastHeadHomeAt || 0) < 120000) return false
 
@@ -643,10 +1049,12 @@ class Bot {
 
   /** 真的走一趟回家。跟 tryGoHomeAfterRespawn 共用同一套防重入。 */
   async walkHomeNow (why) {
-    if (this._homing) return false
-    this._homing = true
-    this.busy = true
-    this._busySince = Date.now()
+    // 只占 home 这一条线。busy 是它的派生读法（getter），不用再手动置位 ——
+    // 以前 _homing + busy 两个布尔写同一个事实，谁先谁后都能写出不一致。
+    if (!this.lock.acquire(REASON.HOME, `走回家：${why || ''}`)) {
+      this.log(`[lock] 回家上不了位（当前 ${this.lock.describe()}）`)
+      return false
+    }
     this.taskDesc = '走回家'
     try {
       const r = await this.home.goHome({ timeoutMs: 300000 })
@@ -661,9 +1069,10 @@ class Bot {
       this.log('[home] 回家出错: ' + e.message)
       return false
     } finally {
-      this._homing = false
-      this.busy = false
-      this.taskDesc = ''
+      // 只放自己这一条。用 release 不用 forceRelease：
+      // 锁被死亡/看门狗整把清过时它返回 false，不会误清别人的锁。
+      if (this.lock.isHolding(REASON.HOME)) this.lock.release(REASON.HOME)
+      if (!this.lock.busy) this.taskDesc = ''
     }
   }
 
@@ -704,7 +1113,7 @@ class Bot {
       this.log('[home] 手上有活，这趟先不回家')
       return
     }
-    if (this._homing) return
+    if (this.lock.isHolding(REASON.HOME)) return
 
     this.log(`[home] 离家 ${Math.round(dist)} 格，走回去`)
 
@@ -772,12 +1181,23 @@ class Bot {
 
   async loop () {
     while (this.running && this.bot && this.bot.entity) {
-      // 兜底：busy 卡太久（比如异常没走到 finally），强制放开。
-      // 回家期间不算"卡死"—— 它有自己的超时（最长 5 分钟），
-      // 这里强行清掉只会让主循环插进来抢寻路。
-      if (!this._homing && this.busy && this._busySince && Date.now() - this._busySince > (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000 + 30000) {
-        this.log('[stall] busy 状态卡太久，强制恢复')
-        this.busy = false
+      // 兜底：某条动作线卡太久（异步链没走到 finally）就只清那一条，
+      // 否则主循环的 `if (this.busy) return` 会永远把它挡在门外 —— 人站着不动还查不出原因。
+      //
+      // 阈值按线分：
+      //   task    → 任务超时 + 30 秒（和原来一致）
+      //   其它线  → 15 分钟硬上限（session 收工、follow 都可能跑几分钟，但不该这么久）
+      //   home / survive 不在看门狗里管：home 自己有分段超时（最长 10 分钟），
+      //   survive 每次只跑几秒。强行清它们只会让主循环插进来抢寻路。
+      const taskCap = (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000 + 30000
+      const stuck = this.lock.holders().filter(h => {
+        if (h.reason === REASON.HOME || h.reason === REASON.SURVIVE) return false
+        const cap = h.reason === REASON.TASK ? taskCap : 15 * 60 * 1000
+        return Date.now() - h.since > cap
+      })
+      if (stuck.length) {
+        this.log(`[stall] 动作线卡太久：${stuck.map(h => `${h.reason} ${Math.round(h.secs)}s@${h.why}`).join('，')}，强制放开`)
+        for (const h of stuck) this.lock.forceRelease(h.reason, '卡太久兜底')
         this.taskDesc = ''
         if (this.actions) this.actions.cancel = false
       }
@@ -909,11 +1329,17 @@ class Bot {
    * 为什么单独抽出来：成功/失败/异常三个分支都要调，而且每一处都不能
    * 因为 goals 挂了把主循环带崩 —— 统一在这里吞异常。
    */
-  reportTaskResult (ok, text, outText) {
+  reportTaskResult (ok, text, outText, meta = {}) {
     if (!this.goals) return null
     try {
-      const st = this.actions ? this.actions.status() : null
-      const res = this.goals.onTaskResult({ ok: !!ok, text, status: st })
+      // 用 statusWithUnderground 而不是 actions.status()：
+      // 后者没有 underground 字段，surface 阶段在 onTaskResult 里只能按 y 猜，
+      // 而 observeGoals 那条路是带的 —— 同一个阶段两条路判据不一致。
+      const st = this.statusWithUnderground()
+      // progress 是**硬判据算出来的真实增量**，不是"完成"这两个字的副产品。
+      // 以前不带这个字段，goals 那边就只能 `addWork(progress || 1)` ——
+      // 于是任何 do/build 阶段，一次"完成"就无条件过。
+      const res = this.goals.onTaskResult({ ok: !!ok, text, status: st, progress: meta.progress })
       if (res && res.abandoned) this.log('[goals] 这个阶段反复不成，换条路')
       else if (res && res.goalCompleted) this.log('[goals] 长期目标做完了')
       else if (res && res.stageCompleted) this.log('[goals] 过了一步')
@@ -924,13 +1350,126 @@ class Bot {
     }
   }
 
+  /**
+   * 别人挨打（UNHUMAN-SCAN #14）。
+   *
+   * spontaneous.onFriendInDanger() 实现一直在，但没人调用 ——
+   * 触发源里没有"别人受伤"这一类，所以 25 分钟里他一次都没关心过别人。
+   *
+   * 这里接 mineflayer 的 entityHurt：有玩家掉血就捏一个 social 事件塞进主动层，
+   * 由它决定说不说（chance 0.8）。**只说话、不接管移动** ——
+   * 帮忙的寻路逻辑属于 reflex/actions，这里不碰。
+   *
+   * 防刷屏：同一个人 30 秒内只报一次；血量读得到时，大于 12 就不报。
+   */
+  onEntityHurt (entity) {
+    try {
+      if (!entity || !entity.username) return          // 怪挨打不管
+      const name = String(entity.username)
+      if (!name || name === this.bot.username) return  // 自己挨打走 health 那条线
+      if (this.bot.entity && entity === this.bot.entity) return
+
+      const now = Date.now()
+      this._friendHurtAt = this._friendHurtAt || new Map()
+      if (now - (this._friendHurtAt.get(name) || 0) < 30000) return
+
+      const hp = this.peerHealth(entity)
+      if (hp != null && hp > 12) return                 // 掉一点血不算危险
+      this._friendHurtAt.set(name, now)
+
+      const shown = hp == null ? '?' : Math.round(hp)
+      this.log(`[social] ${name} 在挨打（血 ${shown}）→ onFriendInDanger`)
+      if (this.spont) {
+        const ev = spontaneous.onFriendInDanger(name, hp == null ? '不多' : Math.round(hp))
+        if (ev) this.spont.push(ev)
+      }
+    } catch (e) {
+      this.log('[social] entityHurt 处理出错: ' + (e && e.message))
+    }
+  }
+
+  /**
+   * 读一个实体的血量。mineflayer 没有统一的 entity.health，
+   * 玩家实体在 metadata[9]（1.20.x 协议：血量 float）。
+   * 读不到就返回 null —— 由调用方决定怎么措辞，别硬编一个假数字。
+   */
+  peerHealth (entity) {
+    if (!entity) return null
+    if (typeof entity.health === 'number') return entity.health
+    try {
+      const md = entity.metadata
+      const v = md ? md[9] : undefined
+      if (typeof v === 'number') return v                       // 数组/对象下标都可能是裸数字
+      if (v && typeof v.value === 'number') return v.value      // 有的版本是 {value}
+    } catch (e) {}
+    return null
+  }
+
+  /**
+   * 任务之间发多久呆（UNHUMAN-SCAN #16）。
+   *
+   * 【为什么要有这个】config.json 里一直躺着 `behavior.idleThinkSeconds: 60`，
+   * 但全项目没有任何一行代码读它 —— 主循环固定 4 秒一轮，任务之间只睡
+   * `3000 + random*9000`。实测任务间隔中位数 10 秒、最短 1 秒，
+   * 真人干完一件事至少会愣一会儿、走两步、想一想。
+   *
+   * 取 idleThinkSeconds 的 10%~50% 作为区间（60 -> 6~30 秒），
+   * 上限封 30 秒：再久玩家会以为他掉线了。
+   */
+  idleThinkMs () {
+    const sec = Number(this.cfg && this.cfg.behavior && this.cfg.behavior.idleThinkSeconds)
+    const base = Number.isFinite(sec) && sec > 0 ? sec : 60
+    const lo = Math.max(3, base * 0.1)
+    const hi = Math.max(lo + 1, Math.min(30, base * 0.5))
+    return Math.round((lo + Math.random() * (hi - lo)) * 1000)
+  }
+
+  /**
+   * 发呆：站着看、偶尔转身、偶尔原地跳一下。
+   *
+   * 不调模型、不占 pathfinder、不置 busy —— 这期间有人说话照样回，
+   * 有怪过来立刻收工交给主循环。
+   */
+  async idleThink () {
+    const ms = this.idleThinkMs()
+    const t0 = Date.now()
+    this.log(`[idle] 发会儿呆（约 ${Math.round(ms / 1000)} 秒）`)
+    while (Date.now() - t0 < ms && this.running && this.bot && this.bot.entity) {
+      // 有东西摸过来就别演了
+      const near = this.reflex ? this.reflex.nearestHostile(10) : null
+      if (near) { this.log('[idle] 有东西过来了，先不发了'); break }
+      // 东张西望
+      if (Math.random() < 0.35) {
+        try {
+          const ent = this.bot.entity
+          const yaw = (ent.yaw || 0) + (Math.random() - 0.5) * Math.PI
+          const pitch = -0.15 + Math.random() * 0.35
+          if (this.bot.look) await this.bot.look(yaw, pitch)
+        } catch (e) {}
+      }
+      // 无聊蹦一下
+      if (Math.random() < 0.12) {
+        try {
+          this.bot.setControlState('jump', true)
+          await sleep(160)
+          this.bot.setControlState('jump', false)
+        } catch (e) {}
+      }
+      await sleep(700 + Math.random() * 1300)
+    }
+    try { this.bot.setControlState('jump', false) } catch (e) {}
+  }
+
   async tick () {
     const bot = this.bot
     if (!bot || !bot.entity) return
-
     // 0. 长期目标：先扫一眼进度（同步、很便宜，不会挡住自救）
     //    这一步只更新"当前阶段完成到几成"，不跟模型说话。
     this.observeGoals()
+    // 0.1 代价层：记走路里程和当前位置 —— 放弃时要算"走了多少路才弄到这点东西"
+    try {
+      if (this.cost && this.actions) this.cost.observe(this.actions.status())
+    } catch (e) {}
     // 0.5 他自己注意到的变化（工具换了/快坏了）进事件队列
     this.pumpSelfChanges()
 
@@ -971,7 +1510,10 @@ class Bot {
 
     // 2. 天亮重置
     const tod = bot.time && bot.time.timeOfDay
-    if (tod !== undefined && (tod < 12000 || tod > 23500)) this.sheltered = false
+    if (tod !== undefined && (tod < 12000 || tod > 23500)) {
+      this.sheltered = false
+      this._nightAlerted = false     // 新的一夜可以再警觉一次
+    }
 
     // 3. 天黑 + 血少 -> 躲
     if (tod !== undefined && tod > 13000 && tod < 23000 && bot.health <= 14) {
@@ -986,11 +1528,48 @@ class Bot {
       return
     }
 
+    // 3.5 天黑 + 血够 -> 警觉，但不躲
+    //
+    // 【REAL-STATUS：`tod>13000 && health<=14`，满血永不触发】
+    // 原来"天黑"这件事只有一条路：血 <=14 才躲。血满 20 的人天黑之后
+    // 一条日志、一句话、一个动作都没有 —— 天黑对他等于不存在。
+    //
+    // 真人不分血量，天黑了都会警觉：抬头看一眼、插个火把、往家那边靠，
+    // 或者至少嘟囔一句。要不要**停手躲起来**才取决于血。
+    // 所以这里拆成两条：血低 -> 躲（上面那条，原样保留）；血够 -> 只是警觉。
+    if (tod !== undefined && tod > 13000 && tod < 23000 && bot.health > 14) {
+      if (!this._nightAlerted) {
+        this._nightAlerted = true
+        this.log(`[night] 天黑了（血 ${Math.round(bot.health)}，血够，不躲）—— 警觉一下`)
+        // 心里有这件事：提示词里也会带（selfstate 的"时间"那行）
+        if (this.events) {
+          try { this.events.push('time_change', { tod, phase: 'night' }, '天黑了，外面开始刷怪') } catch (e) {}
+        }
+        // 让他在公屏上嘟囔一句（不一定说，chance 控制）
+        if (this.spont) {
+          try {
+            this.spont.push({
+              situation: '天黑了，外面开始刷怪。你血还是满的，不慌，但天黑了总归不是好事。',
+              chance: 0.45,
+              maxLen: 22
+            })
+          } catch (e) {}
+        }
+      }
+    }
+
     // 4. 心情和品味随时间变化
     this.tickInnerState()
 
     // 5. 检查背包有没有新收获，攒个"想说话"的念头
     this.checkNewLoot()
+
+    // 5.5 喂一次"有没有人在看我"（main 这一层显式接线）
+    //     被注视强度 focus 会被 audience 自己用在 bot.dig 的停顿上；
+    //     这里只负责让它每轮都有最新位置/朝向，别等人走了还在"被看着"。
+    if (this.audience) {
+      try { this.audience.tick(bot) } catch (e) {}
+    }
 
     // 6. 有攒着的念头就问他要不要说（吐槽类不受"忙"限制）
     if (this.spont && this.talk) {
@@ -1000,7 +1579,11 @@ class Bot {
     // 6. 正在干活不打断
     //    回家也算在干活：它自己管 busy，但万一被别处误清过，
     //    这里再兜一次，保证主循环不会趁虚插进来抢寻路。
-    if (this.busy || this._homing) return
+    if (this.busy) return
+
+    // 6.4 被人叫去跟着走的时候，不许自己开新任务。
+    //     否则就是"两个东西并排走"：他在跟人，同时又决定去挖矿。
+    if (this.invite && this.invite.active) return
 
     // 7. 有答应别人的事就先做（答应了要做到）
     let want = null
@@ -1014,7 +1597,7 @@ class Bot {
     //
     // 现在每轮都问一次 home.shouldHeadHome()：距离/深度/背包/工具综合判断，
     // 只有代价真的超过收益时才打断，不是"离家就回"。
-    if (this.home && this.home.hasHome && !this._homing) {
+    if (this.home && this.home.hasHome && !this.lock.isHolding(REASON.HOME)) {
       const head = this.tryHeadHome()
       if (head) return
     }
@@ -1044,6 +1627,36 @@ class Bot {
       } catch (e) {}
     }
 
+    // ===== 歇着的时候，两个入口都要关掉 =====
+    //
+    // 【goals-fixer 实测 · 2026-11-13】`will.js:37` 的第一入口是 goals.current()，
+    // 那条已经通过 isResting() 了。但另外三条绕开 goals 的路没有：
+    //   ① pendingTask（答应别人的事 / session 派的活）
+    //   ② impulse.maybe()（冲动，休息时不该有冲动去干活）
+    //   ③ will.current 缓存（休息前领的活会跑到 finish()，最长 420s）
+    //
+    // 歇着就是歇着，别半路又被派走。
+    if (this.goals && this.goals.isResting && this.goals.isResting()) {
+      // 休息态：只允许 pendingTask 里"歇着"那一类（session 派的回家收拾）
+      if (this.pendingTask && /歇|回家|收拾|睡/.test(this.pendingTask.text || '')) {
+        want = this.pendingTask
+        this.pendingTask = null
+        this.log('[comply] 歇着，顺手做：' + want.text)
+      } else {
+        // 其它一律压到休息结束
+        if (this.pendingTask) {
+          this.log('[rest] 正在歇着，「' + this.pendingTask.text + '」等缓过来再说')
+        }
+        // impulse 不问了（歇着没冲动）
+        if (this.will && this.will.current) {
+          this.log('[rest] 歇着，把手上「' + (this.will.current.text || '') + '」先放下')
+          this.will.current = null
+        }
+        await sleep(1000)
+        return
+      }
+    }
+
     if (this.pendingTask) {
       want = this.pendingTask
       this.pendingTask = null
@@ -1058,7 +1671,7 @@ class Bot {
         }
       }
       // impulse.maybe() 也会问模型，同样要重新确认忙不忙
-      if (this.busy || this._homing) return
+      if (this.busy) return
     }
 
     // 8. 没有别的事，就问自己想干什么
@@ -1070,16 +1683,55 @@ class Bot {
     // busy 置成 true（复活后回家、反射层抢救），而上面第 6 步的 busy 检查
     // 早就过了。不在这里重新确认的话，回家途中会再起一个任务跟它抢
     // pathfinder 的目标 —— 实测「离家 164.8 格 → 197.5 格」，越走越远。
-    if (this.busy || this._homing) return
+    if (this.busy) return
     if (!want) want = await this.will.think()
     if (!want) return
-    // will.think() 同样可能等模型；它回来时也可能已经忙起来了
-    if (this.busy || this._homing) return
 
-    this.busy = true
-    this._busySince = Date.now()
+    // ===== 歇着不是任务 =====
+    //
+    // 【盲测 RT2 第 9 行抓到的】goals.current() 在休息态会返回一句
+    // 「先歇着，什么都不干（精力还没回来）」，带 `resting: true` 标记 ——
+    // 目的是不让 will 掉进兜底模板（那会变成"弄点木头先做把镐"，还是活）。
+    //
+    // 但主循环把它当成了正常任务：`>>> 开始：先歇着…` → 完成 → 下一轮又来
+    // → 30 分钟里"什么都不干"被宣布了 23 遍，裁判第一眼就判不是真人。
+    //
+    // 为什么上面的休息态闸门没拦住：`isResting()` 是实时读 mood/session 的，
+    // 精力在阈值附近恢复时它会翻。闸门那一刻是 false，等 will.think() 问到
+    // goals.current() 时又成了 true —— 于是漏过去。
+    //
+    // 所以这里认 `resting` 标记，不认 isResting()：标记在 want 身上，不会翻。
+    if (want && want.resting) {
+      if (!this._restingLoggedAt || Date.now() - this._restingLoggedAt > 60000) {
+        this._restingLoggedAt = Date.now()
+        this.log('[rest] 歇着，不派活（精力还没回来）')
+      }
+      await sleep(5000)
+      return
+    }
+    // will.think() 同样可能等模型；它回来时也可能已经忙起来了
+    if (this.busy) return
+
+    // 占住 task 这条线（rank 10）。抢不过说明有更高优先级的线在跑，这轮不起任务。
+    // 以前这里是一句 busy=true，只能表达"有人占着"，说不出是谁、占多久。
+    if (!this.lock.acquire(REASON.TASK, want.text)) {
+      this.log(`[lock] 起任务被拒：${want.text}（当前 ${this.lock.describe()}）`)
+      return
+    }
     this.taskDesc = want.text
     this._taskStartInv = this.snapshotInv()   // 记下开始时的背包，用来判断产出
+    // 同时记位置：观察/探索类任务没有背包指标，"有没有真的去"只能看位移
+    try { this._taskStartPos = this.bot.entity.position.clone() } catch (e) { this._taskStartPos = null }
+    // 【层1根治】记下脚下这片世界的方块快照。
+    // 盖墙/铺路/挖通道这类活背包不会变（挖下来的东西又用掉了），
+    // 只有"方块真的动了"能证明他干了事。
+    try { this._taskStartWorld = this.worldSig(this._taskStartPos) } catch (e) { this._taskStartWorld = null }
+    // 手持物品和饱食度：换装备时背包可能一点没变（工具在手上换），
+    // 吃东西时食物一定变少 —— 这两样不记，这两类活永远没证据。
+    try { this._taskStartHeld = this.bot.heldItem ? this.bot.heldItem.name : null } catch (e) { this._taskStartHeld = null }
+    try { this._taskStartFood = Math.round(this.bot.food) } catch (e) { this._taskStartFood = null }
+    try { this._taskStartHealth = Math.round(this.bot.health) } catch (e) { this._taskStartHealth = null }
+    this._taskStartAt = Date.now()   // duration 类证据（待够 N 秒）要用
     if (this.actions) { this.actions.cancel = false; this.actions.stop() }
     const t0 = Date.now()
     if (this.impulse) this.impulse.taskStarted()
@@ -1100,7 +1752,7 @@ class Bot {
       }
       if (Date.now() - tp.at > 60000) {
         this.log('[stall] 一分钟没动，强制结束任务')
-        if (this.actions) this.actions.cancel = true
+        this._signalCancel('stall 一分钟没动')
         try { this.bot.pathfinder.setGoal(null) } catch (e) {}
         tp.at = Date.now() + 600000   // 别重复触发
       }
@@ -1110,7 +1762,7 @@ class Bot {
     const hardTimeout = (this.cfg.behavior.taskTimeoutSeconds || 420) * 1000
     const timeoutPromise = new Promise((_, rej) => {
       this._taskTimer = setTimeout(() => {
-        if (this.actions) this.actions.cancel = true
+        this._signalCancel('任务硬超时')
         try { this.bot.pathfinder.setGoal(null) } catch (e) {}
         rej(new Error('这个任务干太久了，先放下'))
       }, hardTimeout)
@@ -1137,11 +1789,33 @@ class Bot {
       //   1. 写了 judgeOutcome() 却从没调用，用的是一段只能匹配开头 40 字的粗糙正则
       //   2. 失败分支引用了未定义的 verdict 变量，抛 ReferenceError，
       //      导致所有失败记录都写不进记忆（日志里有三次 "verdict is not defined"）
-      const verdict = this.judgeOutcome(want.text, outText, t0)
+      //
+      // ===== 【层1根治】判成功必须看世界，不看话术 =====
+      //
+      // 参谋挖出来的分工（2026-11-13）：
+      //   层1 判定看话术：result.ok = 代码没抛异常；verdict = 读模型自己写的结尾
+      //   层2 技能记账：out.ok 同样的东西 -> 成功率虚高 -> 越熟越死
+      //   层3 目标进度：kind do/build 一句"完成"就白送 +1
+      //
+      // 所以这里改权责：judgeOutcome 降级成**否决权**（说了失败词就是失败），
+      // 不再有批准权。批准权交给 verifyTaskEffect()：背包 / 目标产物 /
+      // 周围方块 / 位移，四样里得真的动了一个。
+      // 顺序有意义：先拿世界的证据，再让文本行使否决权 ——
+      // 文本里那些"推断类"判断（A→A 数量没变、零产出字样）在有硬证据时
+      // 不该拍板。实测 22:34:13 一个真干成的任务（背包+9 方块15）
+      // 就因为句子里有"3→3"被判死。
+      const proof = this.verifyTaskEffect(want.text, outText)
+      const verdict = this.judgeOutcome(want.text, outText, t0, proof.ok)
 
-      if (result.ok && verdict.ok) {
+      if (result.ok && verdict.ok && proof.ok) {
         this.log(`<<< 完成（${secs}s）：${outText}`)
-        if (result.code) {
+        // 【入库规则】没有"无进展退出"的代码不进库。
+        // 双峰耗时的成因就是它只有成功出口；这种代码存下来会被复用一辈子。
+        const keep = result.code ? require('./src/coder').hasNoProgressExit(result.code) : false
+        if (result.code && !keep) {
+          this.log('[skill] 这段代码没有"无进展就退出"的出口，不入库')
+        }
+        if (result.code && keep) {
           this.skills.add({
             name: 'k_' + Date.now().toString(36),
             desc: want.text,
@@ -1162,10 +1836,14 @@ class Bot {
         if (this.mood) this.mood.onEvent('task_done', 1)
         // 干完了：攒个念头，让主动层决定说不说
         if (this.spont) this.spont.push(spontaneous.onGoalDone(want.text, outText))
-        // 告诉长期目标"这一下算数"
-        this.reportTaskResult(true, want.text, outText)
+        // 告诉长期目标"这一下算数" —— 带上**真实增量**，不再白送 +1
+        this.log(`[proof] 硬判据通过：${proof.evidence || ''}`)
+        this.reportTaskResult(true, want.text, outText, { progress: proof.progress })
       } else {
-        const why = result.error || verdict.why || outText
+        const why = result.error ||
+          (!verdict.ok ? verdict.why : '') ||
+          (!proof.ok ? proof.why : '') ||
+          outText
         this.log(`<<< 失败（${secs}s）：${why}`)
 
         // ===== 失败归因：进日志，不进长期记忆 =====
@@ -1192,7 +1870,7 @@ class Bot {
         this.will.finish()
         if (this.mood) this.mood.onEvent('task_fail', 1)
         // 告诉长期目标"这趟没成" —— 同一个阶段失败太多次它会自己换路
-        this.reportTaskResult(false, want.text, why)
+        this.reportTaskResult(false, want.text, why, { progress: 0 })
         const others = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
         if (this.spont) {
           const err = String(result.error || outText || '')
@@ -1209,7 +1887,7 @@ class Bot {
       this.will.finish()
       // 异常也算一次失败：不回报的话，长期目标那边会以为"还没试过"，
       // 同一阶段会因为异常无限重试。
-      this.reportTaskResult(false, want.text, e.message)
+      this.reportTaskResult(false, want.text, e.message, { progress: 0 })
     } finally {
       if (stallCheck) clearInterval(stallCheck)
       this._taskProgress = null
@@ -1219,10 +1897,12 @@ class Bot {
       // 期间一个早就起跑的任务走到这里，就把回家的忙状态误清掉，
       // 主循环立刻起新任务，两边抢 pathfinder —— 实测「107 → 105 → 107」原地打转。
       // 回家期间不碰 busy，让 tryGoHomeAfterRespawn 的 finally 负责收尾。
-      if (!this._homing) {
-        this.busy = false
-        this.taskDesc = ''
-      }
+      //
+      // 只归还 task 这一条线 —— 这就是 107 的根因修法：
+      // 早跑的任务收尾时，home/follow/session 的锁一格都不动。
+      // 用 isHolding 兜一下：死亡/看门狗可能已经整把清过，那不是 bug，别刷告警。
+      if (this.lock.isHolding(REASON.TASK)) this.lock.release(REASON.TASK)
+      if (!this.lock.isHolding(REASON.HOME)) this.taskDesc = ''
       if (this.actions) this.actions.cancel = false
     }
 
@@ -1236,7 +1916,12 @@ class Bot {
       }
     }
 
-    await sleep(3000 + Math.random() * 9000)
+    // 干完一件事先发一会儿呆（UNHUMAN-SCAN #16）。
+    //
+    // 原来这里固定 `sleep(3000 + random*9000)`，不管 config 里写的
+    // idleThinkSeconds 是多少 —— 实测任务间隔中位数 10 秒、最短 1 秒，
+    // 看起来像"任务队列在空转"，不像一个人在决定下一步做什么。
+    await this.idleThink()
   }
 
   /**
@@ -1249,7 +1934,7 @@ class Bot {
    *   2. 输出里有"返回0""从0变成0""0块""0个"这种零产出的痕迹
    *   3. 任务说要做某样东西，但背包里没有
    */
-  judgeOutcome (goal, outText, t0) {
+  judgeOutcome (goal, outText, t0, hardOk) {
     const t = String(outText || '')
 
     // 1. 明确的失败词
@@ -1260,7 +1945,7 @@ class Bot {
     if (/出错|Error:|任务被中断|异常|崩溃/.test(t)) {
       return { ok: false, why: '执行出错' }
     }
-    if (/(做不了|做不出|放不出|挖不出|弄不出|盖不成|造不出|没做成|搞不定|完成不了|没能|白忙|砍不到|挖不到|找不到|弄不到|拿不到)/.test(t)) {
+    if (/(做不了|做不出|放不出|挖不出|弄不出|盖不成|造不出|没做成|搞不定|完成不了|没能|白忙|砍不到|挖不到|找不到|没找着|找不着|没捞着|没弄到|弄不到|拿不到|啥也没有|白折腾|白费)/.test(t)) {
       return { ok: false, why: '输出里有失败词' }
     }
     // 超时 —— 明确没完成
@@ -1280,6 +1965,25 @@ class Bot {
       return { ok: false, why: '明确零收获' }
     }
 
+    // 目标是要"上去"，而文本自己承认还在下面 —— 明确的失败信号。
+    // 真机铁证（22:54:45）：
+    //   <<< 完成（86s）：没硬往上挖，往北探了探（没挪动），点了火把、捡了捡东西，
+    //                    坐下歇了会儿。现在 y=42，还在地面下，出去的事改天再想。
+    // 这句话里三个失败词（没硬往上挖 / 还在地面下 / 改天再想）原来一个都没识别。
+    if (/(回到地面|回到上面|回到地表|离开地下|出洞|出土|上去|爬到|爬上|上到|升到)/.test(goal) &&
+        /(还在地面下|还在地下|还在地底|没上去|没爬上去|没往上去|没硬往上|没往上挖|出去的事改天|改天再想)/.test(t)) {
+      return { ok: false, why: '目标是上去，文本自己说还在下面/没上去' }
+    }
+
+    // ===== 到这里为止都是"明确的失败信号"，文本的否决权到此结束 =====
+    //
+    // 硬判据已经证明世界变了（hardOk）→ 直接放过。
+    // 下面那些都是**推断**（正则猜"有没有产出"），不该压过真实背包/方块/位移。
+    // 真机实测被它们误杀过一次：
+    //   22:34:13 [ledger] 背包+9 方块15 位移3.7 结论:成
+    //   22:34:13 <<< 失败（106s）：背包数量没变（3→3、0→0）
+    if (hardOk) return { ok: true, why: '' }
+
     // 2. 零产出的痕迹
     //
     // 踩过的坑：单一正则太容易误判。
@@ -1291,21 +1995,52 @@ class Bot {
     // 先查"A→A"这种"数量没变" —— 比 hasGain 优先
     // 实测日志："用石镐挖了安山岩6块；安山岩 109→109，圆石 126→126"
     // 前半句的"6块"会被 hasGain 当成有产出，但实际一个都没增加
-    {
+    //
+    // 【降级为推断】硬判据已经通过时（hardOk），这一整块不判死：
+    // 它读的是"句子里出现了一对 3→3"，而真正该看的是背包到底变没变。
+    // 实测 22:34:13：背包+9、方块动 15 格的真成功，被这句"3→3"否掉。
+    if (!hardOk) {
       const arrows = [...t.matchAll(/(\S+)\s*(\d+)\s*(?:→|->|>)\s*(\d+)/g)]
       if (arrows.length) {
         const gained = arrows.some(m => Number(m[3]) > Number(m[2]))
         if (!gained) {
+          // 【删掉两处"文本批准"例外】原来这里有：
+          //   if (isCraftTask && /做好了/.test(t)) return { ok: true }   ← 制作类
+          //   if (isEatTask)                     return { ok: true }   ← 吃东西类
+          // 它们解决的是"石镐做出来了但箭头全在减少"这个真实问题，
+          // 但解决方式是**再用一句正则批准** —— 同一个病的第 5 次。
+          // 现在这两类由 src/judge.js 的证据维度负责：
+          //   制作 -> 产物进背包（stone_pickaxe +1）
+          //   吃东西 -> 饱食度上升或食物类减少
+          // judgeOutcome 只剩否决权，这里不再返回 ok:true。
+          // scripts/check-judge-discipline.js 会盯着这条线。
           return { ok: false, why: `背包数量没变（${arrows.map(m => `${m[2]}→${m[3]}`).join('、')}）` }
         }
       }
     }
 
+    // ===== 文本里的"增加证据"=====
+    //
+    // 【#8 的核心 bug】原来这里第一条是
+    //   /[1-9]\d*\s*(块|个|根|把|颗|件)/
+    // 意思是"文本里出现 4块/12个 就算有产出"。
+    // 但技能 k_mwe74ysb 的结尾是无条件：
+    //   return '现在手上有圆石' + actions.countOf('cobblestone') + '个，石料总共约' + finalCobble + '个，够垫脚用了'
+    // "圆石132个" 正好命中 —— 哪怕一个都没捡到，也判成功。
+    // 实测它 74 次复用 ok 74 / fail 0，世界却毫无变化。
+    //
+    // 现在：**光出现数字不算**。必须是"动词 + 数字"（真的做了/拿到了），
+    // 或者 A→B 且 B>A 这种明确增量。
+    // 单纯"有 132 个"只是描述存量，不是进展。
     const hasGain = [
-      /[1-9]\d*\s*(块|个|根|把|颗|件)/,          // "4块" "12个"
-      /从\s*\d+\s*变成\s*([1-9]\d*)/,           // "从0变成5"
-      /→\s*([1-9]\d*)/,                          // "51→52"
-      /做好了|做成了|砍下|挖到|捡到|拿到|放进|存进|摆好|放好/
+      /从\s*\d+\s*变成\s*([1-9]\d*)/,                     // "从0变成5"
+      /(?:→|->)\s*([1-9]\d*)/,                            // "51→52"（上面已单独校验 B>A）
+      // 动词 + 数量：真做了事才有的说法
+      /(?:挖到|捡到|拿到|砍到|采到|凑到|攒到|获得|收获)\s*[1-9]\d*/,
+      /(?:挖|砍|捡|采|做|合|烤|种|放|摆|存|建|盖)(?:了|下|出|好|成)\s*(?:[1-9]\d*\s*(?:块|个|根|把|颗|件|张|座))?/,
+      /做好了|做成了|搭好了|盖好了|摆好了|放好了|种好了|存好了/,
+      // 明确的"增加/涨了"
+      /(?:增加|多了|涨了|净增|\+)\s*[1-9]\d*/
     ].some(re => re.test(t))
 
     const zeroPatterns = [
@@ -1336,24 +2071,276 @@ class Bot {
       }
     }
 
-    // 3. （已删除）"说要做的物品背包有没有增加"这条判据
+    // ===== 3. 背包硬对比（#8 的正面修法）=====
     //
-    // 删掉的原因：它把"用工具干活"误判成"要制作工具"。
-    //   "用石斧砍树" -> extractWantedItem 提取 stone_axe
-    //   -> 砍完斧头还在（1->1）-> 判"背包没增加"-> 误判失败
-    //   "用石镐挖圆石" 同理
+    // 上面两条都只看文本。文本可以被"无条件 return 成功文案"骗过去 ——
+    // 这正是 k_mwe74ysb 74 次 0 失败的原因。
+    // 所以这里加一条不看文本的判据：**任务开始时和现在，背包到底变没变。**
     //
-    // 实测日志里 5 条真实目标有 2 条踩这个坑。
-    // 成败判定只留前两条：明确失败词 + 零产出痕迹。
+    // 分类处理，不能一刀切：
+    //
+    //   A. 产出型任务（弄/挖/砍/收集/做...）
+    //      -> 要求背包**增加**。没增加就是没做成，不管模型怎么说。
+    //
+    //   B. 消耗/放置型任务（放/摆/存/种/扔/建...）
+    //      -> 这类本来就该"背包变少"，要求的是世界变了（方块放下去了）。
+    //         背包减少也算成功证据。
+    //
+    //   C. 观察/探索型任务（看/观察/走/找/记...）
+    //      -> 没有背包指标。这类只能靠文本，但要求更严（见下）。
+    //
+    // 注意不要退回老 bug：老判据只查"目标物品"（用石斧砍树 -> 查石斧 1->1 -> 误判失败）。
+    // 这里查的是**整个背包的总变化**，不是特定物品。
+    try {
+      const before = this._taskStartInv
+      if (before && typeof before === 'object') {
+        const now = this.snapshotInv()
+        const sum = (inv) => Object.values(inv || {}).reduce((a, b) => a + (b || 0), 0)
+        const totalBefore = sum(before)
+        const totalNow = sum(now)
+
+        // 逐物品增减
+        const gained = {}
+        const lost = {}
+        for (const [k, v] of Object.entries(now)) {
+          const d = (v || 0) - (before[k] || 0)
+          if (d > 0) gained[k] = d
+        }
+        for (const [k, v] of Object.entries(before)) {
+          const d = (v || 0) - (now[k] || 0)
+          if (d > 0) lost[k] = d
+        }
+        const gainedAny = Object.keys(gained).length > 0
+        const lostAny = Object.keys(lost).length > 0
+
+        const isProduce = /(做|制作|合成|弄|搞|挖|砍|打|采|收集|攒|备|升级|换|烤|烧|熔炼|种|捡|找点|弄点|弄到|搞到)/.test(goal)
+        const isConsume = /(放|摆|存|放进|存进|摆好|放好|安置|整理|扔|丢|清空|倒)/.test(goal)
+        const isObserve = /(看|观察|看看|望|巡视|转一圈|探|确认|记住|记下|标记|问问|说说|睡|歇|等)/.test(goal)
+
+        // D. 搬到/挪到/移开：产物在过程中又被放回去了，背包一定不涨。
+        //    这类只认"位置变了"，不查背包（否则"把熔炉搬到山顶"永远判失败）。
+        const isMove = /(搬到|搬去|挪到|挪去|移到|移去|运到|扛到|抬到)/.test(goal)
+
+        // A. 产出型：必须真的多了东西
+        if (isProduce && !isConsume && !isObserve && !isMove) {
+          if (!gainedAny && totalNow <= totalBefore) {
+            return {
+              ok: false,
+              why: `背包没有任何增加（${totalBefore}->${totalNow} 个）——` +
+                `文本说有产出，但物品栏没变，这是假成功`
+            }
+          }
+          // 物品总量没涨，但种类变了（比如 1 原木 -> 4 木板，总量涨了；这里兜底）
+          if (!gainedAny) {
+            return {
+              ok: false,
+              why: `背包没有新增物品（${totalBefore}->${totalNow}）`
+            }
+          }
+        }
+
+        // B. 消耗/放置型：背包该变少，或者世界里有新方块
+        if (isConsume && !isProduce) {
+          if (!lostAny) {
+            return {
+              ok: false,
+              why: `要"放/存/摆"东西，但背包一个都没少（${totalBefore}->${totalNow}）——` +
+                `东西没出手，这是假成功`
+            }
+          }
+        }
+
+        // C. 观察型：不查背包，但纯文本不变（说明根本没动）要警惕
+        if (isObserve && !isProduce && !isConsume) {
+          // 位置也没变、背包也没变 => 大概率是干坐着
+          const moved = this._taskStartPos
+            ? this.bot.entity.position.distanceTo(this._taskStartPos)
+            : null
+          if (moved !== null && moved < 1.5 && !gainedAny && !lostAny) {
+            // 观察类允许原地（比如"睡一会儿"），只记录不判死
+            // 这里只对"探/找/看/巡视"这类要求走动的收紧
+            if (/(探|找|巡视|转一圈|看看|观察)/.test(goal)) {
+              return {
+                ok: false,
+                why: `说去"${goal.slice(0, 12)}"，但 位置只动了 ${moved.toFixed(1)} 格、` +
+                  `背包也没变 —— 根本没去`
+              }
+            }
+          }
+        }
+
+        // ===== 3.5 目标产物核对（判据 3，原来只写在函数注释里没实现）=====
+        //
+        // 函数开头写着"任务说要做某样东西，但背包里没有"要算失败，
+        // extractWantedItem() / countItem() 也写好了 —— 但**一次都没被调用**，
+        // 就是两段死代码。后果实测（data/runtime/bot.log）：
+        //
+        //   [code] 挖到铁矿石 0
+        //   [code] 冶炼失败:Error: destination full
+        //   <<< 完成（44s）：冲铁镐: 铁锭0 生铁0 圆石148
+        //
+        // 目标是"弄把铁镐"，铁锭 0、铁镐 0，只因为顺路挖了几块圆石让
+        // 背包总数涨了，就判成功。同样是假进展，只是指标从小票换成了总数。
+        const wanted = this.extractWantedItem(goal)
+        if (wanted && isProduce && !isConsume && !isMove) {
+          const hadN = before[wanted] || 0
+          const nowN = this.countItem(wanted)
+          if (nowN === 0) {
+            return {
+              ok: false,
+              why: `目标是「${goal.slice(0, 14)}」，但背包里一个 ${wanted} 都没有` +
+                `（背包总量 ${totalBefore}->${totalNow}，涨的是别的东西）`
+            }
+          }
+          if (nowN <= hadN) {
+            return {
+              ok: false,
+              why: `目标是「${goal.slice(0, 14)}」，${wanted} 还是 ${hadN} 个，` +
+                `这一趟一个都没多 —— 别的东西涨了不算`
+            }
+          }
+        }
+
+        // ===== 3.6 无单位的零产出（"铁锭0 生铁0"）=====
+        //
+        // 老正则要求"0个/0块"这种带单位的写法。但模型汇报时常写成
+        // "冲铁镐: 铁锭0 生铁0 圆石148" —— 数字紧贴物品名、没有单位，
+        // 全部漏过。两个以上"物品0"是极强的零产出信号，产出型任务直接判失败。
+        if (isProduce && !isConsume && !isMove) {
+          const zeros = [...t.matchAll(/([\u4e00-\u9fa5]{2,6})\s*0(?![0-9])(?![个块根把颗件张座格层度次秒分米])/g)]
+            .map(m => m[1])
+            .filter(w => !/^(第|共|全|约|剩|差|还)$/.test(w))
+          const uniq = Array.from(new Set(zeros))
+          if (uniq.length >= 2) {
+            return {
+              ok: false,
+              why: `输出里 ${uniq.map(w => w + '0').join('、')} —— 全是零产出`
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // 背包读不到（断线等）时不因此判失败，交回文本判据
+    }
 
     return { ok: true, why: '' }
   }
 
+  // ==================== 硬判据（层1根治） ====================
+
+  /**
+   * 给脚下这片世界拍个方块快照。
+   *
+   * 为什么要它：盖墙、铺路、挖通道、堵门口的活，背包不会涨 ——
+   * 挖下来的东西当场又用掉了。只看背包的话这些真干成的活全被判失败，
+   * 只看话术的话没干成的活全被判成功。方块动了才是最硬的证据。
+   *
+   * 采样范围按半径 5、高 -2..+2（约 600 格）。这不是完整世界状态，
+   * 是"他身边这一小片有没有变"—— 够用，而且开销可忽略。
+   */
+  // 快照统一走 src/judge.js —— 那边用**绝对坐标**做 key。
+  // 之前这里 key 是相对偏移、比较时却按当前坐标重拍一次，
+  // 人一动所有 key 全变：实测"动了 2 格没挖"报 482 格变化，
+  // 等于把"他动过没有"当成了"世界变了没有"，走动型假成功全放行。
+  worldSig (pos) {
+    return judge.worldSig(this.bot, pos)
+  }
+
+  /** 和任务开始时的快照比，有几格的方块变了（-1 表示读不到） */
+  worldDiff (pos) {
+    const before = this._taskStartWorld
+    if (!before) return -1
+    // 关键：仍然按**任务开始时锚定的那片区域**取样，
+    // 这样两次快照的坐标系完全一致。
+    const anchor = this._taskStartPos || pos
+    const now = this.worldSig(anchor)
+    return judge.worldDiffCount(before, now)
+  }
+
+  /**
+   * 硬判据：这一趟到底有没有改变世界。
+   *
+   * 返回 { ok, why, progress, evidence }
+   *   progress 是给长期目标的**真实增量**（0 = 什么都没发生）。
+   *   上层只用它，"完成"这两个字不再自带进度。
+   */
+  /**
+   * 硬判据：这一趟到底有没有改变世界。**审批权在这里。**
+   *
+   * 判定本体搬到 src/judge.js 了 —— 因为 main 和 coder 原来各写一份，
+   * 同一份证据能得出相反结论（38 个技能 × 3 种世界态，差值 42%）。
+   * 现在两边都调 judge.judgeTask()，不会再漂。
+   *
+   * 返回 { ok, why, progress, evidence }
+   *   progress 是给长期目标的**真实增量**（0 = 什么都没发生）。
+   */
+  verifyTaskEffect (goal, outText) {
+    const posNow = (this.bot && this.bot.entity) ? this.bot.entity.position : null
+    // 阶段自己声明的证据类型。judge 没有默认分支 —— 阶段没声明会直接抛错。
+    // 没有阶段（临时任务，比如"跟他聊两句"）时按世界证据验：那是最严的一类，
+    // 不是给文本开口子。
+    let stage = null
+    try {
+      if (this.goals) stage = this.goals.currentStage ? this.goals.currentStage() : (this.goals.stage ? this.goals.stage() : null)
+    } catch (e) {}
+    // 有阶段就必须由阶段自己声明证据类型：缺了传 undefined，judge 入口直接抛错。
+    // 只有"压根没有阶段"的临时任务（聊天、跟随）才按 world 验 —— 那是最严的一类，
+    // 不是给文本开口子。
+    const evidence = stage ? stage.evidence : 'world'
+    const res = judge.judgeTask({
+      evidence,
+      minSec: stage && stage.minSec,
+      durationSec: this._taskStartAt ? (Date.now() - this._taskStartAt) / 1000 : 0,
+      healthBefore: this._taskStartHealth,
+      healthAfter: this.bot ? Math.round(this.bot.health) : null,
+      goal: String(goal || ''),
+      text: String(outText || ''),
+      invBefore: this._taskStartInv || {},
+      invAfter: this.snapshotInv(),
+      posBefore: this._taskStartPos,
+      posAfter: posNow,
+      worldBefore: this._taskStartWorld,
+      worldAfter: this.worldSig(this._taskStartPos || posNow),
+      heldBefore: this._taskStartHeld,
+      heldAfter: (this.bot && this.bot.heldItem) ? this.bot.heldItem.name : null,
+      foodLevelBefore: this._taskStartFood,
+      foodLevelAfter: this.bot ? Math.round(this.bot.food) : null,
+      // 硬事实：现在到底还在地下吗？位置类目标（回地面）可以直接用它判到。
+      undergroundAfter: (() => {
+        try { return this.actions.isUnderground() } catch (e) { return null }
+      })()
+    })
+    this._lastProof = res
+    // 账本对照：日志里声称的产量 vs 真实背包增量。
+    // 哨兵审计里"声称 +0 件、实际捡起 28 件"就是这么来的：
+    // 汇报是模型写的，背包是游戏给的，两者必须并排记下来才能对账。
+    try {
+      const inv = res.dims || {}
+      // 账本差：日志/汇报里说的数 vs 背包真的动了多少。
+      // 哨兵审计里"声称 +0 件、实际捡起 28 件"就是这条线要量的东西。
+      let claim = ''
+      try {
+        const wants = judge.wantedItems(String(goal || ''))
+        if (wants.length) {
+          const cn = wants[0].cn
+          const m = new RegExp(cn + '\\s*[:：]?\\s*(\\d+)').exec(String(outText || ''))
+          const actual = (inv.targets || []).find(x => x.cn === cn)
+          claim = ` 声称:${cn}${m ? m[1] : '?'}/实际${actual ? (actual.d >= 0 ? '+' : '') + actual.d : '?'}`
+        }
+      } catch (e) {}
+      this.log(`[ledger]${claim} 背包${inv.invGain >= 0 ? '+' : ''}${inv.invGain} 减${inv.invLoss} ` +
+        `方块${inv.blocks < 0 ? '?' : inv.blocks} 位移${inv.moved === null ? '?' : inv.moved} ` +
+        `手持${inv.heldChanged ? '变' : '未变'} ｜ 结论:${res.ok ? '成' : '败'}`)
+    } catch (e) {}
+    return res
+  }
+
   /** 从目标描述里猜他想要什么物品 */
   extractWantedItem (goal) {
+    // 顺序有意义：长词在前，否则"做钻石镐"会先命中"石镐"。
     const map = {
-      '木镐': 'wooden_pickaxe', '石镐': 'stone_pickaxe', '铁镐': 'iron_pickaxe',
-      '钻石镐': 'diamond_pickaxe', '木斧': 'wooden_axe', '石斧': 'stone_axe',
+      '钻石镐': 'diamond_pickaxe', '木镐': 'wooden_pickaxe', '石镐': 'stone_pickaxe',
+      '铁镐': 'iron_pickaxe', '木斧': 'wooden_axe', '石斧': 'stone_axe',
       '铁斧': 'iron_axe', '木剑': 'wooden_sword', '石剑': 'stone_sword',
       '铁剑': 'iron_sword', '工作台': 'crafting_table', '熔炉': 'furnace',
       '箱子': 'chest', '木棍': 'stick', '火把': 'torch', '床': 'red_bed',
@@ -1579,6 +2566,59 @@ class Bot {
       if (this.mood) this.mood.tick(deltaMin)
       if (this.taste) this.taste.decay(this.mem.clock.now())
     } catch (e) {}
+    try { this.noteLateNight() } catch (e) {}
+  }
+
+  /**
+   * 夜深了，提一句时间。
+   *
+   * 【2026-11-13 UNHUMAN-SCAN #11】
+   *   [04:00:21] [hb] 心情:good
+   *   [04:01:19] 还在挖矿
+   * 10 次心跳全 good，全程一句没提"这么晚了"。
+   *
+   * 原因很简单：spontaneous.js 里 onLateNight() 逻辑完整，
+   * 判断 isVeryLate、算概率、给话术都写好了 —— **但全项目 0 次调用**。
+   * 写好了没人用，等于没写。
+   *
+   * 这里每 10 分钟看一次，符合条件就攒一个"想说话"的念头。
+   * 为什么不每轮都看：凌晨一直在游戏里，每轮都提一次"几点了"会变成复读机。
+   */
+  noteLateNight () {
+    const now = Date.now()
+    // 10 分钟一次就够。onLateNight 内部还有自己的概率，叠起来不会太吵
+    if (now - (this._lastLateNightAt || 0) < 10 * 60 * 1000) return
+    this._lastLateNightAt = now
+
+    let t = null
+    try { t = require('./src/realtime').realTime() } catch (e) { return }
+    if (!t || !(t.isLate || t.isEarlyMorning)) return
+
+    const ev = spontaneous.onLateNight()
+    if (!ev) return
+
+    // 【2026-11-13 修 · UNHUMAN-SCAN #11 接上之后实测的第二个坑】
+    //
+    // 第一版是 `this.spont.push(ev)` 交给队列。凌晨实测他整局都在干活，
+    // 而 spont.tick 对非社交/非吐槽事件有一条 `if (busy) return false` ——
+    // 于是"几点了"这条念头每一轮都被忙挡掉，队列 120 秒后再判定过期。
+    // 也就是说：接上了调用，话还是说出口不了。
+    //
+    // 时间这件事不像"挖到铁矿"，它不需要抽离任务才能说 ——
+    // 人边挖边嘀咕一句"卧槽四点了"是常态。所以这里直接开口。
+    const chance = t.isVeryLate ? 0.55 : 0.35
+    this.log(`[time] ${t.clock} 夜深了，想提一句（p=${chance}）`)
+    if (this.talk && Math.random() < chance) {
+      this.talk.speak(ev.situation, {
+        maxLen: ev.maxLen || 25,
+        minGap: 20000,
+        extraHint: '提一句现在几点了/该睡了。随口一句，别像报告时间，也别拿这个当借口长篇大论。'
+      }).then(ok => {
+        this.log(ok ? `[time] 说了：${t.clock}` : '[time] 这轮没说')
+      }).catch(() => {})
+    }
+    // 队列里也留一份：万一这轮开口被别的事挤掉，下一轮还有机会
+    this.spont.push(ev)
   }
 
   /** 背包快照 */
@@ -1607,11 +2647,17 @@ class Bot {
   async doSurvive (why) {
     // 找吃的本身需要动作能力，不能把 cancel 设成 true
     const needCancel = why !== 'lowhp'
-    if (needCancel && this.actions) this.actions.cancel = true
-    this.busy = false
+    if (needCancel) this._signalCancel('自救：' + why)
+    // 逃命压过一切（rank 100）。home 还在走的话先把它按下去（goHome 每段都会看 cancel），
+    // 否则两条线同时抢 pathfinder —— 那正是「107 → 105 → 107」的形状。
+    if (this.lock.isHolding(REASON.HOME) && this.home) {
+      try { this.home.stop() } catch (e) {}
+    }
+    this.lock.acquire(REASON.SURVIVE, '自救：' + why)
     try {
       await this._survive(why)
     } finally {
+      if (this.lock.isHolding(REASON.SURVIVE)) this.lock.release(REASON.SURVIVE)
       if (this.actions) this.actions.cancel = false
     }
   }
@@ -1788,6 +2834,31 @@ function main () {
     console.error(e.message)
     process.exit(1)
   }
+
+  // ===== 数据目录 =====
+  // 不设 AIFRIEND_DATA 就用默认目录。跑一个 AI 没事；跑多个必然互相覆盖记忆，
+  // 所以这里必须喊一嗓子 —— 之前是静默的，谁都不知道自己在共用目录。
+  if (!process.env.AIFRIEND_DATA) {
+    console.log('[启动] 没设 AIFRIEND_DATA，用默认目录 data/runtime')
+    console.log('       跑多个 AI 时必须各自设一个，否则会互相覆盖记忆')
+  }
+
+  // ===== 实例锁：一个数据目录只允许一个进程 =====
+  // memory.json 是整文件覆盖，两个实例同目录 = 后写的把前一个的记忆吞掉，且不报错。
+  // 所以宁可拒绝启动，也不能让它悄悄跑。
+  const lock = InstanceLock.acquire(DATA, { username: cfg.bot.username })
+  if (!lock.ok) {
+    const e = lock.existing
+    if (e && e.pid) {
+      console.error(`[启动] 这个数据目录已经有一个实例在跑（pid ${e.pid}，起于 ${e.atText}）`)
+      console.error('       要么关掉它，要么用 AIFRIEND_DATA 换个目录')
+    } else {
+      console.error('[启动] 这个数据目录的实例锁建不上（' + (lock.error || '锁文件被占用') + '）')
+      console.error('       要么等一会儿重试，要么用 AIFRIEND_DATA 换个目录')
+    }
+    process.exit(1)
+  }
+  console.log(`[启动] 数据目录 ${path.relative(ROOT, DATA) || DATA}（实例锁已拿到，pid ${process.pid}）`)
 
   const b = new Bot(cfg)
 

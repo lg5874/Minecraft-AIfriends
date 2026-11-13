@@ -28,6 +28,10 @@
     "ignoreChanceWhenBusy": 0.55,
     "autoRespawn": true,
     "reconnectDelaySeconds": 15,
-    "taskTimeoutSeconds": 420
+    "taskTimeoutSeconds": 420,
+    "botNames": [
+      "XJJ_A",
+      "XJJ_B"
+    ]
   }
 }

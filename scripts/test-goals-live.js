@@ -175,7 +175,7 @@ async function main () {
 
     // 挖够 12 块
     let r = g.observe(st({ inv: { stone_pickaxe: 1, raw_iron: 12 }, y: 14 }))
-    ok(g.stage() && g.stage().kind === 'surface', '挖够之后进到"回地面"', g.stage() && g.stage().kind)
+    ok(g.currentStage() && g.currentStage().kind === 'surface', '挖够之后进到"回地面"', g.currentStage() && g.currentStage().kind)
 
     // 还在洞里，不该过
     r = g.observe(st({ inv: { stone_pickaxe: 1, raw_iron: 12 }, y: 30 }))

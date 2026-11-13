@@ -39,3 +39,11 @@ tmp/
 *.orig
 *.rej
 *.tmp.js
+
+# 探针和测试临时产物（成员跑测试时生成的，不该入库）
+.tmp-*
+data/probe-*/
+data/probe*.json
+data/tmp-*/
+# 探针用的独立数据目录（XJJ_XXX 之类的测试账号）
+data/XJJ_*/

@@ -115,7 +115,7 @@ console.log('\n[三、记进度：一步一步往前推]')
   // 阶段1：先弄把石镐（craft）
   let status = fakeStatus({ inv: { wooden_pickaxe: 1, cobblestone: 30 } })
   await g.ensure(status)
-  ok(g.stage().kind === 'craft', '第一步是弄工具')
+  ok(g.currentStage().kind === 'craft', '第一步是弄工具')
   let r = g.observe(status)
   ok(r.ratio < 1, '还没石镐，进度不满', String(r.ratio))
 
@@ -126,7 +126,7 @@ console.log('\n[三、记进度：一步一步往前推]')
   ok(g.goal.stageIndex === 1, '进到第二步')
 
   // 阶段2：带火把和吃的（gather）
-  ok(g.stage().kind === 'gather', '第二步是备料')
+  ok(g.currentStage().kind === 'gather', '第二步是备料')
   status = fakeStatus({ inv: { stone_pickaxe: 1, cobblestone: 30, torch: 4, bread: 2 } })
   r = g.observe(status)
   ok(r.ratio > 0.3 && r.ratio < 1, '备了一半', g.progressText())
@@ -139,7 +139,7 @@ console.log('\n[三、记进度：一步一步往前推]')
   //
   // 【量已改】原来是"挖够 40 块"，那是"一直待在地下"的直接原因。
   // 现在一趟 12 块就算够 —— 真人挖矿是"这一趟挖到这些就上去"，不是挖满一箱。
-  ok(g.stage().kind === 'gather', '第三步是挖矿')
+  ok(g.currentStage().kind === 'gather', '第三步是挖矿')
   status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 3 } })
   r = g.observe(status)
   ok(r.ratio > 0.1 && r.ratio < 0.5, '挖到 3 块粗铁，刚起步', g.progressText())
@@ -149,7 +149,7 @@ console.log('\n[三、记进度：一步一步往前推]')
   ok(r.stageCompleted === true, '12 块粗铁就够一趟 → 过了一步')
 
   // 阶段4：必须回地面（surface）
-  ok(g.stage().kind === 'surface', '挖完必须先回地面')
+  ok(g.currentStage().kind === 'surface', '挖完必须先回地面')
   status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 12 }, y: 14 })
   r = g.observe(status)
   ok(r.stageCompleted === false, '还在洞里 y=14，这步不算过', g.progressText())
@@ -251,18 +251,36 @@ console.log('\n[六、干不下去就放弃]')
 }
 
 // ================================================================
-console.log('\n[七、反复失败也会放弃]')
+console.log('\n[七、反复失败：先换法子，几条路都不行才放弃（也不能几秒就放弃）]')
 {
   const dir = tmp()
+  let t = 1000000
+  const logs = []
   const llm = fakeLLM(JSON.stringify({ key: 'tower', title: '搭个高台看看四周', why: '想看清楚' }))
-  const g = new Goals(dir, { llm, ctx: { log }, cfg: { maxFails: 3 } })
+  const g = new Goals(dir, { llm, ctx: { log: (x) => logs.push(x) }, now: () => t })
   const status = fakeStatus({ inv: { stone_pickaxe: 1 } })
   await g.ensure(status)
 
-  let res
-  for (let i = 0; i < 3; i++) res = g.onTaskResult({ ok: false, text: '卡住了', status })
-  ok(res.abandoned === true, '同一阶段失败 3 次 → 放弃')
-  ok(g.history[g.history.length - 1].reason.includes('3 次'), '理由写得清楚')
+  // 前两遍失败：还按原计划（第一次失败就换 = 假）
+  let r = g.onTaskResult({ ok: false, text: '卡住了', status })
+  ok(g.currentStage().methodIndex === 0, '第 1 遍失败：不换（一失败就换也假）')
+  r = g.onTaskResult({ ok: false, text: '卡住了', status })
+  ok(g.currentStage().methodIndex === 1, '第 2 遍还不行 → 换法子', String(r.switched))
+  ok(!!g.goal, '目标还在')
+  ok(/换个法子/.test(g.current().text), '发下去的活变了', g.current().text)
+
+  // 一路失败到三条路都试完
+  for (let i = 0; i < 8; i++) { t += 1600; r = g.onTaskResult({ ok: false, text: '又卡住了', status }) }
+  ok(g.currentStage().parked === true || r.abandoned === true, '几条路都走不通 → 先搁着（还没到 5 分钟）')
+
+  // 不到最低寿命，不许扔
+  ok(!!g.goal, '才几分钟，目标还在手上')
+
+  // 过了最低寿命，同样的失败就该认账
+  t += 5 * 60 * 1000
+  r = g.onTaskResult({ ok: false, text: '还是不成', status })
+  ok(r.abandoned === true, '过了 5 分钟 → 放弃')
+  ok(/几条路|次都不行/.test(g.history[g.history.length - 1].reason), '理由写得清楚', g.history[g.history.length - 1].reason)
 }
 
 // ================================================================
@@ -335,10 +353,14 @@ console.log('\n[十一、完整演示：一个目标从生到完]')
   g.plan().forEach(p => console.log(`      阶段${p.index + 1} ${p.title}（${p.kind}）`))
 
   // 一步步推进（起始背包：木镐 1、木头 8）
+  // 【改成边盖边攒之后是 7 步：do / 8石6木 / do / 16石6木 / do / 24石4木 / do】
   const steps = [
     { note: '把地面收拾出来', inv: { wooden_pickaxe: 1, oak_log: 8 }, work: 1 },
-    { note: '备料：又砍了 16 根木头、挖了 48 块石头', inv: { wooden_pickaxe: 1, oak_log: 24, cobblestone: 48 } },
-    { note: '立墙', inv: { wooden_pickaxe: 1, oak_log: 24, cobblestone: 48 }, work: 1 },
+    { note: '先攒一小堆（8 石 6 木）', inv: { wooden_pickaxe: 1, oak_log: 14, cobblestone: 8 } },
+    { note: '先搭个小矮墙', inv: { wooden_pickaxe: 1, oak_log: 14, cobblestone: 8 }, work: 1 },
+    { note: '再补一轮（+16 石 6 木）', inv: { wooden_pickaxe: 1, oak_log: 20, cobblestone: 24 } },
+    { note: '扩一圈接墙', inv: { wooden_pickaxe: 1, oak_log: 20, cobblestone: 24 }, work: 1 },
+    { note: '最后补一轮（+24 石 4 木）', inv: { wooden_pickaxe: 1, oak_log: 24, cobblestone: 48 } },
     { note: '封顶装门', inv: { wooden_pickaxe: 1, oak_log: 24, cobblestone: 48 }, work: 1 }
   ]
   for (const st of steps) {
@@ -353,6 +375,441 @@ console.log('\n[十一、完整演示：一个目标从生到完]')
   ok(g.goal === null, '演示跑完，目标收工')
   ok(g.history.length === 1, '历史里有这一条')
   console.log('    结果：' + g.history[0].title + ' —— 用了 ' + g.history[0].stages + ' 步')
+}
+
+// ================================================================
+console.log('\n[十二、#7：同一个阶段不连做 5 遍，第 2 遍没动就换法子]')
+{
+  const dir = tmp()
+  let t = 2000000
+  const llm = fakeLLM(JSON.stringify({ key: 'tower', title: '搭个高台看看四周', why: '想看清楚' }))
+  const g = new Goals(dir, { llm, ctx: { log: (s) => logs.push(s) }, now: () => t })
+  const logs = []
+  // 背包里没有垫脚石：这一阶段怎么弄都不会有进展（#8 的假成功）
+  const status = fakeStatus({ inv: { stone_pickaxe: 1 } })
+  await g.ensure(status)
+  const title = g.currentStage().title
+
+  const attempt = () => { t += 1600; return g.onTaskResult({ ok: true, text: '成了', status }) }
+
+  attempt()
+  ok(g.currentStage().methodIndex === 0, '第 1 遍：还按原计划')
+  const r2 = attempt()
+  ok(g.currentStage().methodIndex === 1, '第 2 遍没进展 → 换法子（不是放弃目标）', String(r2.switched))
+  ok(!!g.goal, '目标还在')
+  ok(/换个法子/.test(g.current().text), '交给上层的话变了', g.current().text)
+
+  // 第 3 遍：总账到 3 -> 该换目标了；还没到 5 分钟，所以先搁着
+  const r3 = attempt()
+  ok(g.currentStage().parked === true, '第 3 遍还不行 → 搁着（5 分钟闸门没过，先不扔）', JSON.stringify(r3))
+  ok(!!g.goal, '搁着的时候目标还在')
+  ok(/放一放|转转|坐一会儿|归置/.test(g.current().text), '搁着时给的是"干点别的"', g.current().text)
+
+  // 同一个任务文本连续出现最多几遍
+  // 按真实节奏：每趟任务取一次文本（current 在同一趟里是稳定的）
+  const texts = []
+  for (let i = 0; i < 20; i++) { texts.push(g.current().text); attempt() }
+  let run = 1
+  let maxRun = 1
+  for (let i = 1; i < texts.length; i++) {
+    if (texts[i] === texts[i - 1]) { run++; maxRun = Math.max(maxRun, run) } else run = 1
+  }
+  ok(maxRun <= 2, '同一句话不会连着重复 5 遍', '最多 ' + maxRun + ' 遍')
+
+  // 过了最低寿命，这条走不通的路才被放下
+  t += 5 * 60 * 1000
+  const rEnd = attempt()
+  ok(rEnd.abandoned === true, '过了 5 分钟 → 放弃这个目标')
+  ok(/几条路|趟|次都不行/.test(g.history[g.history.length - 1].reason), '放弃的理由说得清', g.history[g.history.length - 1].reason)
+
+  const switchLogs = logs.filter(s => /换法子/.test(s))
+  ok(switchLogs.length >= 1, '换法子有日志（写清换什么/为什么）', String(switchLogs.length))
+  console.log('    ' + switchLogs[0])
+  ok(/「.+」→「.+」/.test(switchLogs[0] || ''), '日志里写明了从哪条路换到哪条路')
+}
+
+// ================================================================
+console.log('\n[十三、层3：真实增量 —— 存量不算、没证据不算]')
+{
+  // 1) craft：手上本来就有，不代表这一阶段做完了
+  const mk = async (key, inv) => {
+    const llm = fakeLLM(JSON.stringify({ key, title: 'x' + key, why: 'y' }))
+    const g = new Goals(tmp(), { llm, ctx: { log: () => {} } })
+    await g.ensure(fakeStatus({ inv }))
+    return g
+  }
+  const gIron = await mk('iron', { stone_pickaxe: 1, iron_pickaxe: 1 })
+  ok(gIron.currentStage().kind === 'craft', 'iron 第 1 步是 craft')
+  const pIron = Goals.stageProgress(gIron.currentStage(), fakeStatus({ inv: { stone_pickaxe: 1, iron_pickaxe: 1 } }))
+  ok(pIron.trivial === true, '开局就有石镐 → 这一步"不用做"（跳过，不算他做到）', JSON.stringify(pIron))
+  const gIron2 = await mk('iron', { cobblestone: 20 })
+  const pIron2 = Goals.stageProgress(gIron2.currentStage(), fakeStatus({ inv: { cobblestone: 20 } }))
+  ok(pIron2.ratio === 0 && !pIron2.trivial, '手上没有石镐 → 必须真的做出来才算', JSON.stringify(pIron2))
+
+  // 2) gather：开局有 130 块圆石，也不算攒够
+  const gTower = await mk('tower', { cobblestone: 130 })
+  const sT = gTower.currentStage()
+  ok(sT.kind === 'gather', 'tower 第 1 步是 gather')
+  ok(Goals.stageProgress(sT, fakeStatus({ inv: { cobblestone: 130 } })).ratio === 0,
+    '开局 130 块圆石 → 这一步也不算做完')
+
+  // 3) 真的多出来 48 块 → 才过
+  ok(Goals.stageProgress(sT, fakeStatus({ inv: { cobblestone: 178 } })).ratio === 1,
+    '真的多挖了 48 块 → 过')
+
+  // 4) do：报"完成"但不给增量 → 不推进
+  const gHouse = await mk('house', { wooden_pickaxe: 1 })
+  const beforeIdx = gHouse.goal.stageIndex
+  gHouse.onTaskResult({ ok: true, text: '把地面收拾好了', status: fakeStatus({ inv: { wooden_pickaxe: 1 } }) })
+  ok(gHouse.goal.stageIndex === beforeIdx, 'do 阶段：没给 progress → 不白送')
+  ok(gHouse.currentStage().noProof >= 1, '记了一次"拿不出硬证据"', String(gHouse.currentStage().noProof))
+  gHouse.onTaskResult({ ok: true, text: '收拾好了', status: fakeStatus({ inv: { wooden_pickaxe: 1 } }), progress: 1 })
+  ok(gHouse.goal.stageIndex === beforeIdx + 1, '给了真实增量 → 才过这一步')
+
+  // 5) surface：一开始就在地面上，是"没走过"，不是"做到了"
+  const pTrivial = Goals.stageProgress(
+    { kind: 'surface', need: { y: 58 }, base: { ug: false, y: 70 } },
+    { pos: { x: 0, y: 70, z: 0 }, underground: false, inventory: {} }
+  )
+  ok(pTrivial.trivial === true, 'surface：一开始就在外面 → 标成"本来就不用做"')
+  const pReal = Goals.stageProgress(
+    { kind: 'surface', need: { y: 58 }, base: { ug: true, y: 20 } },
+    { pos: { x: 0, y: 70, z: 0 }, underground: false, inventory: {} }
+  )
+  ok(pReal.ratio === 1 && !pReal.trivial, 'surface：真从下面上来了 → 才算到')
+}
+
+
+// ================================================================
+console.log('\n[十四、stage() 是声明式候选池，不是命令]')
+{
+  const llm = fakeLLM(JSON.stringify({ key: 'tower', title: '搭个高台看看四周', why: '想看清楚' }))
+  const g = new Goals(tmp(), { llm, ctx: { log: () => {} } })
+  await g.ensure(fakeStatus({ inv: { stone_pickaxe: 1, cobblestone: 5 } }))
+
+  const pool = g.stage()
+  ok(Array.isArray(pool), 'stage() 返回的是池子（数组），不是"下一步做 X"', typeof pool)
+  ok(pool.length === g.goal.stages.length, '池子里是这次的全部步骤', String(pool.length))
+  ok(pool.every(x => x.state), '每条都带状态（done/current/later）')
+  ok(pool[0].state === 'current' && pool[1].state === 'later', '第一条是当前的，后面的还是 later')
+  ok(pool.every(x => Array.isArray(x.prereqs)), '每条都说清前置条件')
+  ok(pool.every(x => Array.isArray(x.ways) && x.ways.length >= 1), '每条都给出可选的干法')
+  ok(!('score' in pool[0]) && !('priority' in pool[0]), '不带排序/优先级 —— 排序是 session 的事')
+  ok(!('text' in pool[0]) || !/(先|去|赶紧)/.test(String(pool[0].text || '')), '没有"下命令"的字段')
+
+  // 条件按增量算：手上 5 块圆石 ≠ 攒够 40
+  const first = pool[0]
+  const stone = first.prereqs.find(r => /surfacestone|石头/.test(r.what + r.text))
+  ok(!!stone && stone.ok === false, '前置条件说"还不够"', JSON.stringify(stone || {}))
+
+  // 开局就有 130 块老石头：这一阶段仍然是 0/40（存量不算）
+  const g2 = new Goals(tmp(), { llm: fakeLLM(JSON.stringify({ key: 'tower', title: '搭个高台', why: '想看远' })), ctx: { log: () => {} } })
+  await g2.ensure(fakeStatus({ inv: { stone_pickaxe: 1, cobblestone: 130 } }))
+  const stone2 = g2.stage()[0].prereqs.find(r => /surfacestone|石头/.test(r.what + r.text))
+  ok(!!stone2 && stone2.ok === false, '开局 130 块老石头 → 池子里还是不够（存量不算）', JSON.stringify(stone2 || {}))
+
+  // 这一步里真的多弄到 40 块，条件才成立
+  const st2 = fakeStatus({ inv: { stone_pickaxe: 1, cobblestone: 45 } })
+  g.observe(st2)
+  const pool3 = g.stage()
+  ok(pool3[0].progress !== null, '当前这一步带"上次进展"')
+  ok(pool3[1].state === 'current' || pool3[0].state === 'done', '攒够之后这一步就过去了', pool3[0].state)
+
+  console.log('    池子：')
+  pool3.forEach(x => console.log(`      ${x.index + 1}. [${x.state}] ${x.title}  ready=${x.ready}` +
+    (x.blockedBy.length ? '  差：' + x.blockedBy.join('；') : '') +
+    (x.progress ? `  进度=${(x.progress.ratio * 100).toFixed(0)}%` : '')))
+}
+
+
+// ================================================================
+console.log('\n[十五、P0：地表石头、钻石深度、火把顺序]')
+{
+  // P0-1 深板岩不算地表石头
+  const G = require('../src/goals')
+  const n1 = G.itemCount({ cobbled_deepslate: 40 }, '#surfacestone')
+  const n2 = G.itemCount({ cobblestone: 20, stone: 5, cobbled_deepslate: 40 }, '#surfacestone')
+  ok(n1 === 0, '深板岩不算地表石头（y<0 才有，地表挖不到）', String(n1))
+  ok(n2 === 25, '圆石 + 石头还算', String(n2))
+
+  // P0-2 / P0-3 钻石目标：火把在下去之前，深度是 1.18+ 的真实分布
+  const POOL = G.POOL
+  const dia = POOL.find(g => g.key === 'diamond')
+  const depth = dia.stages.find(s => s.kind === 'depth')
+  const torchIdx = dia.stages.findIndex(s => s.need && s.need.torch)
+  const depthIdx = dia.stages.findIndex(s => s.kind === 'depth')
+  ok(depth.need.y === -54, '钻石的深度是 y=-54（1.18+ 峰值 -58/-59）', String(depth.need.y))
+  ok(torchIdx >= 0 && torchIdx < depthIdx, '火把在下去之前备好', `torch@${torchIdx} depth@${depthIdx}`)
+
+  const iron = POOL.find(g => g.key === 'iron')
+  const ironTorch = iron.stages.findIndex(s => s.need && s.need.torch)
+  const ironMine = iron.stages.findIndex(s => s.need && s.need.raw_iron)
+  ok(ironTorch >= 0 && ironTorch < ironMine, '铁的流程里火把也在下矿之前', `torch@${ironTorch} mine@${ironMine}`)
+  console.log('    diamond：' + dia.stages.map(s => s.title).join(' → '))
+  console.log('    iron   ：' + iron.stages.map(s => s.title).join(' → '))
+}
+
+
+// ================================================================
+console.log('\n[十六、歇着的时候不发活（任务调度要问心情）]')
+{
+  const mood = { resting: false }
+  const llm = fakeLLM(JSON.stringify({ key: 'tower', title: '搭个高台', why: '想看远' }))
+  const g = new Goals(tmp(), { llm, ctx: { log: () => {}, mood } })
+
+  // 正常状态：能立目标
+  const goal = await g.ensure(fakeStatus({ inv: { stone_pickaxe: 1 } }))
+  ok(!!goal, '没在歇着 → 正常立目标')
+
+  // 进入休息
+  mood.resting = true
+  ok(g.isResting() === true, '能读到 mood.resting')
+  ok(g.candidates(fakeStatus({ inv: { stone_pickaxe: 1 } })).length === 0, '歇着 → 方向池是空的（不产出新目标）')
+  const cur = g.current()
+  ok(cur && cur.resting === true, '歇着 → current() 给的是"歇着"', JSON.stringify(cur && cur.text))
+  ok(!/石头|矿|镐/.test(cur.text), '不会再把攒料/挖矿的活发出去', cur.text)
+  ok(/歇/.test(g.promptBlock()), '提示词里也说在歇着')
+
+  // 手上原本的目标没被扔掉
+  const keep = await g.ensure(fakeStatus({ inv: { stone_pickaxe: 1 } }))
+  ok(keep === goal, '歇着不扔已有的目标（只是先不干）')
+
+  // 休息窗口里：在途任务回报只记账，不换法子、不改主意
+  {
+    const m2 = { resting: false }
+    const llm = fakeLLM(JSON.stringify({ key: 'tower', title: '搭个高台', why: '想看远' }))
+    const g3 = new Goals(tmp(), { llm, ctx: { log: () => {}, mood: m2 } })
+    const st = fakeStatus({ inv: { stone_pickaxe: 1 } })
+    await g3.ensure(st)
+    m2.resting = true
+    const r1 = g3.onTaskResult({ ok: true, text: '成了', status: st })
+    ok(r1.resting === true, '歇着时任务回报 → 只记账', JSON.stringify(r1))
+    ok(g3.currentStage().idleWins === 1, '账还是记着的（只是不做决定）', String(g3.currentStage().idleWins))
+    ok(g3.currentStage().methodIndex === 0, '歇着时不换法子（休息窗口不偷步）', String(g3.currentStage().methodIndex))
+    m2.resting = false
+    g3.onTaskResult({ ok: true, text: '成了', status: st })
+    ok(g3.currentStage().methodIndex === 1, '醒过来之后才按趟数换法子', String(g3.currentStage().methodIndex))
+  }
+
+  // 收工（session.phase === 'resting'）也算"歇着"
+  {
+    const gRest = new Goals(tmp(), { ctx: { log: () => {}, session: { phase: 'resting' } } })
+    ok(gRest.isResting() === true, 'session 收工了 → goals 也不再派人（只读 session 状态）')
+    ok(gRest.current() && gRest.current().resting === true, '收工时 current() 给的是"歇着"')
+    const gWork = new Goals(tmp(), { ctx: { log: () => {}, session: { phase: 'working', isTodayDone: () => false } } })
+    ok(gWork.isResting() === false, 'session 在上班 → 照常干活')
+    const gDone = new Goals(tmp(), { ctx: { log: () => {}, session: { phase: 'working', isTodayDone: () => true } } })
+    ok(gDone.isResting() === true, 'todayDone 也算收工')
+  }
+
+  // main.js 没往 ctx 里传 mood 的情况：从 mood.active() 读（只读）
+  {
+    const Mood = require('../src/mood')
+    const live = new Mood(tmp())
+    live.resting = true
+    const g2 = new Goals(tmp(), { ctx: { log: () => {} } })  // 注意：没有 mood
+    ok(g2.isResting() === true, 'ctx 里没有 mood 时，能读到进程里那个 mood 的休息状态')
+    live.resting = false
+    ok(g2.isResting() === false, '歇够了也能读到')
+  }
+
+  // 歇够了：接着干
+  mood.resting = false
+  const cur2 = g.current()
+  ok(cur2 && cur2.resting !== true, '歇够了 → 又发活了', cur2 && cur2.text)
+  console.log('    歇够之后发的是：' + (cur2 && cur2.text))
+}
+
+
+// ================================================================
+console.log('\n[十七、house 边盖边攒 / getup 拆成爬高度+找露天]')
+{
+  const POOL = Goals.POOL
+  const house = POOL.find(g => g.key === 'house')
+  const gs = house.stages
+  const gathers = gs.filter(x => x.kind === 'gather')
+  const stone = gathers.reduce((a, x) => a + (x.need['#surfacestone'] || 0), 0)
+  const logs = gathers.reduce((a, x) => a + (x.need['#log'] || 0), 0)
+  ok(gs.length >= 6, 'house 拆成了多步（边盖边攒）', gs.length + ' 步')
+  ok(gathers.length >= 3, '备料拆成 3 轮', String(gathers.length))
+  ok(stone === 48 && logs === 16, '总料还是 48 石 + 16 木（只是分三轮）', `${stone}/${logs}`)
+  ok(gathers.every(x => x.need['#surfacestone'] <= 24), '每一轮都不超过 24 块（一口气攒得动）')
+  // 每轮备料后面都跟着一段建造
+  ok(gs[gs.length - 1].kind === 'do', '最后一段是建造，不是攒料')
+
+  // 天黑 / 血少 → house 更想盖
+  const dayInv = { stone_pickaxe: 1, oak_log: 10 }
+  const day = house.score({ inventory: dayInv, time: '白天', health: 20 })
+  const night = house.score({ inventory: dayInv, time: '夜', health: 20 })
+  const hurt = house.score({ inventory: dayInv, time: '白天', health: 6 })
+  ok(night > day, '夜里更想有个能关门的地方', `${day} → ${night}`)
+  ok(hurt >= day, '血少也会想盖', `${day} → ${hurt}`)
+
+  const getup = POOL.find(g => g.key === 'getup')
+  ok(getup.stages[0].kind === 'climb', 'getup 第一步是"往上爬高度"（做得到的事）', getup.stages[0].kind)
+  ok(getup.stages[1].kind === 'surface', '第二步才是"找到露天"', getup.stages[1].kind)
+
+  const climb = { kind: 'climb', need: { y: 58 }, base: { y: 42 } }
+  const at = (y) => ({ pos: { x: 0, y, z: 0 }, inventory: {}, underground: true })
+  ok(Goals.stageProgress(climb, at(42)).ratio === 0, 'climb：还没动')
+  ok(Math.abs(Goals.stageProgress(climb, at(50)).ratio - 0.5) < 0.01, 'climb：爬到一半就算一半')
+  ok(Goals.stageProgress(climb, at(58)).ratio === 1, 'climb：到高度就算这一步做到')
+  console.log('    house：' + gs.map(x => x.title).join(' → '))
+  console.log('    getup：' + getup.stages.map(x => x.title).join(' → '))
+}
+
+
+// ================================================================
+console.log('\n[十八、地表头上被遮挡 ≠ 在地下（house 不该被无辜扣 25）]')
+{
+  const g = new Goals(tmp(), { ctx: { log: () => {} } })
+  const tree = { pos: { x: 69, y: 68, z: 1 }, health: 20, food: 20, inventory: {}, time: '白天', underground: true }
+  const deep = { pos: { x: 0, y: 40, z: 0 }, health: 20, food: 20, inventory: {}, time: '白天', underground: true }
+  const flat = { pos: { x: 69, y: 68, z: 1 }, health: 20, food: 20, inventory: {}, time: '白天', underground: false }
+
+  const hTree = g.candidates(tree).find(c => c.key === 'house')
+  const hDeep = g.candidates(deep).find(c => c.key === 'house')
+  const hFlat = g.candidates(flat).find(c => c.key === 'house')
+  ok(hTree.score === hFlat.score - 8, '站在树底下只扣 8（挪两步的事）', `${hFlat.score} → ${hTree.score}`)
+  ok(hDeep.score <= 15, '真的在地面以下 → 盖房压到 15（物理上干不了）', `${hFlat.score} → ${hDeep.score}`)
+  // 关键判据：洞里「盖房」必须低于「上去」
+  const caveInv = { stone_pickaxe: 1, iron_pickaxe: 1, cobblestone: 130, oak_log: 26 }
+  for (const time of ['白天', '夜']) {
+    const cave = { pos: { x: 0, y: 42, z: 0 }, health: 20, food: 20, inventory: caveInv, time, underground: true }
+    const cs = g.candidates(cave)
+    const h = cs.find(c => c.key === 'house')
+    const u = cs.find(c => c.key === 'getup')
+    ok(h.score < u.score, `洞里（${time}）house < getup（不再"在洞里挑盖房"）`, `house=${h.score} getup=${u.score}`)
+  }
+  // 地面上要恢复正常
+  const surf = { pos: { x: 0, y: 70, z: 0 }, health: 20, food: 20, inventory: caveInv, time: '白天', underground: false }
+  const hs = g.candidates(surf).find(c => c.key === 'house')
+  ok(hs.score >= 80, '地面 y=70 材料齐 → house 不被误压', String(hs.score))
+  ok(g.candidates(tree)[0].key === 'house', '地表被树挡着时 house 仍是首选', g.candidates(tree)[0].key)
+  console.log('    树底：' + g.candidates(tree).slice(0, 3).map(c => c.key + '(' + c.score + ')').join(' '))
+  console.log('    地下：' + g.candidates(deep).slice(0, 3).map(c => c.key + '(' + c.score + ')').join(' '))
+}
+
+
+// ================================================================
+console.log('\n[十九、今天份：攒到一半不许喊够了（实机 4/6 木头就收工）]')
+{
+  const llm = fakeLLM(JSON.stringify({ key: 'house', title: '盖屋', why: 'x' }))
+  const g = new Goals(tmp(), { llm, ctx: { log: () => {} } })
+  const st = (inv) => fakeStatus({ inv, y: 70 })
+  await g.ensure(st({ stone_pickaxe: 1 }))
+  g.goal.stageIndex = 1
+  g.goal.stages[1].base = { inv: {}, pos: { x: 0, y: 70, z: 0 }, y: 70 }
+
+  const half = g.dailyQuota(st({ cobblestone: 8, oak_log: 4 }))
+  ok(half.reached === false, '8 石 + 4 木（差 2 根）→ 还不该收工', half.text)
+  const full = g.dailyQuota(st({ cobblestone: 8, oak_log: 6 }))
+  ok(full.reached === true, '8 石 + 6 木 → 这一份够了', full.text)
+  console.log('    ' + half.text)
+  console.log('    ' + full.text)
+}
+
+
+// ================================================================
+console.log('\n[二十、history 记下"立目标时在哪"（排序 bug 的判据）]')
+{
+  let t = 3000000
+  const logs = []
+  const llm = fakeLLM(JSON.stringify({ key: 'iron', title: '挖铁', why: 'x' }))
+  const g = new Goals(tmp(), { llm, ctx: { log: (x) => logs.push(x) }, now: () => t })
+  await g.ensure(fakeStatus({ inv: { stone_pickaxe: 1 }, y: 42 }))
+  ok(g.goal.createdY === 42, '目标上记着立的时候 y=42', String(g.goal.createdY))
+  ok(g.goal.createdUnderground === true, '也记着当时在地下')
+  t += 6 * 60 * 1000
+  g.abandon('测试')
+  const h = g.history[g.history.length - 1]
+  ok(h.y === 42 && h.underground === true, 'history 里有 y / underground', JSON.stringify({ y: h.y, ug: h.underground }))
+  ok('yNow' in h && 'undergroundNow' in h, '也记了扔的时候在哪', JSON.stringify({ yNow: h.yNow, ugNow: h.undergroundNow }))
+  console.log('    ' + JSON.stringify(h))
+}
+
+// ================================================================
+console.log('\n[二十一、gather 进度用峰值：挖到就算、消耗不倒退、开局不白送]')
+{
+  const P = Goals.stageProgress
+  const st = (need, baseInv) => ({
+    kind: 'gather',
+    need,
+    base: { inv: Object.assign({}, baseInv), peak: {} }
+  })
+  const inv = (o) => ({ inventory: o })
+
+  // 1. 挖到比开局多 8 块 -> 1
+  {
+    const s = st({ '#surfacestone': 8 }, {})
+    const p = P(s, inv({ cobblestone: 8 }))
+    ok(p.ratio === 1, '挖到 8 块（需求 8）→ ratio=1', String(p.ratio))
+  }
+
+  // 2. 挖到 10 后消耗到 5 -> 仍是 1
+  {
+    const s = st({ '#surfacestone': 8 }, {})
+    P(s, inv({ cobblestone: 10 }))
+    const p = P(s, inv({ cobblestone: 5 }))
+    ok(p.ratio === 1, '挖到 10 再消耗到 5 → ratio 仍是 1（不倒退）', String(p.ratio))
+  }
+
+  // 3. 开局 170 块，一块没挖 -> 0
+  {
+    const s = st({ '#surfacestone': 8 }, { cobblestone: 170 })
+    const p = P(s, inv({ cobblestone: 170 }))
+    ok(p.ratio === 0, '开局 170 块、一块没挖 → ratio=0（不白送）', String(p.ratio))
+  }
+
+  // 4. 挖到 4 块（需求 8）-> 0.5
+  {
+    const s = st({ '#surfacestone': 8 }, {})
+    const p = P(s, inv({ cobblestone: 4 }))
+    ok(Math.abs(p.ratio - 0.5) < 1e-9, '挖到 4 块（需求 8）→ ratio=0.5', p.ratio.toFixed(3))
+  }
+
+  // 5. 关键：挖到 8 → 消耗到 2 → 再挖 3（到 5），peak 仍是 8
+  {
+    const s = st({ '#surfacestone': 8 }, {})
+    P(s, inv({ cobblestone: 8 }))
+    P(s, inv({ cobblestone: 2 }))
+    const p = P(s, inv({ cobblestone: 5 }))
+    ok(s.base.peak['#surfacestone'] === 8, '消耗后再挖，peak 取历史最大值 8', JSON.stringify(s.base.peak))
+    ok(p.ratio === 1, '消耗后再挖 3 块（到 5）→ ratio 仍是 1', String(p.ratio))
+  }
+
+  // 6. 多个 key 分别记峰值，用光也不倒退
+  {
+    const s = st({ '#surfacestone': 8, '#log': 6 }, {})
+    P(s, inv({ cobblestone: 8, oak_log: 6 }))
+    const p = P(s, inv({ cobblestone: 0, oak_log: 0 }))
+    ok(p.ratio === 1, '石头和木头都攒够后全用光 → ratio 仍是 1', p.text)
+  }
+
+  // 7. #surfacestone 认 diorite / andesite / granite
+  {
+    const n1 = Goals.itemCount({ cobblestone: 3, diorite: 5 }, '#surfacestone')
+    ok(n1 === 8, '背包 {cobblestone:3, diorite:5} → #surfacestone=8（不是 3）', String(n1))
+    const n2 = Goals.itemCount({ cobblestone: 3, andesite: 2, granite: 1 }, '#surfacestone')
+    ok(n2 === 6, 'andesite / granite 也算地表石头', String(n2))
+  }
+
+  // 8. 深板岩仍然排除
+  {
+    const n3 = Goals.itemCount({ cobblestone: 3, cobbled_deepslate: 10, deepslate: 4 }, '#surfacestone')
+    ok(n3 === 3, 'cobbled_deepslate / deepslate 不算地表石头', String(n3))
+  }
+
+  // 9. dailyQuota 用同一口径：消耗后不倒退
+  {
+    const g = new Goals(tmp(), { ctx: { log: () => {} } })
+    const s = st({ '#surfacestone': 8 }, {})
+    g.goal = { stages: [s], stageIndex: 0 }
+    const q1 = g.dailyQuota({ inventory: { cobblestone: 8 } })
+    const q2 = g.dailyQuota({ inventory: { cobblestone: 0 } })
+    ok(q1.reached === true && q2.reached === true && s.base.peak['#surfacestone'] === 8,
+      '今天份也按峰值算：挖够 8 块后用光，今天份仍算完成', q2.text)
+  }
 }
 
 // ================================================================

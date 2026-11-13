@@ -156,8 +156,14 @@ console.log('\n[检索]')
   const dir = tmpDir('rank')
   const lib = new SkillLibrary(dir)
   // 两个不同意图、但都跟"石镐"沾边的技能，用来比排序
+  //
+  // k_mine 的描述里必须带"石镐"：skills.js 在 #8 里把 useBonus 从
+  // min(uses/20, 1) 降到 min(uses/100, 0.3)，旧的"用木镐挖石头"在
+  // query="做一把石镐" 下得分正好掉到 2.05（阈值 2.2），
+  // 于是"能搜到两个候选"就只剩 1 个 —— 那是权重变了、夹具没跟上，
+  // 不是检索坏了。带上"石镐"之后得分 3.23，和 k_craft(19.44) 差距稳定。
   lib.add({ name: 'k_craft', desc: '用圆石做一把石镐', code: CODE_STONE_PICK })
-  lib.add({ name: 'k_mine', desc: '用木镐挖石头', code: CODE_MINE_WITH_WOOD })
+  lib.add({ name: 'k_mine', desc: '用木镐挖石头，攒料做石镐', code: CODE_MINE_WITH_WOOD })
 
   // k_mine 一直失败，k_craft 一直成功
   for (let i = 0; i < 5; i++) lib.markUse('k_mine', false)
@@ -393,7 +399,26 @@ async function testCoderReuse () {
     cfg: { llm: { codeMaxTokens: 1000 }, behavior: { taskTimeoutSeconds: 20 } }
   }
 
-  const bot = { username: 'XJJ', health: 20, food: 20, time: 0, entity: {}, players: {} }
+  // 【测试夹具】必须给 bot 一个真 inventory。
+  //
+  // coder 在 112917d 之后会用 `bot.inventory.items()` 核对"世界真的变了"
+  // （src/coder.js 的 verifySkillEffect，防假成功的第一层）。
+  // 这里原来只有 {username, health, ...}，没有 inventory：
+  // snapshotInv() 永远返回 {}，于是"真的搓出了石镐"也被判成
+  // "背包没增加"，复用整条链路直接断掉（表现为 reused=null、uses=1 ok=0）。
+  //
+  // 注意 items() 必须读**当前的** inv 变量（测试中途会 rebind），所以用闭包。
+  const bot = {
+    username: 'XJJ',
+    health: 20,
+    food: 20,
+    time: 0,
+    entity: {},
+    players: {},
+    inventory: {
+      items: () => Object.entries(inv).map(([name, count]) => ({ name, count }))
+    }
+  }
   const coder = new Coder(bot, actions, llm, lib, ctx)
   const goal = '用圆石做一把石镐'
 

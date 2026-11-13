@@ -12,7 +12,17 @@
     "test:decay": "node scripts/test-decay.js",
     "test:persona": "node scripts/test-persona.js",
     "test": "node scripts/test-memory.js && node scripts/test-decay.js && node scripts/test-persona.js && node scripts/test-perceive.js",
-    "test:perceive": "node scripts/test-perceive.js"
+    "test:perceive": "node scripts/test-perceive.js",
+    "test:fake-success": "node scripts/test-fake-success.js",
+    "scan:fake": "node scripts/scan-fake-success.js",
+    "test:actionlock": "node scripts/test-actionlock.js",
+    "test:cost": "node scripts/test-cost.js",
+    "test:lie-audit": "node scripts/lie-audit.js --self-check",
+    "test:skills": "node scripts/test-skills.js",
+    "test:goals": "node scripts/test-goals.js",
+    "blind": "node scripts/blind-test.js",
+    "check:judge": "node scripts/check-judge-discipline.js",
+    "audit:ledger": "node scripts/audit-skill-ledger.js"
   },
   "keywords": [
     "minecraft",

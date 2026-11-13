@@ -148,9 +148,16 @@ class Memory {
   }
 
   save () {
+    // 原子写：先写同目录的临时文件，再 rename 覆盖。
+    // 原来直接 writeFileSync(this.file) 有两个问题：
+    //   1. 写一半被杀 -> 盘上是半截 JSON，下次启动 load() 失败，记忆全丢；
+    //   2. 两个实例共用一个目录时互相整文件覆盖，谁最后写谁说了算（静默丢记忆）。
+    // rename 在同一文件系统内是原子的：要么是旧内容，要么是完整新内容。
+    const tmp = this.file + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2, 8)
+    let fd = null
     try {
       fs.mkdirSync(this.dir, { recursive: true })
-      fs.writeFileSync(this.file, JSON.stringify({
+      const payload = JSON.stringify({
         version: VERSION,
         entries: this.entries,
         people: this.people,
@@ -160,8 +167,17 @@ class Memory {
         summaries: this.summaries,
         journal: this.journal.slice(-300),
         lastDecayAt: this.lastDecayAt
-      }, null, 0), 'utf8')
+      }, null, 0)
+      // 先 fsync 再 rename：进程被杀只丢这次，机器断电也不会留下空文件
+      fd = fs.openSync(tmp, 'w')
+      fs.writeSync(fd, payload)
+      try { fs.fsyncSync(fd) } catch (e2) {}
+      fs.closeSync(fd)
+      fd = null
+      fs.renameSync(tmp, this.file)
     } catch (e) {
+      try { if (fd != null) fs.closeSync(fd) } catch (e2) {}
+      try { fs.unlinkSync(tmp) } catch (e2) {}
       console.error('[mem] save failed:', e.message)
     }
   }
@@ -398,6 +414,13 @@ class Memory {
 
   /** 从一句对话里提取并决定要不要记 */
   maybeRemember (text, meta = {}) {
+    // 【说过话】记号（地名不是人的主判据，见 person/note/peopleDigest）。
+    // 只有**玩家真的开口**才会走到这里，所以这是"这是个活人"最可靠的证据。
+    // 打在他自己的档案上，跟记忆一起落盘 —— 重载后依然认得出来。
+    for (const n of (Array.isArray(meta.who) ? meta.who : (meta.who ? [meta.who] : []))) {
+      const p = this.people[n]
+      if (p) p.talked = true
+    }
     const v = writer.admit({ text, who: meta.who, where: meta.where })
     if (!v.keep) return null
     return this.add({
@@ -425,7 +448,8 @@ class Memory {
         gave: [], got: [],
         hits: 0,
         trust: 0,
-        lastHitAt: 0
+        lastHitAt: 0,
+        talked: false   // 说过话没有（地名过滤的主判据）
       }
     }
     const p = this.people[name]
@@ -437,6 +461,21 @@ class Memory {
   }
 
   note (name, text) {
+    // 【地名不是人】UNHUMAN-SCAN #13 的尾巴
+    //
+    // 实测 coder 写了 `memory.note('标记起点', '起点 (100.48,59,14.3) 开始做路标')`，
+    // 于是 people 里多了一个叫"标记起点"的人，peopleDigest 就念成
+    // 「- 标记起点（一般）：起点 (100.48,59,14.3) 开始做路标」——
+    // 他会在提示词里把自己的路标当成一个人介绍。
+    //
+    // 判据：名字像地名 + 从没说过话（没有互动档案）-> 不记成"人"。
+    // 真玩家叫"矿洞王"这种，一开口 talked 就是 true，照记不误。
+    const known = this.people[name]
+    if (!known && writer.looksLikePlaceName(name)) {
+      this.journal.push({ t: this.clock.now(), text: short(`关于${name}：${text}`), why: 'place-not-person' })
+      if (this.journal.length > 300) this.journal.shift()
+      return
+    }
     const p = this.person(name); if (!p) return
     if (!p.notes.includes(text)) p.notes.push(text)
     if (p.notes.length > 30) p.notes.shift()
@@ -448,6 +487,7 @@ class Memory {
 
   gave (to, item) {
     const p = this.person(to); if (!p) return
+    p.interacted = true   // 有过实际互动，地名过滤不会碰他
     p.gave.push({ t: this.clock.now(), item })
     if (p.gave.length > 40) p.gave.shift()
     this.add({
@@ -458,6 +498,7 @@ class Memory {
 
   got (from, item) {
     const p = this.person(from); if (!p) return
+    p.interacted = true   // 有过实际互动，地名过滤不会碰他
     p.got.push({ t: this.clock.now(), item })
     if (p.got.length > 40) p.got.shift()
     p.trust = Math.min(10, (p.trust || 0) + 1)
@@ -469,6 +510,7 @@ class Memory {
 
   hit (by, times = 1) {
     const p = this.person(by); if (!p) return
+    p.interacted = true   // 有过实际互动，地名过滤不会碰他
     p.hits = (p.hits || 0) + times
     p.lastHitAt = this.clock.now()
     p.trust = Math.max(-10, (p.trust || 0) - times)
@@ -648,6 +690,11 @@ class Memory {
   peopleDigest (limit = 8) {
     const now = this.clock.now()
     const list = Object.entries(this.people)
+      // 【地名不是人】老数据里已经躺着的地名（"标记起点"这类）也挡在摘要外面。
+      // 主判据是"说过话/有过互动"，名字特征词只是辅助 —— 真玩家说过一句就放行。
+      .filter(([name, p]) => !(writer.looksLikePlaceName(name) &&
+        !p.talked && !p.interacted &&
+        !p.hits && !(p.gave || []).length && !(p.got || []).length))
       .sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0))
       .slice(0, limit)
 

@@ -127,8 +127,16 @@ class LLM {
     let lastErr = null
 
     // 依次试：当前 -> 下一个 -> ... 绕一圈
+    //
+    // 【实测 bug 修复 · 2026-11-14】原来是 `(this.activeIndex + hop) % total`。
+    // 但 hop=0 失败后 `_switchTo` 会把 this.activeIndex 改成 1，
+    // 于是 hop=1 时算 `(1+1)%2 = 0` —— 又打回主端点，备用永远用不上。
+    // 两个 provider 时表现最明显：主端点 403 一次，整个调用就抛错。
+    // 三个 provider 时 `(1+1)%3 = 2`，看起来"能救回来"，其实跳过了 p1。
+    // 修法：循环开始前快照起点，用固定基准算偏移。
+    const startIndex = this.activeIndex
     for (let hop = 0; hop < total; hop++) {
-      const idx = (this.activeIndex + hop) % total
+      const idx = (startIndex + hop) % total
       const p = this.providers[idx]
       const h = this.health[idx]
 

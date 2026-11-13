@@ -90,7 +90,14 @@ console.log('\n[心情：影响迁就意愿]')
   m.energy = 0.1; m.spirit = 0.2; m.irritation = 0.9; m.satisfaction = 0.3
   const bad = m.willingness()
   ok(good > bad, `心情好更愿意迁就（${good.toFixed(2)} vs ${bad.toFixed(2)}）`)
+  // 【2026-11-13 UNHUMAN-SCAN #10】原来这里断言 energy=0.1 + irritation=0.9
+  // 应该返回 'irritated'。但那正是被修的 bug：energy=0.1 已经快累垮了，
+  // 还说他"只是烦"就不对。现在 energy<0.12 直接判 tired。
+  // 改成用"精力正常但很烦"来验烦躁这条路径。
+  m.energy = 0.7; m.spirit = 0.5; m.irritation = 0.9; m.satisfaction = 0.4
   ok(m.state() === 'irritated', '烦躁时状态是 irritated')
+  m.energy = 0.1
+  ok(m.state() === 'tired', '累垮了优先说累，不是烦')
 }
 
 console.log('\n[心情：事件影响]')

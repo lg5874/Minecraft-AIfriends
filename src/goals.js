@@ -99,13 +99,18 @@ function itemCount (inv, key) {
     case '#log': return sum(/_log$/)
     case '#planks': return sum(/_planks$/)
     case '#stone': return sum(/^(cobblestone|stone|deepslate|cobbled_deepslate|andesite|diorite|granite|tuff)$/)
-    // 地表就能挖到的石头（挖 stone 掉 cobblestone）。垫脚、盖墙都用它。
-    // 单独列一个键，是因为 #stone 把 andesite/diorite/granite/deepslate/tuff
-    // 也算进去了 —— 那些主要生成在地下（y≈50 上下），
-    // 在地表攒垫脚料时去挖它们是够不到的。
-    // 实测：目标「攒够垫脚的石头」时他一直在找 andesite，
-    // 日志里 [goto] 高度到不了（目标 y=57，现在 y=63）连着刷。
-    case '#surfacestone': return sum(/^(cobblestone|stone|cobbled_deepslate)$/)
+    // 能当"地表石头"用的建筑料。
+    //
+    // 这里必须和**他实际挖的方块**对齐：挖 stone 掉 cobblestone，
+    // 挖 diorite/andesite/granite 掉同名物品 —— 都是能垫脚、能砌墙的石头。
+    // 之前只认 cobblestone|stone，实测日志里他反复 `[dig] 用 stone_pickaxe
+    // 挖 diorite`，东西在背包里（diorite 数量在涨），但 #surfacestone 一点
+    // 不涨 → house/tower 的备料阶段永远 0 进度。
+    //
+    // 【P0-1 保留】深板岩（cobbled_deepslate）只在 y<0 生成，
+    // 地表永远挖不到一块，仍然排除。
+    // tuff 也排除：它主要在下层，且不做"地表随手攒"的料。
+    case '#surfacestone': return sum(/^(cobblestone|stone|andesite|diorite|granite)$/)
     case '#food': return sum(/^(bread|cooked_|baked_potato|apple|carrot|potato|beef|porkchop|chicken|mutton|rabbit)/)
     default: return Number(inv[key]) || 0
   }
@@ -115,6 +120,7 @@ const ITEM_CN = {
   '#log': '木头',
   '#planks': '木板',
   '#stone': '石头',
+  '#surfacestone': '地上的石头',
   '#food': '吃的',
   cobblestone: '圆石',
   stone: '石头',
@@ -158,7 +164,13 @@ function dist (a, b) {
 
 function makeBase (stage, status) {
   const p = posOf(status)
-  return { at: Date.now(), inv: snapInv(status), pos: p, y: p.y }
+  // 【层3】记下"这一步开始时在不在下面"。
+  // "回到地面"这种阶段，如果一开始人就在露天，那是**没走过**，
+  // 不能算他做到了（UNHUMAN-SCAN #9 里 3 秒完成的 getup 就是这样）。
+  //
+  // peak：gather 阶段"达到过的最高数量"（见 trackPeak）。
+  // 开局为空，第一次算进度时按 base.inv 起步。
+  return { at: Date.now(), inv: snapInv(status), peak: {}, pos: p, y: p.y, ug: undergroundOf(status) }
 }
 
 // ---------------------------------------------------------------- 候选池
@@ -180,24 +192,78 @@ const POOL = [
     title: '攒够材料盖个小屋',
     why: '一直住山洞不像话，想要个自己的地方',
     tag: '建造',
+    // 这条目标的 score() 自己会看坐标（地下压分）—— candidates() 的通用
+    // 位置扣分要跳过它，否则树底下会被扣两遍（-8 变 -16）。
+    locationAware: true,
+    // ===== 【2026-11-13 实机反馈】边盖边攒，不要一口气攒 48+16 =====
+    //
+    // 原来是"备料 48 石 + 16 木 → 立墙 → 封顶"三步。
+    // 实测：他人在 y=42 的洞里爬不出来，48 块地表石头是**天量**，
+    // 于是 house 每次都卡在第 2 步被放弃 → 进冷却 → 30 分钟里 0 次被选中。
+    //
+    // 真人是"先搭个小的，再慢慢扩"：8 块石头就能围个 3×3 的窝。
+    // 所以拆成三轮备料（8 → 16 → 24），每轮后面接一小段建造，
+    // 让他随时有个"已经盖出来的东西"，而不是攒不满就等于白干。
     stages: [
       { kind: 'do', title: '找块够平的地方，把地面收拾出来', need: { count: 1 } },
       {
         kind: 'gather',
-        title: '备料：石头和木头攒够一堆',
-        need: { '#surfacestone': 48, '#log': 16 },
+        title: '先弄一小堆：够围个 3×3 的石头和几根木头',
+        need: { '#surfacestone': 8, '#log': 6 },
+        where: '地上：脚边捡圆石，砍两棵最近的树'
+      },
+      { kind: 'do', title: '先搭个小的：四面矮墙立起来', need: { count: 1 } },
+      {
+        kind: 'gather',
+        title: '再补一轮石头和木头，把屋子放大一点',
+        need: { '#surfacestone': 16, '#log': 6 },
         where: '地上：石头挖裸露的岩面，木头找树'
       },
-      { kind: 'do', title: '把四面墙立起来', need: { count: 1 } },
+      { kind: 'do', title: '把窝扩一圈，接上墙、留个门洞', need: { count: 1 } },
+      {
+        kind: 'gather',
+        title: '最后补一轮，够封顶压边',
+        need: { '#surfacestone': 24, '#log': 4 },
+        where: '地上：石头挖裸露的岩面，木头找树'
+      },
       { kind: 'do', title: '封顶，顺手装个门', need: { count: 1 } }
     ],
     score (status) {
+      status = status || {}
       const inv = status.inventory || {}
       const tier = pickTier(inv)
       let s = 50
       if (tier >= 1) s += 15
       if (tier >= 2) s += 10
       s += Math.min(15, itemCount(inv, '#log') / 16 * 15)
+      // 【普通模式之后】天黑了有怪物，一个能关门睡觉的地方是真的要紧。
+      // 只加在"该过夜"的时段上，白天这条不加分，免得又变成永远想盖房。
+      try {
+        const t = String(status.time || '')
+        if (/夜|night|黄昏|傍晚/.test(t)) s += 12
+      } catch (e) {}
+      if ((status.health || 20) <= 8) s += 6
+
+      // ===== 【排序 bug】目标自己的分数必须知道"人在哪" =====
+      //
+      // 之前这条检查只写在 candidates() 的通用扣分里，house.score() 单独
+      // 被问的时候仍然返回 70~108 —— 比 getup 的 30~65 高。于是日志、测试、
+      // 别的调用方看到的都是"他在 y=42 的洞里想盖房"，而 candidates 里
+      // 的封顶只是事后补救，目标本身并没有诚实报出自己的可行性。
+      //
+      // 现在扣在目标自己的分数里（candidates 对 locationAware 的目标不再重复扣）：
+      //   · 真的在地面以下（y < SURFACE_Y）：盖房物理上干不了，封顶 15。
+      //     getup 在地下最低 30，所以哪怕夜里 +12、木头满 +15，
+      //     house 也永远低于 getup —— 这是"不在地里挑盖房"的硬保证。
+      //   · 地表高度、只是头顶有遮挡（树底下/洞口上方）：挪两步的事，-8。
+      //   · 没给坐标：按地面算，不误伤。
+      const ug = undergroundOf(status)
+      const y = (status.pos && status.pos.y != null) ? Number(status.pos.y) : 70
+      if (ug === true && y < SURFACE_Y) {
+        s = Math.min(s - 30, 15)
+      } else if (ug === true) {
+        s -= 8
+      }
       return s
     }
   },
@@ -237,8 +303,15 @@ const POOL = [
     undergroundGoal: true,
     stages: [
       { kind: 'craft', title: '先弄把铁镐，不然到深层白跑', need: { item: 'iron_pickaxe', n: 1 } },
-      { kind: 'depth', title: '往下挖到很深的地方', need: { y: 16 } },
+      // 【P0-3 修】火把要在**下井前**备好。
+      // 原来先 depth 后 torch：人已经摸黑下到几十层，才想起来带火把。
+      // Minecraft Wiki 的挖矿流程也是"一整组火把是下去之前的事"。
       { kind: 'gather', title: '带够火把，别在下面摸黑', need: { torch: 16 } },
+      // 【P0-2 修】y=16 是老版本（<1.18）的钻石层。
+      // 1.18 之后钻石峰值在 y=-58/-59，y=16 只是低产区，
+      // 挖到那儿就以为"到位了"，然后在贫矿层空转。
+      // 取 -54 留点余量，不精确到 -58（太死板，也容易被基岩卡住）。
+      { kind: 'depth', title: '往下挖到很深的地方', need: { y: -54 } },
       // 【量】找到钻石是运气活。要求"挖到 1 颗"就够 —— 没找到也不算白跑，
       // 一次没找到会走 stall 逻辑放弃，而不是逼他在下面无限挖。
       { kind: 'gather', title: '找到钻石矿，挖下来', need: { diamond: 1 } },
@@ -324,8 +397,19 @@ const POOL = [
     why: '洞里憋得慌，想看看天，吹吹风',
     tag: '探索',
     valleyGoal: true,
+    // ===== 【实机归因】0/14 次成功 =====
+    //
+    // 原来只有一步 surface：必须 `isUnderground() === false`（头顶没有遮挡）
+    // 才算完。可他每次能往上刨十几格就卡住，y 到了 50 出头、头顶还是石头 ——
+    // 于是"真的爬了一段"在 goals 里是 0 进度，日志里只能是"没成"。
+    //
+    // 现在拆两步：
+    //   1. climb  —— 纯高度：从 y=42 爬到 y≥58 就算这一步做到了（能做得到的事）
+    //   2. surface—— 再找真正的露天（头顶见天）
+    // 这样"挖上去"和"找到出口"分开计，卡住时也看得出卡在哪一段。
     stages: [
-      { kind: 'surface', title: '往上挖/找路，回到地面上', need: { y: SURFACE_Y } },
+      { kind: 'climb', title: '先往上挖，挖到地表那么高', need: { y: SURFACE_Y } },
+      { kind: 'surface', title: '再找露天的地方钻出去', need: { y: SURFACE_Y } },
       { kind: 'do', title: '到地面上站一会儿，看看四周', need: { count: 1 } }
     ],
     score (status) {
@@ -364,11 +448,58 @@ class Goals {
     this.now = typeof opts.now === 'function' ? opts.now : () => Date.now()
     this.cfg = Object.assign({
       stallMs: 45 * 60 * 1000,       // 这么久没有任何进展 -> 放弃
-      maxFails: 6,                    // 同一阶段试这么多次都失败 -> 放弃
-      maxIdleWins: 5,                 // 连续这么多趟"说成了但进度没动" -> 放弃
+      // 【口径统一：和 src/skills.js 对齐】
+      // skills 那边是"失败次数不到 2 次的不做成功率筛选"（试过的才算，
+      // 第 2 次失败才允许按 minRate 排除）。goals 这边不能更松也不能更狠：
+      //   失败 2 次 -> 换法子（methodSwitchFails）
+      //   失败 3 次 -> 换目标（maxFails，failTotal 跨"换法子"累计）
+      // 原来是 6 —— 6 次才认账，比 skills 宽太多，两边一起用的时候
+      // 一边攒容错一边被抹掉，日志里就看不出到底试了几次。
+      maxFails: 3,                    // 第三次还不行 -> 换目标
+      // 空转同理：2 趟说成了没进展 -> 换法子；3 趟 -> 换目标。
+      // maxIdleWins: 12 保留为绝对兜底（自定义目标 ways 特别多时用得上）。
+      maxIdleTotal: 3,
+      // 【调高：5 -> 12】UNHUMAN-SCAN #9 的 8 秒寿命就是这里造成的。
+      // 5 趟 × 1.6 秒/趟 = 8 秒。12 趟大约 20 秒，配合下面的时间闸才算够。
+      // 真正该修的是 #8 的假成功判定（那个不归我改），这里先把伤害限住。
+      maxIdleWins: 12,                // 连续这么多趟"说成了但进度没动" -> 放弃
       cooldownMs: 2 * 60 * 60 * 1000, // 放弃后这段时间不再选它
       doneCooldownMs: 12 * 60 * 60 * 1000, // 做完了的目标这段时间不重复
       maxCustomStages: 5,
+      // ===== 目标最低存活时间 =====
+      //
+      // 【2026-11-13 UNHUMAN-SCAN #9】25 分钟立了 6 个目标全放弃，
+      // 寿命中位数 8 秒，最短 4 秒。
+      //
+      // 根因不是阈值"松"，是**按次数算**：
+      // maxIdleWins = 5 的意思是"连续 5 趟说成了但进度没动就放弃"。
+      // 但 UNHUMAN-SCAN #8 已经证明 98% 的任务判"完成"是假的，
+      // 一趟"任务"只要 1~2 秒 —— 于是 5 趟 = 8 秒。
+      //
+      // 所以除了把次数调高，更根本的是加一条**时间**闸：
+      // 目标立了之后 minLifeMs 之内不许放弃（生命危险除外）。
+      // 真人不会 8 秒换一个想法；就算这目标眼下干不成，
+      // 他也会先愣一会儿、试两下、再认。
+      minLifeMs: 5 * 60 * 1000,       // 5 分钟内不许放弃
+      minLifeStageMs: 90 * 1000,       // 每一步也至少待 90 秒
+      // ===== 【UNHUMAN-SCAN #7】同一个阶段连做几遍就换**法子** =====
+      //
+      // 实测（data/runtime/goals.json 最近 30 条）：8 个方向全是同一句
+      //   「「在附近地上捡够垫脚的石头」干了 5 趟都说成了，进度一点没动」
+      // 同一个阶段连做 5 遍才动，而且一动就是整个目标被扔掉。
+      //
+      // 真人不是这么干的：第二遍发现"这么弄不行"，会换个法子再来一次
+      // （"这锄头咋做不出来，算了直接挖石头去"），三条路都走不通才认账。
+      //
+      // 所以拆成两级：
+      //   methodSwitchWins = 2  连续 2 趟说成了没进展 -> 换法子（日志写清换什么/为什么）
+      //   maxMethods      = 3   这一阶段最多试 3 条路，都走不通才算它没戏
+      // maxIdleWins: 12 保留（#9 的兜底），正常走不到 —— 先被 maxMethods 拦住。
+      methodSwitchWins: 2,
+      // 干不成的也算：真人做两遍不成就会换方法（原话），不是死磕六遍。
+      // 但一次失败不换 —— 那才是"一失败就换"，也假。
+      methodSwitchFails: 2,
+      maxMethods: 3,
       // ===== 「刚上来，别马上又钻回去」 =====
       //
       // 【2026-11-13 16:47 home-owner 实测】
@@ -421,6 +552,16 @@ class Goals {
         this.goal = d.goal || null
         this.history = Array.isArray(d.history) ? d.history : []
         this.cooldown = d.cooldown && typeof d.cooldown === 'object' ? d.cooldown : {}
+        // 老存盘没有 evidence：补上（不是给判据开口子，是让阶段自己先声明）
+        if (this.goal && Array.isArray(this.goal.stages)) {
+          for (const st of this.goal.stages) {
+            if (!st.evidence) {
+              const ev = evidenceForStage(st.kind, st.title)
+              st.evidence = ev.evidence
+              if (ev.minSec) st.minSec = ev.minSec
+            }
+          }
+        }
       }
     } catch (e) {
       this.goal = null
@@ -490,7 +631,58 @@ class Goals {
    * + 在地下待久了的修正（挖矿压下去、地面活抬起来、出口目标浮上来）
    * + 品味偏好
    */
+  /**
+   * 他现在是不是在歇着。
+   *
+   * 【为什么任务调度要问心情】mood-fixer 的休息窗口实测：
+   *   21:45:09 [rest] 你累垮了（精力 0%），自己停下来歇着了
+   *   21:54:2x [rest] 歇够了（精力 60%），可以起来干活了
+   * 可这 9 分钟里仍然启动了 5 个任务 —— 全是从 goals.current() 发出去的
+   * 「备料：石头和木头攒够一堆」。嘴上说歇、状态在歇、任务照发。
+   *
+   * 根因在这一层：任务调度从来没问过心情。只读 mood，不改它。
+   */
+  isResting () {
+    try {
+      let m = this.ctx && this.ctx.mood
+      // main.js 目前没往 goals.ctx 里塞 mood（那个文件不归我改）。
+      // mood.js 自己导出了 active()：进程里最后构造的那个 Mood 实例，
+      // 就是主循环在用的那个。只读它，不碰 mood 的任何状态。
+      if (!m || (typeof m.resting !== 'boolean' && typeof m.state !== 'function')) {
+        try { m = require('./mood').active() } catch (e) { m = null }
+      }
+      let rest = false
+      if (m) rest = typeof m.resting === 'boolean' ? m.resting : (typeof m.state === 'function' && m.state() === 'tired')
+      if (rest) return true
+
+      // ===== 收工了也算"歇着" =====
+      //
+      // 实机（run5）：session 22:19:29 已经「今天到此为止，回去歇着」，
+      // 22:23:04 goals 还在换法子派人去"收拾地面"。两个层各说各的。
+      //
+      // session.js 的 phase/todayDone 是权威信号，但 main.js 现在没把它
+      // 传进 goals.ctx（那两处不归我改）。这里做成**只读、可缺省**：
+      // 谁把 ctx.session 塞进来（或者 session 以后导出 active()），
+      // 这一行就自动生效；没有就退回只看 mood。
+      let se = this.ctx && this.ctx.session
+      if (!se) {
+        try {
+          const sm = require('./session')
+          se = typeof sm.active === 'function' ? sm.active() : null
+        } catch (e) { se = null }
+      }
+      if (se) {
+        if (typeof se.isTodayDone === 'function' && se.isTodayDone()) return true
+        if (se.phase === 'resting' || se.phase === 'closed') return true
+      }
+      return false
+    } catch (e) { return false }
+  }
+
   candidates (status) {
+    // 歇着的时候心里没有"接下来想干点什么" —— 空池子。
+    // ensure() 会先看这个，不再产出新目标。
+    if (this.isResting()) return []
     const now = this.now()
     const out = []
     const underMin = this.undergroundFor() / 60000
@@ -553,8 +745,33 @@ class Goals {
       // 正确的关系是减法：地面上的活，在地下就是**干不了**，
       // 分数该降（降完仍是正数，因为"先上去再干"是条通顺的路）。
       // 让他真上来的责任交给专门的 getup 目标。
-      if (!g.undergroundGoal && !g.valleyGoal && isUnder) {
-        score -= 25
+      // 【2026-11-13 实测】`isUnderground()` 是"头顶有没有遮挡"，
+      // 站在树底下 / 洞口上方也算 true。真机 23:26:56 他就是站在
+      // y=68 的地面、脚边全是平地，只是头顶有树冠 —— 被判成"在地下"，
+      // house 从 50 掉到 25，输给 iron 的 40，于是 30 分钟一次没选上。
+      //
+      // 所以分成两档：
+      //   真的在地面以下（y < 地表）→ 扣 25 并封顶，那确实盖不了
+      //   人在地表高度、只是头顶有遮挡 → 扣 8（挪两步的事，不是干不了）
+      //
+      // 【house 自己算】house.score() 现在自带同一套坐标判断（locationAware），
+      // 这里必须跳过它 —— 否则树底下会被扣两遍（-8 变 -16）。
+      if (!g.locationAware && !g.undergroundGoal && !g.valleyGoal && isUnder) {
+        const yy = posOf(status).y
+        if (yy < SURFACE_Y) {
+          // 【参谋 2026-11-13】真的在地面以下：这些活（搭台/种地/探索）
+          // 物理上就干不了，必须**压到 getup 之下**，否则会出现
+          // "人在 y=42 的洞里，却挑了做不到的事" ——
+          // 选了也做不了 → 放弃 → 冷却 → 过一阵又选它。
+          //
+          // 光扣 25 压不住：带材料 + 夜里能到 90+，扣完还有 65-77，
+          // 比 getup 的 30 高。所以这里封顶 15（getup 地下最低 30，压得住）。
+          score = Math.min(score - 25, 15)
+        } else {
+          // 人在地表高度、只是头顶有遮挡（树底下/洞口上方）：
+          // 挪两步的事，不是干不了。
+          score -= 8
+        }
       }
 
       // 出口目标：只在地下时有分，憋得越久分越高。
@@ -577,6 +794,9 @@ class Goals {
       })
     }
     out.sort((a, b) => b.score - a.score)
+    // 注意：这里**不**过滤负分。
+    // 负分是"现在不现实"，对上层和测试都是有意义的信息
+    // （比如"人在地面上时 getup 是 0 分"）。挑不挑它是 ensure() 的事。
     return out
   }
 
@@ -606,17 +826,50 @@ class Goals {
   async ensure (status) {
     if (status) this.lastStatus = status
 
+    // ===== 歇着就不立新目标 =====
+    // 手上的目标不扔（那是"还没干完的事"），但别再起新的。
+    // 休息窗口里连续启动 5 个任务就是从这儿漏出去的。
+    if (this.isResting()) {
+      if (!this._restLogged) {
+        this._restLogged = true
+        this.log('[goals] 在歇着，先不立新目标')
+      }
+      return this.goal && !this.goal.done ? this.goal : null
+    }
+    this._restLogged = false
+
     // 手上已经有个没做完的，接着干
     if (this.goal && !this.goal.done) return this.goal
 
     // 上一个目标已经收尾了（完成时已清空，这里兜底）
     if (this.goal && this.goal.done) this.goal = null
 
-    const cands = this.candidates(status || this.lastStatus || {})
+    // 只有正分的才值得当"接下来这些天的正事"。
+    // 0/负分 = 现在根本干不了（比如人在地面上却想"先爬回地面"），
+    // 挑了它等于立了个立刻能"完成"的目标 —— 那正是 #9 里 3 秒寿命的来源。
+    const allCands = this.candidates(status || this.lastStatus || {})
+    const cands = allCands.filter(c => c.score > 0)
     if (!cands.length) {
-      // 全在冷却里：把冷却清掉，总得有事干
-      this.cooldown = {}
-      return this.ensure(status)
+      // 全在冷却里（或者全都被判成"现在干不了"）：
+      // 先把冷却清掉再想一遍；还不行就放宽到"勉强能干的"，
+      // 不能因为候选被过滤干净就卡在那儿不出目标。
+      if (Object.keys(this.cooldown).length) {
+        this.cooldown = {}
+        return this.ensure(status)
+      }
+      const all = allCands
+      if (!all.length) return null
+      const top0 = all[0]
+      const def0 = POOL.find(g => g.key === top0.key)
+      this.goal = this.makeGoal({
+        key: def0.key,
+        title: def0.title,
+        why: def0.why,
+        stages: def0.stages.map(s => Object.assign({}, s))
+      }, status || this.lastStatus || {})
+      this.save(true)
+      this.log('[goals] 眼下没什么特别想干的，先干这个：' + this.goal.title)
+      return this.goal
     }
 
     let picked = null
@@ -705,7 +958,23 @@ ${list}
   makeGoal (picked, status) {
     const now = this.now()
     const stages = picked.stages.map(s => {
-      const stage = Object.assign({ key: s.key || null, kind: s.kind || 'do', need: s.need || { count: 1 }, title: s.title }, {})
+      // 【证据类型随计划走】evidence/minSec 必须从计划**原样带过来**。
+      //
+      // 2026-11-14 实测：这里原来只拷 key/kind/need/title，声明写在计划里、
+      // 到了目标身上就没了 —— 真实目标 5/5 阶段 evidence=undefined，
+      // main 的 `|| 'world'` 于是悄悄接管，duration 永远用不上。
+      // 声明了却送不到判据层，比没声明更坏：看着有制度，实际全靠兜底。
+      //
+      // 这里**只透传、不推导**（推导就是默认分支，第五次文本后门就藏在那儿）；
+      // 真没声明的阶段，judge 会在判定时抛错并写进日志。
+      const stage = Object.assign({
+        key: s.key || null,
+        kind: s.kind || 'do',
+        need: s.need || { count: 1 },
+        title: s.title,
+        evidence: s.evidence,
+        ...(s.minSec ? { minSec: s.minSec } : {})
+      })
       stage.startedAt = now
       stage.base = makeBase(stage, status)
       stage.work = 0
@@ -714,13 +983,31 @@ ${list}
       stage.attempts = 0
       stage.fails = 0
       stage.doneAt = null
+      // ===== #7：这一阶段在用第几种干法 =====
+      // 0 = 原计划。连着几趟没进展就往后挪（见 switchMethod）。
+      if (Array.isArray(s.ways) && s.ways.length) stage.ways = s.ways.slice()
+      stage.methodIndex = 0
+      stage.methodSince = now
+      stage.idleWins = 0
+      // 跨"换法子"累计的总账：换法子只清当条路的账，不清总账
+      stage.idleTotal = 0
+      stage.failTotal = 0
+      stage.parked = false    // 几条路都试过、目标还在冷却期时置 true（见 PARK_TEXTS）
       return stage
     })
+    const p0 = posOf(status)
     return {
       key: picked.key,
       title: picked.title,
       why: picked.why || '',
       createdAt: now,
+      // ===== 立目标那一刻他在哪 =====
+      //
+      // 【参谋要的判据】"看 house 被选中时的 y 坐标。如果绝大多数 < 50，
+      // 就是排序 bug"。原来的 history 不记位置，事后只能靠日志猜。
+      // 现在选中时记下来，放弃/收工时一并写进 history。
+      createdY: Math.round(p0.y),
+      createdUnderground: undergroundOf(status),
       updatedAt: now,
       stageIndex: 0,
       stages,
@@ -734,9 +1021,112 @@ ${list}
 
   // ------------------------------------------------ 现在该干什么
 
-  stage () {
+  /**
+   * 内部用：手上正在办的那一步。
+   *
+   * 注意这是**命令式**的旧入口，只给 goals 自己的记账逻辑用
+   * （进度、换法子、放弃）。对外要说"能干点什么"用 stage()。
+   */
+  currentStage () {
     if (!this.goal) return null
     return this.goal.stages[this.goal.stageIndex] || null
+  }
+
+  /**
+   * ===== 声明式的"能干些什么"：候选池，不下命令 =====
+   *
+   * 【为什么改成这样】
+   * 之前 stage() 直接返回"下一步做 X" —— 它是指挥官，session 只能照做。
+   * 于是"他心里想干什么"永远是 goals 一个人说了算，
+   * 而 goals 又只认自己刚 shuffle 出来的那一步。
+   *
+   * 现在它只**陈述事实**：
+   *   · 这件事叫什么、要什么（need）
+   *   · 现在能不能干（prereqs：差什么，差多少）
+   *   · 上次干到哪了（progress：ratio / 试了几趟 / 换过几个法子 / 是不是搁着了）
+   *   · 可以怎么干（ways）
+   * 排哪个、干不干，留给 session（"今天的主意"）。
+   *
+   * 返回数组，顺序就是目标里的阶段顺序 —— **不代表优先级**。
+   * 没有目标时返回空数组。
+   */
+  stage () {
+    if (!this.goal) return []
+    const st = this.lastStatus || {}
+    return this.goal.stages.map((s, i) => this.describeStage(s, i, st))
+  }
+
+  /** 把一步阶段说成一条"声明"，不排序、不挑、不催 */
+  describeStage (s, i, status) {
+    const idx = this.goal ? this.goal.stageIndex : 0
+    const state = i < idx ? 'done' : (i === idx ? 'current' : 'later')
+    const need = s.need || {}
+    const inv = (status && status.inventory) || {}
+    const baseInv = (s.base && s.base.inv) || {}
+    const prereqs = []
+
+    // 前置 1：前面那一步
+    if (i > 0) {
+      const prev = this.goal.stages[i - 1]
+      prereqs.push({ what: '上一步', text: `先干完「${prev.title}」`, ok: i <= idx })
+    }
+
+    // 前置 2：要的东西现在有多少
+    //   current 这一步按**增量**算（base 之后新弄到的才算）
+    //   后面的步骤还没开工，只能报"现在手上有多少"（参考值）
+    for (const [k, v] of Object.entries(need)) {
+      if (k === 'count' || k === 'item' || k === 'n' || k === 'y' || k === 'distance') continue
+      const want = Number(v) || 0
+      const have = itemCount(inv, k) - (state === 'current' ? itemCount(baseInv, k) : 0)
+      prereqs.push({ what: cn(k), text: `${cn(k)} ${Math.max(0, Math.min(have, want))}/${want}`, ok: have >= want })
+    }
+    if (need.item) {
+      const want = Number(need.n) || 1
+      const have = itemCount(inv, need.item) - (state === 'current' ? itemCount(baseInv, need.item) : 0)
+      prereqs.push({ what: cn(need.item), text: `${cn(need.item)} ${Math.max(0, Math.min(have, want))}/${want}`, ok: have >= want })
+    }
+
+    // 前置 3：位置
+    if (need.y != null) {
+      const y = Math.round(posOf(status).y)
+      if (s.kind === 'surface') prereqs.push({ what: '位置', text: `现在 y=${y}，人得在 y≥${need.y}（露天更好）`, ok: y >= Number(need.y) })
+      else if (s.kind === 'depth') prereqs.push({ what: '位置', text: `现在 y=${y}，得下到 y≤${need.y}`, ok: y <= Number(need.y) })
+    }
+
+    // 上次进展（只对正在办的那一步有意义）
+    let progress = null
+    if (state === 'current') {
+      let p = { ratio: s.ratio || 0, text: s.progressText || '' }
+      try { p = stageProgress(s, status) } catch (e) {}
+      progress = {
+        ratio: p.ratio,
+        text: p.text,
+        at: this.goal.lastProgressAt || s.startedAt || null,
+        attempts: s.attempts || 0,
+        idleWins: s.idleWins || 0,
+        methodIndex: s.methodIndex || 0,
+        parked: !!s.parked
+      }
+    } else if (state === 'done') {
+      progress = { ratio: 1, text: '这一步过去了', at: s.doneAt || null, attempts: s.attempts || 0, idleWins: 0, methodIndex: s.methodIndex || 0, parked: false }
+    }
+
+    return {
+      goal: this.goal.title,
+      goalKey: this.goal.key,
+      index: i,
+      count: this.goal.stages.length,
+      title: s.title,
+      kind: s.kind || 'do',
+      need,
+      state,
+      ready: prereqs.every(r => r.ok),
+      blockedBy: prereqs.filter(r => !r.ok).map(r => r.text),
+      prereqs,
+      progress,
+      // 可以怎么干（第一条是原计划）。只是选项，不是指令。
+      ways: waysForStage(s).map((w, wi) => ({ way: w, used: wi < (s.methodIndex || 0), current: wi === (s.methodIndex || 0) }))
+    }
   }
 
   /**
@@ -747,16 +1137,40 @@ ${list}
    * 另外带上 goal / stageIndex / total，方便上层显示进度。
    */
   current () {
+    // 歇着的时候不发活。will 优先用 goals.current()，
+    // 这里不回 null 而是回一句"歇着" —— 回 null 会掉进 will 的兜底模板
+    // （"弄点木头，先做把镐"），那还是活。
+    if (this.isResting()) {
+      return {
+        text: '先歇着，什么都不干（精力还没回来）',
+        since: (this.goal && this.goal.createdAt) || this.now(),
+        done: false,
+        resting: true,
+        fromGoal: false,
+        goal: this.goal ? this.goal.title : null
+      }
+    }
     if (!this.goal || this.goal.done) return null
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s) return null
+    const ways = waysForStage(s)
+    const mi = Math.max(0, Math.min(s.methodIndex || 0, ways.length - 1))
+    const method = mi > 0 ? ways[mi] : null
+    // 搁起来了：说"干点别的"，别再念那条已经试过三遍的任务。
+    const park = s.parked ? PARK_TEXTS[(s.attempts || 0) % PARK_TEXTS.length] : null
     return {
-      text: s.title,
-      since: s.startedAt || this.goal.createdAt,
+      // 【#7】换过法子之后，交给上层的是"换个法子怎么干"，
+      // 不是把同一句话原样再说一遍 —— will 拿它去派活，
+      // 文本变了，动作才会真的变。
+      text: park || (method ? `${s.title}（换个法子：${method}）` : s.title),
+      since: park ? this.now() : (s.methodSince || s.startedAt || this.goal.createdAt),
       done: false,
       goal: this.goal.title,
       why: this.goal.why,
       stage: s.title,
+      method,
+      parked: !!s.parked,
+      methodIndex: mi,
       stageIndex: this.goal.stageIndex,
       total: this.goal.stages.length,
       progress: s.ratio || 0,
@@ -773,7 +1187,7 @@ ${list}
   /** 这一步现在的进度，说人话 */
   progressText () {
     if (!this.goal) return ''
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s) return ''
     const p = stageProgress(s, this.lastStatus || {})
     return p.text
@@ -781,14 +1195,24 @@ ${list}
 
   /** 塞进提示词的一段话 */
   promptBlock () {
+    if (this.isResting()) return '## 你现在的状态\n累得不行，坐着歇会儿。手上那件事不急，等缓过来再说。'
     if (!this.goal) return ''
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s) return ''
     const idx = this.goal.stageIndex + 1
     const lines = [
       '## 你心里挂着的一件事',
       `目标：${this.goal.title}${this.goal.why ? '（' + this.goal.why + '）' : ''}`,
       `进度：第 ${idx}/${this.goal.stages.length} 步 —— ${s.title}`,
+      // 【#7】换过法子就明说"上次那样不行，这次这么干"，
+      // 不然模型会照着同一句话再编一遍同样的动作。
+      (() => {
+        if (s.parked) return '这一步几条路都试过了，先放一放：在附近转转、收拾收拾，别硬来。'
+        const ways = waysForStage(s)
+        const mi = s.methodIndex || 0
+        if (mi <= 0 || !ways[mi]) return ''
+        return `换了法子：${ways[mi]}（之前那样弄了 ${this.cfg.methodSwitchWins} 遍没往前挪，别重复）`
+      })(),
       // 去哪找：没有这句他会挑"最近的那块" —— 而最近的石头可能在地下，
       // 他下不去（实测 [goto] 高度到不了 连刷 6 次）。
       s.where ? `去哪弄：${s.where}` : '',
@@ -846,8 +1270,19 @@ ${list}
     if (!this.goal || this.goal.done || !status) {
       return { stageCompleted: false, goalCompleted: false, ratio: 0, abandoned: false }
     }
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s) return { stageCompleted: false, goalCompleted: false, ratio: 0, abandoned: false }
+
+    // ===== 生命危险除外（#9 的例外条款，现在真的存在了）=====
+    //
+    // 血见底的时候什么长期目标都得先放下 —— 否则 will 还会拿
+    // 「捡够垫脚的石头」去派活，人就死在四格血上。
+    // 这是 minLifeMs 闸门的唯一例外，跟文档里写的一致。
+    const hp = Number(status.health)
+    if (isFinite(hp) && hp <= 4) {
+      const rec = this.abandon(`血只剩 ${hp} 格，保命要紧，这事先放下`, { urgent: true })
+      if (rec) return { stageCompleted: false, goalCompleted: false, ratio: s.ratio || 0, abandoned: true, urgent: true }
+    }
 
     const p = stageProgress(s, status)
     const before = s.best || 0
@@ -855,8 +1290,39 @@ ${list}
     s.progressText = p.text
     if (p.ratio > before + 0.01) {
       s.best = p.ratio
+      // 搁着的时候事情自己有了进展（背包里多了、位置对了）：接着干
+      if (s.parked) {
+        s.parked = false
+        s._holdLogged = false
+        s.methodIndex = 0
+        s.idleWins = 0
+        this.log(`[goals] 「${s.title}」又有进展了，接着弄`)
+      }
       this.goal.lastProgressAt = this.now()
       this.goal.updatedAt = this.now()
+    }
+
+    // ===== 【层3】"本来就不用做"的阶段：跳过，不算他做到 =====
+    //
+    // 回地面上、往回走到目标高度这类阶段，如果立起来的时候人已经在那儿，
+    // 那就是没走过。直接跳过去，但**不记"搞定了"** —— 不然
+    // goals.json 里又会多一条零动作完成的阶段。
+    if (p.trivial) {
+      const isLast = this.goal.stageIndex >= this.goal.stages.length - 1
+      this.log(`[goals] 跳过「${s.title}」：${p.text}`)
+      this.journal(`「${s.title}」本来就不用做，跳过`)
+      if (isLast) {
+        this.completeGoal()
+        return { stageCompleted: true, goalCompleted: true, ratio: 1, abandoned: false, trivial: true }
+      }
+      this.goal.stageIndex++
+      const nextS = this.currentStage()
+      if (nextS) {
+        nextS.base = makeBase(nextS, status)
+        nextS.startedAt = this.now()
+      }
+      this.save(true)
+      return { stageCompleted: true, goalCompleted: false, ratio: 1, abandoned: false, trivial: true }
     }
 
     if (p.ratio >= 1 - 1e-9) {
@@ -868,7 +1334,7 @@ ${list}
         return { stageCompleted: true, goalCompleted: true, ratio: 1, abandoned: false }
       }
       this.goal.stageIndex++
-      const ns = this.stage()
+      const ns = this.currentStage()
       if (ns) {
         ns.base = makeBase(ns, status)
         ns.startedAt = this.now()
@@ -882,9 +1348,13 @@ ${list}
     // 太久没动静：这事可能干不成，或者他不想干了
     const idle = this.now() - (this.goal.lastProgressAt || this.goal.createdAt)
     if (idle > this.cfg.stallMs) {
+      // 歇着的时候不判"这事儿干不成" —— 人只是睡了，不是放弃了。
+      if (this.isResting()) {
+        return { stageCompleted: false, goalCompleted: false, ratio: p.ratio, abandoned: false, resting: true }
+      }
       const mins = Math.round(idle / 60000)
-      this.abandon(`「${s.title}」卡了 ${mins} 分钟没往前挪，先算了`)
-      return { stageCompleted: false, goalCompleted: false, ratio: p.ratio, abandoned: true }
+      const rec = this.abandon(`「${s.title}」卡了 ${mins} 分钟没往前挪，先算了`)
+      return { stageCompleted: false, goalCompleted: false, ratio: p.ratio, abandoned: !!rec }
     }
 
     this.save()
@@ -898,15 +1368,66 @@ ${list}
   onTaskResult ({ ok, text, status, progress } = {}) {
     if (status) this.lastStatus = status
     if (!this.goal || this.goal.done) return { advanced: false }
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s) return { advanced: false }
 
     s.attempts = (s.attempts || 0) + 1
     this.goal.attempts++
 
+    // ===== 歇着的时候只记账，不改主意 =====
+    //
+    // 实机 run6：22:55:32 收工 → 22:55:43 在休息窗口里打了一条「换法子」。
+    // 那不是新派的活，是休息开始前就在跑的任务刚回报完 —— 但换法子
+    // 会改掉"下次说什么、干什么"，等于把休息窗口偷走了一步。
+    // 这会儿只记结果（哪趟成没成），等醒过来再用。
+    if (this.isResting()) {
+      // 账照记（哪趟成没成、进度动没动），只是不做"换法子/换目标"的决定。
+      if (!ok) {
+        s.fails = (s.fails || 0) + 1
+        s.failTotal = (s.failTotal || 0) + 1
+        this.goal.fails++
+      } else if (status) {
+        const p0 = stageProgress(s, status)
+        if (p0.ratio <= (s.best || 0) + 1e-9) {
+          s.idleWins = (s.idleWins || 0) + 1
+          s.idleTotal = (s.idleTotal || 0) + 1
+        } else {
+          s.idleWins = 0
+          s.idleTotal = 0
+          this.goal.lastProgressAt = this.now()
+        }
+      }
+      this.journal(`歇着的时候手头那件事收了尾：${ok ? '成了' : '没成'}`)
+      this.save(true)
+      return { advanced: false, resting: true, deferred: true }
+    }
+
     if (ok) {
-      // 他自己的动作算"这一步往前推了一点"
-      if (s.kind === 'do' || s.kind === 'build') this.addWork(progress || 1)
+      // 他自己的动作算"这一步往前推了一点"。
+      //
+      // ===== 【层3 修】别再白送 =====
+      //
+      // 原来是 `this.addWork(progress || 1)`，而 kind=do/build 的阶段
+      // need 基本是 {count:1} —— 也就是**任何 do/build 阶段，
+      // 上层一次"完成"就无条件过**。上层那个"完成"以前又是看话术的
+      // （"铁锭0"也算完成），所以整条链一起白给。
+      //
+      // 现在 progress 由 main.verifyTaskEffect() 按硬证据算出来
+      // （目标产物增量 / 背包净变化 / 周围方块变化 / 位移），
+      // 没有证据就是 0，这里拒绝推进，只记一次"空跑"。
+      if (s.kind === 'do' || s.kind === 'build') {
+        const real = Number(progress)
+        if (Number.isFinite(real) && real > 0) {
+          const cap = Math.max(1, Number((s.need && s.need.count) || 1))
+          this.addWork(Math.min(real, cap))
+        } else {
+          s.noProof = (s.noProof || 0) + 1
+          if (s.noProof === 1 || s.noProof % 3 === 0) {
+            this.journal(`「${s.title}」报了完成，但世界没变，这次不算数`)
+            this.log(`[goals] 拒绝白送：「${s.title}」拿不出硬证据（第 ${s.noProof} 次）`)
+          }
+        }
+      }
       s.fails = 0
 
       // ===== 防空转：说"成了"但进度一点没动 =====
@@ -916,20 +1437,82 @@ ${list}
       // judgeOutcome 判成功 -> 这里 s.fails 归零 -> 阶段永远推不动。
       // 结果：40 秒内同一个任务跑了 37 次，什么都没干。
       //
-      // 现在：成功率对得上进度才算数。连续这么多轮"成功但没进展"，
-      // 就当这一阶段没戏，换条路 —— 跟真人一样，
-      // "我已经有了"重复几十遍之后，他自己也会觉得不对劲。
+      // ===== 【UNHUMAN-SCAN #7】两遍没动就换法子，别把同一句话念五遍 =====
+      //
+      // 实测数据（data/runtime/goals.json，最近 30 条）：
+      //   「做把锄头」干了 5 趟都说成了，进度一点没动
+      //   「在附近地上捡够垫脚的石头」干了 5 趟……
+      // 8 个方向一样，都是同一个阶段原样跑 5 遍，然后整个目标被扔掉。
+      //
+      // 现在分两步走：
+      //   连着 methodSwitchWins(=2) 趟没进展 -> 换法子，目标不动
+      //   换到 maxMethods(=3) 条路都试完   -> 才算这阶段真没戏
+      // 换法子会写一条日志，说明"换什么、为什么换"，
+      // 也会进 journal，事后看得出他试过哪几条路。
       const before = s.best || 0
       if (status) {
         const p0 = stageProgress(s, status)
         if (p0.ratio <= before + 1e-9) {
+          // 已经"搁起来了"：别再数趟数，只等最低寿命那道闸到点。
+          // （不然 counter 会一直涨，日志里变成"干了 184 趟"。）
+          if (s.parked) {
+            const rec = this.abandon(`「${s.title}」几条路都试过了，先放下`)
+            return rec ? { advanced: false, abandoned: true } : { advanced: false, parked: true }
+          }
+
           s.idleWins = (s.idleWins || 0) + 1
+          s.idleTotal = (s.idleTotal || 0) + 1
+
+          // 总账到 3：这一阶段反复"说成了没进展"，换目标。
+          // （跟 maxFails=3 同一个刻度：换法子两次 + 第三次还不行。）
+          if ((s.idleTotal || 0) >= (this.cfg.maxIdleTotal || 3)) {
+            const rec = this.abandon(`「${s.title}」${s.idleTotal} 趟说成了进度没动（中间换过 ${s.methodIndex || 0} 个法子）`)
+            if (rec) return { advanced: false, abandoned: true }
+            // 还没到最低寿命：先搁着（current() 会给"干点别的"）
+            if (!s.parked) {
+              s.parked = true
+              s.parkAt = this.now()
+              this.journal('几条路都试过、趟数也够了，先放一放')
+              this.save(true)
+            }
+            return { advanced: false, parked: true }
+          }
+
+          // 兜底：#9 那条"同一个阶段空转到 12 趟就认账"保留着。
           if (s.idleWins >= (this.cfg.maxIdleWins || 5)) {
-            this.abandon(`「${s.title}」干了 ${s.idleWins} 趟都说成了，进度一点没动，八成是弄不到`)
-            return { advanced: false, abandoned: true }
+            const rec = this.abandon(`「${s.title}」干了 ${s.idleWins} 趟都说成了，进度一点没动，八成是弄不到`)
+            return rec ? { advanced: false, abandoned: true } : { advanced: false, held: true }
+          }
+
+          if (s.idleWins >= (this.cfg.methodSwitchWins || 2)) {
+            const why = `连着 ${s.idleWins} 趟都说成了，进度一点没动`
+            const sw = this.switchMethod(s, why)
+            if (sw.switched) return { advanced: false, switched: true, method: sw.text }
+            // 几条路都试过了 —— 这一步确实干不成，走放弃（还要过最低寿命那道闸）
+            const reason = `「${s.title}」换了 ${(s.methodIndex || 0)} 个法子都不行（${why}）`
+            // 先试放弃；被 5 分钟闸门挡住就"搁起来"：闸门会自己写一条
+            // 「先不换：才立了 X 分钟」，这里不重复，只把状态换掉 ——
+            // 接下来 current() 给的是"干点别的"。
+            const rec = this.abandon(reason)
+            if (rec) return { advanced: false, abandoned: true }
+            if (!s.parked) {
+              s.parked = true
+              s.parkAt = this.now()
+              this.journal(`这几条路都不行，先放一放，回头再想`)
+              this.save(true)
+            }
+            return { advanced: false, parked: true }
           }
         } else {
           s.idleWins = 0
+          s.idleTotal = 0
+          // 真往前挪了：不用搁着了，法子从头再试
+          if (s.parked) {
+            s.parked = false
+            s._holdLogged = false
+            s.methodIndex = 0
+            this.log(`[goals] 「${s.title}」又有进展了，接着弄`)
+          }
           this.goal.lastProgressAt = this.now()
         }
       } else {
@@ -937,14 +1520,57 @@ ${list}
       }
     } else {
       s.fails = (s.fails || 0) + 1
+      s.failTotal = (s.failTotal || 0) + 1
       this.goal.fails++
       this.journal(`这趟没成：${text || '不知道为啥'}`)
+
+      // 搁着的时候还失败：只等最低寿命到点，别再数遍数
+      if (s.parked) {
+        const rec = this.abandon(`「${s.title}」几条路都试过了，先放下`)
+        return rec ? { advanced: false, abandoned: true } : { advanced: false, parked: true }
+      }
+
+      // ===== 口径：2 次失败换法子，3 次失败换目标 =====
+      // 实测日志里同一个任务连着 3 遍「先弄把石镐」原样重发，
+      // 每遍都失败、但每次都说"再来一次"。真人第二遍就知道这样不行。
+      //
+      // failTotal 是跨"换法子"累计的 —— 换法子只清当条路的账（s.fails），
+      // 不清总账。所以：第 1、2 次失败在同一条路上，第 3 次失败时
+      // 哪怕已经换了法子，也照样算"这个阶段不行了"。
+      if ((s.failTotal || 0) >= (this.cfg.maxFails || 3)) {
+        const reason = `「${s.title}」试了 ${s.failTotal} 次都不行（中间换过 ${s.methodIndex || 0} 个法子）`
+        const rec = this.abandon(reason)
+        if (rec) return { advanced: false, abandoned: true }
+        if (!s.parked) {
+          s.parked = true
+          s.parkAt = this.now()
+          this.journal('这条路试到头了，先放一放，回头再想')
+          this.save(true)
+        }
+        return { advanced: false, parked: true }
+      }
+
+      if (s.fails >= (this.cfg.methodSwitchFails || 2)) {
+        const sw = this.switchMethod(s, `连着 ${s.fails} 遍都没成`)
+        if (sw.switched) return { advanced: false, switched: true, method: sw.text }
+        // 几条路都试完了：这时才认这一步干不成（还要过最低寿命那道闸）
+        const reason = `「${s.title}」换了几条路都不行（连着几次都没成）`
+        const rec = this.abandon(reason)
+        if (rec) return { advanced: false, abandoned: true }
+        if (!s.parked) {
+          s.parked = true
+          s.parkAt = this.now()
+          this.journal('这几条路都不行，先放一放，回头再想')
+          this.save(true)
+        }
+        return { advanced: false, parked: true }
+      }
     }
 
-    // 同一件事反复干不成，别死磕
+    // 同一件事反复干不成，别死磕（法子都换完之后的兜底）
     if (s.fails >= this.cfg.maxFails) {
-      this.abandon(`「${s.title}」试了 ${s.fails} 次都不行，换条路`)
-      return { advanced: false, abandoned: true }
+      const rec = this.abandon(`「${s.title}」试了 ${s.fails} 次都不行，换条路`)
+      return rec ? { advanced: false, abandoned: true } : { advanced: false, held: true }
     }
 
     const res = status ? this.observe(status) : { stageCompleted: false, goalCompleted: false }
@@ -965,7 +1591,7 @@ ${list}
    *   reached = true  -> 这一趟的额度够了，可以收工上去
    */
   dailyQuota (status) {
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s || !status) return { reached: false, text: '' }
 
     // 只有"攒东西"类阶段有额度概念。do/build 那种是一次性的，不存在分批。
@@ -979,18 +1605,28 @@ ${list}
 
     const parts = []
     let allReached = true
+    // gather 用峰值口径（跟 stageProgress 一致）：他边挖边用的时候，
+    // 当前净增量会变小，但"今天挖到多少"不该因此倒退。
+    if (s.kind === 'gather') trackPeak(s, inv, keys)
     for (const k of keys) {
       const wantTotal = Number(s.kind === 'craft' ? (need.n || 1) : need[k]) || 0
-      const have = Math.max(0, itemCount(inv, k) - itemCount(base, k))
+      const have = s.kind === 'gather'
+        ? peakHave(s, inv, k)
+        : Math.max(0, itemCount(inv, k) - itemCount(base, k))
       const capRaw = this.cfg.dailyCap[k]
-      // 今天该干多少 = min(还差多少, 今天份)
       const remain = Math.max(0, wantTotal - have)
       if (remain === 0) {
         // 这一项整个阶段的目标已经攒满了，今天份自然算完成
         parts.push(`${cn(k)} 够了`)
         continue
       }
-      const cap = Math.min(remain, capRaw != null ? capRaw : wantTotal)
+      // 【2026-11-13 实测 bug】原来是 cap = min(remain, 今天份)，
+      // 再用 have >= cap 判"今天份完成"—— 两个口径混了：
+      //   want=6、have=4 → remain=2 → cap=2 → have(4) >= 2 → 判"够了"，
+      //   于是 23:49:31 在 4/6 木头的时侯就喊"今天这一份够了"，把人从
+      //   盖房的备料里拉走去"回家待着"，接着 house 卡在 2/7 步被放弃。
+      // 现在：今天份 = min(整个阶段要的量, 每天能干多少)，拿 have 跟它比。
+      const cap = Math.min(wantTotal, capRaw != null ? capRaw : wantTotal)
       const reached = have >= cap
       if (!reached) allReached = false
       // 显示实际攒到的（have），不是被裁剪过的 cap ——
@@ -1025,7 +1661,7 @@ ${list}
 
   /** 手工给当前阶段加工作量（盖墙、搭台子这种"做成了"的计量） */
   addWork (n = 1) {
-    const s = this.stage()
+    const s = this.currentStage()
     if (!s) return 0
     s.work = (s.work || 0) + Math.max(0, Number(n) || 0)
     return s.work
@@ -1050,6 +1686,8 @@ ${list}
       why: g.why,
       result: 'done',
       stages: g.stages.length,
+      y: g.createdY,
+      underground: g.createdUnderground,
       at: now,
       tookMin: mins
     })
@@ -1059,12 +1697,77 @@ ${list}
     this.log(`[goals] 干完了：${g.title}（${g.stages.length} 步，用了 ${mins} 分钟游戏外的时间）`)
   }
 
+  // ------------------------------------------------ 换法子（#7）
+
+  /**
+   * 这一阶段换个干法 —— 不是换目标。
+   *
+   * 返回 { switched: true, text, from, why } 或者 { switched: false }（法子用完了）。
+   *
+   * 【为什么单独抽出来】UNHUMAN-SCAN #7 说得很清楚：
+   * "第 2 次『成功但零进展』时就该换**方法**而不是换**目标**"。
+   * 原来只有一条路：数到 5 趟 -> 整个目标扔掉 -> 下一个 8 秒再扔一个。
+   * 换法子之后目标还在，只是"这么干不行，换那样干"。
+   */
+  switchMethod (s, why) {
+    if (!s) return { switched: false }
+    const ways = waysForStage(s)
+    const cur = Math.max(0, Math.min(s.methodIndex || 0, ways.length - 1))
+    const next = cur + 1
+    const maxMethods = Math.max(1, this.cfg.maxMethods || 3)
+    if (next >= ways.length || next >= maxMethods) return { switched: false }
+
+    const from = ways[cur] || s.title
+    const to = ways[next]
+    s.methodIndex = next
+    s.methodSince = this.now()
+    s.idleWins = 0          // 新法子的账重新记
+    s.fails = 0
+    s.methodTries = (s.methodTries || 0) + 1
+
+    const msg = `[goals] 换法子（目标不变）：「${s.title}」${why} —— 「${from}」→「${to}」`
+    this.log(msg)
+    this.journal(`这个法子不行（${why}），换个法子：${to}`)
+    this.save(true)
+    return { switched: true, text: to, from, why }
+  }
+
   /** 放弃。真人也会放弃 —— 不丢人，记下来就行 */
-  abandon (reason) {
+  abandon (reason, opts = {}) {
     const g = this.goal
     if (!g) return null
     const now = this.now()
-    const s = this.stage()
+    const s = this.currentStage()
+
+    // ===== 最低寿命：不到时间不许放弃 =====
+    //
+    // 【为什么要在这里拦】#9 的 minLifeMs / minLifeStageMs 之前只写进了 cfg，
+    // 全文没有任何一行读它们 —— 配置在，闸门没装。
+    // 而 #7 把"空转几趟就动手"从 5 趟压到 2 趟，次数更少、放弃更快，
+    // 不把这道时间闸真正接上的话，#9 会当场回退成"几秒换一个目标"。
+    //
+    // 除了生命危险（urgent），目标立了 minLifeMs 之内、或者这一步
+    // 立了 minLifeStageMs 之内，都不许扔。
+    if (!opts.urgent) {
+      const ageMs = now - (g.createdAt || now)
+      const stageMs = now - ((s && s.startedAt) || g.createdAt || now)
+      const minLife = this.cfg.minLifeMs || 0
+      const minStage = this.cfg.minLifeStageMs || 0
+      const tooYoung = minLife > 0 && ageMs < minLife
+      const stageTooYoung = minStage > 0 && stageMs < minStage
+      if (tooYoung || stageTooYoung) {
+        const leftMin = Math.max(0, Math.ceil((minLife - ageMs) / 60000))
+        // 只记一次，别每 30 秒刷一条
+        if (!s || !s._holdLogged) {
+          if (s) s._holdLogged = true
+          this.log(`[goals] 先不换：这目标才立了 ${(ageMs / 60000).toFixed(1)} 分钟（至少 ${Math.round(minLife / 60000)} 分钟，还差 ${leftMin} 分钟）—— 想放弃的理由是「${reason || ''}」`)
+          this.journal(`有点想放弃（${reason || ''}），但才刚开始，再试试`)
+          this.save(true)
+        }
+        return null
+      }
+    }
+
     this.history.push({
       key: g.key,
       title: g.title,
@@ -1073,6 +1776,11 @@ ${list}
       reason: reason || '不想干了',
       stoppedAt: s ? s.title : '',
       stagesDone: g.stageIndex,
+      // 立的时候在哪 / 扔的时候在哪（参谋要的排序 bug 判据）
+      y: g.createdY,
+      underground: g.createdUnderground,
+      yNow: Math.round(posOf(this.lastStatus || {}).y),
+      undergroundNow: undergroundOf(this.lastStatus || {}),
       at: now
     })
     // 近期不再选同一个方向（自己发明的目标用整句话当 key）
@@ -1088,7 +1796,7 @@ ${list}
     if (!this.goal) {
       return { has: false, text: '现在没在忙什么大事', history: this.history.slice(-3) }
     }
-    const s = this.stage()
+    const s = this.currentStage()
     return {
       has: true,
       title: this.goal.title,
@@ -1106,7 +1814,7 @@ ${list}
   /** 存进长期记忆的一句话 */
   summary () {
     if (!this.goal) return null
-    const s = this.stage()
+    const s = this.currentStage()
     return `最近在忙一件事：${this.goal.title}。卡在「${s ? s.title : ''}」这一步。`
   }
 
@@ -1126,6 +1834,40 @@ ${list}
 
 // ---------------------------------------------------------------- 阶段进度计算
 
+/**
+ * gather 阶段"达到过的最高数量"。
+ *
+ * 【为什么不用当前净增量】他会边挖边用：圆石 167→151→148 在减少，
+ * `itemCount(inv,k) - itemCount(base,k)` 变成负数 -> Math.max(0,…) = 0，
+ * 于是日志里全是「干了 5 趟都说成了，进度一点没动」——他真的干了，
+ * 只是计数器不认。
+ *
+ * 改成阶段期间每个 key 的峰值：挖到就记，消耗不影响进度；
+ * 开局已有的数量记在 base.inv 里，peak 从它起步，所以不会白送。
+ * 峰值写回 stage.base.peak，随 goals.json 一起存盘，重连不丢。
+ */
+function trackPeak (stage, inv, keys) {
+  const base = stage && stage.base
+  if (!base) return
+  if (!base.peak || typeof base.peak !== 'object') base.peak = {}
+  const baseInv = base.inv || {}
+  for (const k of keys) {
+    const floor = itemCount(baseInv, k)
+    const prev = base.peak[k] != null ? Number(base.peak[k]) : floor
+    const now = itemCount(inv, k)
+    base.peak[k] = Math.max(isFinite(prev) ? prev : floor, now)
+  }
+}
+
+/** 某个 key 在这一阶段攒到的量（峰值 - 开局基线，不会因为消耗变小） */
+function peakHave (stage, inv, k) {
+  const baseInv = (stage.base && stage.base.inv) || {}
+  const peak = stage.base && stage.base.peak && stage.base.peak[k] != null
+    ? Number(stage.base.peak[k])
+    : itemCount(inv, k)
+  return Math.max(0, peak - itemCount(baseInv, k))
+}
+
 function stageProgress (stage, status) {
   const inv = (status && status.inventory) || {}
   const need = stage.need || {}
@@ -1134,12 +1876,14 @@ function stageProgress (stage, status) {
   if (stage.kind === 'gather') {
     const keys = Object.keys(need)
     if (!keys.length) return { ratio: 1, text: '' }
+    // 先更新峰值，再按峰值算 —— 消耗不会让已经挖到的进度倒退
+    trackPeak(stage, inv, keys)
     let total = 0
     let got = 0
     const parts = []
     for (const k of keys) {
       const want = Number(need[k]) || 0
-      const have = Math.max(0, itemCount(inv, k) - itemCount(base, k))
+      const have = peakHave(stage, inv, k)
       const g = Math.min(want, have)
       total += want
       got += g
@@ -1151,8 +1895,24 @@ function stageProgress (stage, status) {
   if (stage.kind === 'craft') {
     const name = need.item
     const want = Number(need.n) || 1
-    const have = itemCount(inv, name)
-    return { ratio: clamp01(have / want), text: `${cn(name)} ${Math.min(want, have)}/${want}` }
+    // ===== 【层3 修】craft 也要按**增量**算 =====
+    //
+    // 原来是 `itemCount(inv, name)` —— 绝对存量。
+    // 实测：开局背包里就有 stone_pickaxe / wooden_hoe / iron_pickaxe 的时候，
+    // iron/farm/diamond 三个目标的第 1 步（"先弄把石镐/做把锄头/先弄把铁镐"）
+    // 一立起来 ratio 立刻是 1，一步没动就过。30 条历史里那些 stagesDone:1
+    // 的记录就是这么来的。
+    //
+    // 现在跟 gather 一样对 base 求差：这一阶段**新做出来的**才算。
+    // 手上本来就有的那一把不算他的工。
+    const had = itemCount(base, name)
+    if (had >= want) {
+      // 一开始手上就有够用的：这一步**不用做**，跟"本来就在地面上"一样处理 ——
+      // 直接跳过，但不记成"他做到了"（goals.json 里不留零动作完成的阶段）。
+      return { ratio: 1, text: `手上本来就有${cn(name)}，这一步不用做`, trivial: true }
+    }
+    const made = Math.max(0, itemCount(inv, name) - had)
+    return { ratio: clamp01(made / want), text: `${cn(name)} 新做 ${Math.min(want, made)}/${want}` }
   }
 
   // surface：回到地面。跟 depth 正好相反 —— 往上走，y 大于等于目标就算到。
@@ -1177,8 +1937,13 @@ function stageProgress (stage, status) {
     const ug = certain ? status.underground : null
     const y = Math.round(posOf(status).y)
 
-    // 明确的"在露天" —— 一锤定音，不管 y 是多少
+    // 明确的"在露天" —— 一锤定音，不管 y 是多少。
+    // 但**一开始就在露天**的话，这一步是没走过的：不能白算。
+    // （#9 里 3 秒完成的 getup 就是这种：立起来的时候人已经在外面了。）
     if (ug === false) {
+      if (stage.base && stage.base.ug === false) {
+        return { ratio: 0, text: '本来就在地面上，这一步没什么可爬的', trivial: true }
+      }
       return { ratio: 1, text: `已经在露天了（y=${y}）` }
     }
 
@@ -1212,6 +1977,19 @@ function stageProgress (stage, status) {
     return { ratio: clamp01(done), text: `现在 y=${y}，目标是 y=${target}` }
   }
 
+  // climb：往上爬。跟 depth 正好相反 —— 只要 y 够了就算到。
+  // 【为什么单独一个 kind】"往上挖"是他**做得到**的事（刨十几格没问题），
+  // "找到露天"才是不一定做得到的（头顶有没有遮挡）。两件事分开算，
+  // 卡住时才看得出卡在哪一段，而不是一律记"没成"。
+  if (stage.kind === 'climb') {
+    const target = Number(need.y) || SURFACE_Y
+    const y = Math.round(posOf(status).y)
+    if (y >= target) return { ratio: 1, text: `已经到 y=${y} 了` }
+    const from = stage.base && typeof stage.base.y === 'number' ? stage.base.y : y
+    const span = Math.max(1, target - from)
+    return { ratio: clamp01((y - from) / span), text: `现在 y=${y}，目标是 y=${target}` }
+  }
+
   if (stage.kind === 'travel') {
     const want = Number(need.distance) || 100
     const from = (stage.base && stage.base.pos) || posOf(status)
@@ -1226,20 +2004,252 @@ function stageProgress (stage, status) {
 }
 
 /** 模型给的阶段（可能只有一句话）补成能验收的结构 */
+// ---------------------------------------------------------------- 「换个法子」
+
+/**
+ * 同一件事的几种干法。第 0 条 = 原来的干法，换法子时往后挪。
+ *
+ * 【为什么要有这个】UNHUMAN-SCAN #7：同一个阶段连做 5 遍一模一样的事
+ * （"5 在附近地上捡够垫脚的石头"），第 5 遍才放弃整个目标。
+ * 真人第二遍就会换手法，而不是把"捡石头"这三个字重新念一遍：
+ *   在脚边捡 → 挖裸露岩面 → 往下挖两格取石头再垫回来
+ * 换的是**怎么干**，不是**干什么** —— 目标还是搭高台。
+ *
+ * 按标题登记，是因为池子里的阶段被复制了好几手（POOL → picked.stages →
+ * makeGoal 里的新对象），只在 POOL 上挂 ways 容易在半路丢掉。
+ * 自定义阶段（模型自己编的）没有登记，走下面的按 kind 兜底。
+ */
+const STAGE_WAYS = {
+  // tower / house 的备料
+  '在附近地上捡够垫脚的石头': [
+    '在脚边和山坡上捡现成的圆石',
+    '找裸露的岩面直接挖，别满地找',
+    '往下挖两格取石头，再垫回来'
+  ],
+  '备料：石头和木头攒够一堆': [
+    '石头挖裸露的岩面，木头找树',
+    '先专门砍树把木头凑够，石头最后补',
+    '先挖石头堆够，木头从地上的残桩捡'
+  ],
+  // iron：带火把和吃的
+  '带够火把和吃的，下去挖矿': [
+    '先砍树做火把，吃的顺手打猎',
+    '先解决吃的：打猎或摘野果，火把回头再说',
+    '翻一翻落脚点附近有没有现成的，别从零做'
+  ],
+  '带够火把，别在下面摸黑': [
+    '砍树烧炭做火把',
+    '先攒煤，煤比木炭耐烧',
+    '带够木头和炭下去，边挖边做'
+  ],
+  '这一趟挖够十来块铁矿': [
+    '顺着天然矿洞往下找露头的铁矿',
+    '自己往下挖楼梯井，一路看墙上的矿',
+    '换个方向找，别在同一片石头里打转'
+  ],
+  '回到地上再烧成铁锭': [
+    '回地面上用熔炉烧',
+    '先在下面用随身炉子烧一半再上去',
+    '找现成的熔炉，省得自己造'
+  ],
+  // farm
+  '做把锄头': [
+    '木头做棍、石头做头，从头做一把',
+    '先砍两棵树补够木头，再回来做',
+    '看看有没有现成的能顶用，别非做不可'
+  ],
+  '找点种子': [
+    '找草打掉，弄点小麦种子',
+    '去有水的地方找，草多的地方种子也多',
+    '先开一块地等雨，种子路上顺手捡'
+  ],
+  '等它长，收一茬麦子': [
+    '守着这块地等它长，顺便干点别的',
+    '去别处转一圈再回来看',
+    '先收一轮能收的，青的留着'
+  ],
+  // iron：石镐（3 圆石 + 2 木棍）
+  '先弄把石镐，铁矿才挖得动': [
+    '先砍树做把木镐，挖 3 块圆石再做石镐',
+    '地上捡现成的圆石和木头，凑够就做',
+    '先徒手挖几块软石头凑数，别非得找硬岩'
+  ],
+  // diamond
+  '先弄把铁镐，不然到深层白跑': [
+    '挖够铁矿回去烧，自己做一把',
+    '先找现成的铁：村庄箱子、废弃矿道',
+    '用石镐先挖浅层的，铁镐边挖边攒'
+  ],
+  '往下挖到很深的地方': [
+    '找天然竖井或矿洞往下走',
+    '自己挖楼梯井，一格一格下去',
+    '换个已知的洞口重新下，别死磕这一条'
+  ],
+  '找到钻石矿，挖下来': [
+    '贴着 y=12 一层层探',
+    '沿着岩浆湖边的岩壁找',
+    '换个方向重新开一条探矿道'
+  ],
+  // explore
+  '带上吃的和火把再出门': [
+    '先备吃的和火把，够了就走',
+    '轻装出门，路上打猎捡木头现做',
+    '先带上现有的，缺的路上补'
+  ],
+  '朝一个方向走出去，走到没见过的地界': [
+    '认准一个方向一直走',
+    '沿着河走，河一般通得远',
+    '翻过前面那道山看看另一边'
+  ],
+  // 收尾 / 回地面
+  '顺着来路爬回地面，透口气': [
+    '顺来路爬回去',
+    '自己挖一条向上的楼梯井出去',
+    '找天然洞口出去，别硬挖'
+  ],
+  '往上挖/找路，回到地面上': [
+    '往上挖楼梯井',
+    '找最近的洞口绕出去',
+    '顺着水流或矿道往上摸'
+  ],
+  '先往上挖，挖到地表那么高': [
+    '一格一格往上挖楼梯井',
+    '找个天然的竖井/矿道往上爬',
+    '斜着往上挖，别挖成直井（容易掉）'
+  ],
+  '再找露天的地方钻出去': [
+    '顺着最近的洞口走出去',
+    '朝光的方向挖过去（有光通常就是口子）',
+    '找个漏下天光的地方往上掏'
+  ],
+  '到地面上站一会儿，看看四周': [
+    '站高处看一圈',
+    '沿着边上走一圈看看',
+    '找个树顶爬上去望'
+  ]
+}
+
+/**
+ * 这一步有哪几种干法。第一条恒等于原计划。
+ * 自定义阶段没登记 -> 按 kind 给一组通用换法（也得是真能换的做法）。
+ */
+function waysForStage (stage) {
+  if (!stage) return []
+  if (Array.isArray(stage.ways) && stage.ways.length) return stage.ways.slice()
+  const t = String(stage.title || '')
+  if (STAGE_WAYS[t]) return STAGE_WAYS[t].slice()
+
+  const need = stage.need || {}
+  const what = cn(Object.keys(need)[0] || '')
+  switch (stage.kind) {
+    case 'gather':
+      return [
+        t,
+        `换个地方找${what}`,
+        `找现成的或者能顶用的替代品`
+      ]
+    case 'craft':
+      return [
+        t,
+        `先把材料补齐再回来做`,
+        `看看有没有现成的能顶用`
+      ]
+    case 'surface':
+    case 'depth':
+      return [
+        t,
+        '自己挖一条竖井/楼梯井，别等现成的路',
+        '换个方向重新找路'
+      ]
+    case 'travel':
+      return [
+        t,
+        '换个方向走',
+        '沿着水路走，通常通得远'
+      ]
+    default:
+      return [
+        t,
+        '换个做法，别照原样再来一遍',
+        '换块地方再试'
+      ]
+  }
+}
+
+/**
+ * 几条路都试过、但目标还没到能放弃的时间，这时说什么。
+ *
+ * 【为什么需要】#7 修完第一版跑回放发现的：换法子到第 3 条之后，
+ * 放弃被 #9 的 5 分钟闸门挡住，于是同一条任务文本又被重复了 184 遍 ——
+ * 比原来的 5 遍更难看。真人这时候不会接着念同一句话，
+ * 他会"先把这事放一放，去干点别的"，过一阵再回来看。
+ * 这几句就是那个"干点别的"。按已经跑过的趟数轮换，不重复。
+ */
+const PARK_TEXTS = [
+  '这一步先放放，在附近转转看看有没有别的门路',
+  '坐一会儿，把身上的东西归置一下，这事待会儿再说',
+  '先干点别的散散心，回头再想这件事'
+]
+
 /**
  * 模型给的阶段（可能只有一句话）补成能验收的结构。
  *
  * 它自己发明的阶段没有数字，只能按"做成了没有"来算 —— 一次成功算一步。
  * 这样宁可粗一点，也不能因为"没法量化"就不记账。
  */
+/**
+ * 每个阶段**必须声明**用哪类证据验收 —— 判据层没有默认分支，没声明就抛错。
+ *
+ * 这是在**声明**，不是在**判定**：这里只回答"这个阶段该用哪种尺子量"，
+ * 成败由 src/judge.js 按尺子去量世界。
+ *
+ *   world    背包 / 方块 / 位移 —— 绝大多数体力活
+ *   duration 在附近待够 N 秒且没掉血没饿 —— 歇着、守着、等天亮这类没有世界证据的
+ *   state    调用方给一个明确状态判据
+ */
+// 显式声明表：**目标层是数据，判据层没有默认分支** —— 每个阶段在这里或模板里
+// 写清楚用哪把尺子量。没写的阶段，judge 会直接抛错（不是静默放过）。
+// 新增阶段模板时忘了声明 -> 单测 test-fake-success 的"POOL 每个阶段都能拿到 evidence"会红。
+const STAGE_EVIDENCE = {
+  // 没有世界证据的：待着、守着、等天亮
+  '先歇着': { evidence: 'duration', minSec: 30 },
+  '歇一会儿': { evidence: 'duration', minSec: 30 },
+  '守着火堆': { evidence: 'duration', minSec: 60 }
+}
+
+function evidenceForStage (kind, title) {
+  const t = String(title || '')
+  if (STAGE_EVIDENCE[t]) return Object.assign({}, STAGE_EVIDENCE[t])
+  // 明确"待着/歇/守/等"且没有位移动词的，才用 duration
+  if (/(歇|休息|待着|待一会|守着|等天亮|睡一觉|养伤|养血)/.test(t) &&
+      !/(回|去|走|到|搬|送|找|探|巡)/.test(t)) {
+    return { evidence: 'duration', minSec: 30 }
+  }
+  // 其它一律 world：挖/砍/做/合/盖/放/回地面/上下…都靠背包、方块、位移
+  return { evidence: 'world' }
+}
+
+// POOL 是数据：加载时给每个阶段**盖章**，让 evidence 成为阶段自己的字段。
+// 注意这不是"运行时兜底" —— 盖章发生在模块初始化，之后阶段身上就带着类型；
+// judge 仍然拒绝没有类型的输入。
+for (const def of POOL) {
+  for (const st of def.stages || []) {
+    if (st.evidence) continue
+    const ev = evidenceForStage(st.kind, st.title)
+    st.evidence = ev.evidence
+    if (ev.minSec) st.minSec = ev.minSec
+  }
+}
+
 function normalizeStage (raw) {
   const title = String(raw.title || '').trim().slice(0, 40)
   let kind = String(raw.kind || '').trim()
-  if (!['gather', 'craft', 'depth', 'surface', 'travel', 'do', 'build'].includes(kind)) kind = 'do'
+  if (!['gather', 'craft', 'depth', 'climb', 'surface', 'travel', 'do', 'build'].includes(kind)) kind = 'do'
   const need = raw.need && typeof raw.need === 'object' && Object.keys(raw.need).length
     ? raw.need
     : { count: 1 }
-  return { key: null, kind, need, title }
+  const ev = raw.evidence ? { evidence: raw.evidence, minSec: raw.minSec } : evidenceForStage(kind, title)
+  return { key: null, kind, need, title, evidence: ev.evidence, ...(ev.minSec ? { minSec: ev.minSec } : {}) }
 }
 
 function parseJson (text) {
@@ -1252,6 +2262,7 @@ function parseJson (text) {
 module.exports = Goals
 module.exports.Goals = Goals
 module.exports.POOL = POOL
+module.exports.evidenceForStage = evidenceForStage
 module.exports.ITEM_CN = ITEM_CN
 module.exports.pickTier = pickTier
 module.exports.itemCount = itemCount

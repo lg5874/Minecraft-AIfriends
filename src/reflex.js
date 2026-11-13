@@ -53,26 +53,58 @@ class Reflex {
    *   2. 有怪 -> 跑
    *   3. 什么都没有 -> 吃东西回血
    */
+  /**
+   * 紧急保命。
+   *
+   * 【2026-11-13 · 实测日志可读性事故】
+   * 老节流有一条例外 `dropping`（血还在往下掉就放行），而 `urgent` 对溺水/岩浆
+   * 永远为真 —— 于是 tick 每 800ms 叫一次，血卡在 5 不动也每 0.5~0.8 秒重发。
+   * 实测 5 分钟打 **131 条** `[sos] 血 5，紧急保命（drown）`，
+   * 日志被它淹掉，玩家在公屏/卡顿上也能感觉到"这号在疯狂重复"。
+   *
+   * 现在拆成两件事，各有各的节流：
+   *   **动作**：仍然要重复（溺水时得一直往上，不会因为血没变就能停），
+   *           紧急类型 2.5 秒一次、普通类型 1.2 秒一次；换类型/掉到更低一档立刻执行。
+   *   **日志**：只有"换了一种危险"或"血掉到更低一档"或"一分钟没报了"才打。
+   *           5→4→3 各一条，同一档反复掉不重发。
+   */
   sos (kind, opts = {}) {
     const bot = this.bot
     const now = Date.now()
-    // 节流：1.2 秒内不重复执行（tick 800ms 一轮，避免动作打架）。
-    //
-    // 两种例外必须立刻放行：
-    //   1) urgent=true —— 溺水/岩浆这类"下一秒就死"的，不等节流
-    //   2) 伤害类型变了 —— 先摔后淹，处理方式完全不同
-    const urgent = !!opts.urgent || kind === 'drown' || kind === 'lava' ||
-      kind === 'on_fire' || kind === 'in_fire'
-    const typeChanged = !!(this.sosKind && kind && this.sosKind !== kind)
-    // 血还在往下掉 -> 上一轮没救住，必须重新判断（否则会眼睁睁看着死）
-    const hp = this.bot.health
-    const dropping = typeof hp === 'number' && typeof this.sosHp === 'number' && hp < this.sosHp
-    if (!urgent && !typeChanged && !dropping && now - (this.sosAt || 0) < 1200) return
-    this.sosAt = now
-    this.sosKind = kind || ''
-    this.sosHp = typeof hp === 'number' ? hp : null
+    const hp = bot.health
 
-    try { this.ctx.log(`[sos] 血 ${Math.round(bot.health)}，紧急保命（${kind || '未知'}）`) } catch (e) {}
+    // 【别让"血低"把正在处理的险情顶掉】
+    // tick 每 800ms 叫一次 `sos(this.sosKind || 'lowhp')`，而 onPain 那边按伤害类型
+    // 传 'drown'/'lava'。两边交替时 kind 在 drown ↔ lowhp 之间来回跳，
+    // 每次都算"换了类型"→ 每次都打一行日志（实测 5 分钟 19 条里一大半是这种抖动）。
+    // 正在溺水/岩浆里时，'lowhp' 这种泛泛原因不该改变当前处置。
+    const HAZARD = new Set(['drown', 'lava', 'on_fire', 'in_fire', 'suffocate', 'out_of_world'])
+    let k = kind || ''
+    if (HAZARD.has(this.sosKind) && (k === 'lowhp' || k === '' || k === 'hostile')) k = this.sosKind
+    const urgent = !!opts.urgent || k === 'drown' || k === 'lava' ||
+      k === 'on_fire' || k === 'in_fire'
+
+    // 血按 1 点分档：掉到更低一档才算"更糟了"
+    const band = typeof hp === 'number' && isFinite(hp) ? Math.max(1, Math.ceil(hp)) : null
+    const typeChanged = this.sosKind !== k
+    const lowerBand = band != null && typeof this._sosBandHp === 'number' && band < this._sosBandHp
+
+    const actGapMs = urgent ? 2500 : 1200
+    const sinceAct = now - (this._sosActAt || 0)
+    if (!typeChanged && !lowerBand && sinceAct < actGapMs) return
+
+    this._sosActAt = now
+    this.sosAt = now
+    this.sosKind = k
+    this.sosHp = typeof hp === 'number' ? hp : null
+    this._sosBandHp = band
+
+    // 日志：换类型 / 掉档 / 一分钟一次
+    const sinceLog = now - (this._sosLogAt || 0)
+    if (typeChanged || lowerBand || sinceLog > 60000) {
+      this._sosLogAt = now
+      try { this.ctx.log(`[sos] 血 ${Math.round(hp)}，紧急保命（${k || '未知'}）`) } catch (e) {}
+    }
 
     // 1. 溺水：往上浮
     if (kind === 'drown') {
@@ -135,7 +167,11 @@ class Reflex {
     if (!attacker) {
       // 环境伤害：不记恩怨，但**必须救命**
       this.ctx.log(`[hurt] 环境伤害 ${kind || '未知'}，血 ${Math.round(hp)}`)
-      if (hp <= this.SOS_HP) {
+      // 【按威胁类型，不只是按血量】快淹死/岩浆/着火，血 7~10 一样得先离开。
+      // 血 10 还在水里往下挖，下一口水就没了；摔伤/饿这种已经发生过的不用停手。
+      const LETHAL = kind === 'drown' || kind === 'lava' || kind === 'on_fire' ||
+        kind === 'in_fire' || kind === 'suffocate' || kind === 'out_of_world'
+      if (hp <= this.SOS_HP || (LETHAL && hp <= 10)) {
         // 环境伤害（溺水/岩浆）等不起节流窗口，直接 urgent
         this.sos(kind, { urgent: true })
       }

@@ -40,14 +40,14 @@ MA 想做的是第三种。
 
 | 事情 | 实测 |
 |---|---|
-| 砍一棵树 | 63–87 秒，拿到 6 块原木 |
+| 砍一棵树 | 106 秒，拿到 5 块原木 |
 | 做把木镐 | 3 秒（有材料时） |
 | 做把石镐 | 19–35 秒 |
 | 从 y=18 的地下爬回地面 | 48.7 秒，真寻路，不用传送 |
 | 离家 95 格走回去 | 48.7 秒，误差 2.9 格 |
-| 找点吃的 | 27–52 秒，打猎或摘果子 |
+| 找点吃的 | 119 秒，打猎或摘果子 |
 | 放箱子存东西 | 2–3 秒 |
-| 挖 3 块石头 | 37.8 秒（扫描 0.2s / 挖掘 8.0s / 捡取 18.1s） |
+| 挖 3 块石头 | `mine()` 本身 37.8 秒（扫描 0.2 / 挖掘 8.0 / 捡取 18.1）；端到端含造镐最好 252 秒 |
 
 端到端 8 个典型任务跑下来，**成功率 25% → 67%**。剩下 33% 卡在哪，`docs/KNOWN-BOTTLENECK.md` 里一条条写着。
 
@@ -182,7 +182,11 @@ z+ 1: ████C···█████
 
 下次遇到同类事，**直接复用上次跑通的代码**，不再问模型。
 
-实测复用率 **89.8%**，最热的那个技能被复用了 53 次。
+实测任务复用率 **93.7%**（359/383）。
+
+⚠️ 但这里有个坑：最热的技能复用 **19 次、0 次成功**。
+因为"成功"判的是"代码没抛异常"，不是"事情真的做成了"。
+这个问题正在修（见 `docs/UNHUMAN-SCAN.md` #8）。
 
 **这意味着他的能力上限不是代码写死的**，是模型给多少。
 
@@ -271,9 +275,11 @@ npm start
 不想让他跑在你电脑上？`mcplugin/` 里有个 Paper 插件，能让他常驻服务器。
 
 ```bash
-node scripts/package.js          # 打包（268 KB）
-cd mcplugin && ./build.sh        # 编译插件（52 KB）
+node scripts/package.js                    # 打包（268 KB）
+cd /root/workspace/mcplugin && ./build.sh  # 编译插件（52 KB）
 ```
+
+> `mcplugin/` 目前不在这个仓库里（在 `../mcplugin`）。要合并进来见 BACKLOG。
 
 传到服务器的 `plugins/`，面板点启动，填好 key 就能跑。
 
@@ -290,6 +296,9 @@ cd mcplugin && ./build.sh        # 编译插件（52 KB）
 | [docs/DESIGN.md](docs/DESIGN.md) | 完整设计 |
 | [docs/architecture.md](docs/architecture.md) | 架构调研（对比 Voyager / mindcraft / numen） |
 | [docs/memory.md](docs/memory.md) | 记忆方案调研 |
+| [docs/UNHUMAN-SCAN.md](docs/UNHUMAN-SCAN.md) | **16 个"不像人"的问题**（附实测证据） |
+| [docs/STRATEGY.md](docs/STRATEGY.md) | 项目参谋的独立分析：假进展的三层回路 |
+| [docs/ALIVE-TONE.md](docs/ALIVE-TONE.md) | 2026 活人感语料库（74 条，标注来源） |
 | [docs/KNOWN-BOTTLENECK.md](docs/KNOWN-BOTTLENECK.md) | **所有踩过的坑和修法**（最有参考价值） |
 | [docs/TESTING.md](docs/TESTING.md) | 测试基线和怎么验证 |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 部署步骤 |
@@ -303,8 +312,14 @@ cd mcplugin && ./build.sh        # 编译插件（52 KB）
 ## 自测
 
 ```bash
-npm test                    # 全部单元测试（366 项）
-npm run test:e2e            # 端到端（连真服务器跑 8 个任务）
+npm test                     # npm 里注册的单元测试（90 项）
+node scripts/test-e2e.js     # 端到端（连真服务器跑 8 个任务）
+node scripts/check-syntax.js # 语法检查
+
+# 全部离线测试（496 项）
+for t in persona memory decay perceive multibot memory-quality goals home skills; do
+  node scripts/test-$t.js
+done
 node scripts/check-syntax.js
 ```
 

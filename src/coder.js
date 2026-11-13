@@ -3,6 +3,7 @@
 // 这是"能学任何东西"的核心 —— 能力不由我写死，由它自己长。
 
 const vm = require('vm')
+const judge = require('./judge')
 const { Vec3 } = require('vec3')
 
 // 禁词：沙箱外的任何东西都不许碰
@@ -16,6 +17,53 @@ const FORBIDDEN = [
 function checkSafety (code) {
   for (const re of FORBIDDEN) {
     if (re.test(code)) return '代码里不能用 ' + re.source.replace(/\\b/g, '').replace(/\\/g, '')
+  }
+  return null
+}
+
+// 任务描述里点名的产物 -> 游戏物品名。
+// 技能层核验要知道"这趟到底该多出什么东西"，否则"顺路挖了几块圆石"
+// 就能把"做铁镐 / 做石剑"这种任务洗成成功。
+// 和 main.js 的 extractWantedItem 是同一张表：两个模块各存一份，
+// 是为了不让 coder 反向依赖 main（main 是入口，require 会成环）。
+// 顺序有意义：先长词后短词，否则"做钻石镐"会先命中"石镐"。
+const WANT_MAP = {
+  钻石镐: 'diamond_pickaxe', 木镐: 'wooden_pickaxe', 石镐: 'stone_pickaxe',
+  铁镐: 'iron_pickaxe', 木斧: 'wooden_axe', 石斧: 'stone_axe',
+  铁斧: 'iron_axe', 木剑: 'wooden_sword', 石剑: 'stone_sword',
+  铁剑: 'iron_sword', 工作台: 'crafting_table', 熔炉: 'furnace',
+  箱子: 'chest', 木棍: 'stick', 火把: 'torch', 床: 'red_bed',
+  面包: 'bread', 木门: 'oak_door', 梯子: 'ladder',
+  煤: 'coal', 铁锭: 'iron_ingot', 青金石: 'lapis_lazuli',
+  钻石: 'diamond', 圆石: 'cobblestone', 木板: 'oak_planks'
+}
+
+/**
+ * 【无进展退出】生成的技能代码必须自带"干不动就失败退出"的出口。
+ *
+ * 参谋的判断（2026-11-13）：
+ *   **不该问"这个任务最多允许多久"，该问"它已经多久没改变世界了"。**
+ * 证据是那个技能 8 次成功耗时是双峰：5s / 16s / 131s / 233s / 311s / 312s / 394s / 407s
+ * —— 要么几十秒拿到，要么顶到天花板。双峰 = 它只有成功出口，没有失败出口。
+ *
+ * 入库规则：代码里有 while/for 循环，却没有"连续 N 次没进展就 return 失败"
+ * 的计数 → 拒绝入库。这样新技能不会再把 420 秒天花板当成常态。
+ */
+function hasNoProgressExit (code) {
+  const src = String(code || '')
+  const hasLoop = /\b(while|for)\s*\(/.test(src)
+  if (!hasLoop) return true            // 没有循环，就不存在"空转到底"
+  // 有计数变量 + 有 return（通常 return 失败文案或 throw）
+  const counter = /(noProgress|no_progress|stall|stuck|unchanged|没进展|无进展|没变化|连续)/i
+  const exits = /(return|throw)\s/.test(src)
+  const hasCounterVar = /(\+\+\s*;?|\+=\s*1|=\s*[A-Za-z_$][\w$]*\s*\+\s*1)/.test(src)
+  return counter.test(src) && exits && hasCounterVar
+}
+
+function wantedItemOf (text) {
+  const t = String(text || '')
+  for (const [cn, en] of Object.entries(WANT_MAP)) {
+    if (t.includes(cn)) return en
   }
   return null
 }
@@ -54,11 +102,35 @@ class Coder {
 
       const t0 = Date.now()
       this.ctx.log(`[skill] 复用 ${sk.name}：${sk.desc}（${picked.reason}）`)
+
+      // 【#8】技能跑之前先记背包，跑完核对"世界真的变了吗"。
+      //
+      // 原来 out.ok 只表示"代码没抛异常"。而坏技能 k_mwe74ysb 结尾是
+      //   return '现在手上有圆石' + countOf('cobblestone') + '个，够垫脚用了'
+      // 无条件返回，所以它 74 次复用 ok 74 / fail 0，世界却毫无变化。
+      // 技能库、心情、长期目标全建在这个假进展上。
+      //
+      // 现在：产出型技能必须让背包真的涨，放置型必须真的少，
+      // 否则这一趟记成失败，让 pickFor 以后少选它。
+      const invBefore = this.snapshotInv()
+      const posBefore = this.actions.pos ? this.actions.pos().clone() : null
+      const worldBefore = this.worldSig(posBefore)
+      // 手持和饱食度也是证据维度：换装备时背包可能完全不变
+      try { this._skillHeld = this.bot.heldItem ? this.bot.heldItem.name : null } catch (e) { this._skillHeld = null }
+      try { this._skillFood = this.bot ? Math.round(this.bot.food) : null } catch (e) { this._skillFood = null }
+
       const out = await this.run(sk.code, goal)
       const ms = Date.now() - t0
 
+      const real = this.verifySkillEffect(goal, sk, invBefore, posBefore, out, worldBefore)
+      if (out.ok && !real.ok) {
+        this.ctx.log(`[skill] ${sk.name} 代码跑完了，但世界没变：${real.why}`)
+        out.ok = false
+        out.error = real.why
+      }
+
       // 跑一次记一次，失败也记 —— 成功率必须是真的
-      this.skills.markUse(sk.name, out.ok, { ms, error: out.error })
+      this.skills.markUse(sk.name, out.ok, { ms, error: out.error, fake: out.ok === false && real.fake })
 
       if (out.ok) {
         this.skills.markTask({ reused: true, ok: true })
@@ -136,6 +208,67 @@ class Coder {
     return { ok: false, error: prefix + '试了 ' + MAX + ' 次都没成：' + feedback }
   }
 
+  /** 背包快照（物品名 -> 数量） */
+  snapshotInv () {
+    const out = {}
+    try {
+      for (const i of this.bot.inventory.items()) {
+        out[i.name] = (out[i.name] || 0) + i.count
+      }
+    } catch (e) {}
+    return out
+  }
+
+  /**
+   * 周围方块的快照（半径 5、高 -2..+2）。
+   *
+   * 【层2】技能的成功率必须由"世界真的变了"决定。
+   * 挖通道 / 堵墙 / 铺路这类活背包不涨 —— 挖下来的东西当场又用掉了，
+   * 只看背包会把真干成的判成失败；只看代码有没有抛异常则相反。
+   */
+  // 快照统一走 src/judge.js：那边用**绝对坐标**做 key。
+  // 之前这里是相对偏移 + 每次用当前 pos 重拍，人一动所有 key 都变，
+  // 实测"动了 2 格没挖"会被算成 482 格变化 —— 走动型假成功全放行。
+  worldSig (pos) {
+    return judge.worldSig(this.bot, pos)
+  }
+
+  worldDiff (before, pos) {
+    if (!before) return -1
+    return judge.worldDiffCount(before, this.worldSig(pos))
+  }
+  /**
+   * 核对一次技能运行到底有没有改变世界。
+   *
+   * 判定本体在 src/judge.js（单判定器）。这里只负责**收集证据**：
+   * 背包、方块快照、位移、手持、饱食度。
+   *
+   * 为什么必须共用一份判据：原来 main 和 coder 各写一套，
+   * 38 个真实技能 × 3 种世界状态里，同一份证据两边差 42%
+   * —— 技能记成功、任务记失败，账本互相打架。
+   */
+  verifySkillEffect (goal, skill, invBefore, posBefore, out, worldBefore) {
+    const desc = String((skill && skill.desc) || '')
+    const posNow = this.actions && this.actions.pos ? this.actions.pos() : null
+    const res = judge.judgeTask({
+      // 技能都是体力活 —— 用最硬的世界证据。技能没有"阶段"可声明。
+      evidence: 'world',
+      goal: String(goal || ''),
+      text: desc,
+      invBefore: invBefore || {},
+      invAfter: this.snapshotInv(),
+      posBefore,
+      posAfter: posNow,
+      worldBefore,
+      worldAfter: this.worldSig(posBefore || posNow),
+      heldBefore: this._skillHeld === undefined ? null : this._skillHeld,
+      heldAfter: (this.bot && this.bot.heldItem) ? this.bot.heldItem.name : null,
+      foodLevelBefore: this._skillFood === undefined ? null : this._skillFood,
+      foodLevelAfter: this.bot ? Math.round(this.bot.food) : null
+    })
+    return { ok: res.ok, why: res.why, fake: !res.ok, progress: res.progress }
+  }
+
   async run (code, goal) {
     const bot = this.bot
     const actions = this.actions
@@ -165,6 +298,45 @@ class Coder {
       players: () => Object.keys(bot.players).filter(n => n !== bot.username)
     }
 
+    // 【无进展退出】90 秒里背包/方块/位置/手持全都没变 -> 主动放弃。
+    // 判据是"多久没改变世界"，不是"最多允许跑多久"——前者拟人，后者是配置表。
+    const sigOf = () => {
+      try {
+        const inv = this.snapshotInv()
+        const invSum = Object.entries(inv).map(([k, v]) => k + ':' + v).sort().join(',')
+        const p = this.actions && this.actions.pos ? this.actions.pos() : null
+        const posKey = p ? `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}` : '?'
+        const held = this.bot && this.bot.heldItem ? this.bot.heldItem.name : '-'
+        return invSum + '|' + posKey + '|' + held
+      } catch (e) { return '?' }
+    }
+    let lastSig = sigOf()
+    let lastChangeAt = Date.now()
+    const NO_PROGRESS_MS = Number(ctx.cfg.behavior && ctx.cfg.behavior.noProgressSeconds
+      ? ctx.cfg.behavior.noProgressSeconds * 1000 : 90000)
+    const watchdog = setInterval(() => {
+      const sig = sigOf()
+      if (sig !== lastSig) {
+        lastSig = sig
+        lastChangeAt = Date.now()
+        return
+      }
+      if (Date.now() - lastChangeAt >= NO_PROGRESS_MS) {
+        const secs = Math.round((Date.now() - lastChangeAt) / 1000)
+        // 【必须设 actions.cancel】只设 this.cancelFlag 是没用的 ——
+        // 那个字段没有任何人读（实测 grep 只有赋值、没有判读）。
+        // actions 里每步开头 `if (this.cancel) throw new Error('任务被中断')`，
+        // 所以真正能打断执行的是它。
+        this.cancelFlag = true
+        try { this.actions.cancel = true } catch (e) {}
+        try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+        ctx.log(`[skill] 白干 ${secs}s：背包/方块/位置全没变，主动放弃`)
+        // 记账：白干的时间要能结算，不能悄悄吞掉
+        try { ctx.onNoProgress && ctx.onNoProgress(secs, goal) } catch (e) {}
+        lastChangeAt = Date.now() + 1e9   // 别重复触发
+      }
+    }, 5000)
+
     const sandbox = {
       ...api,
       console: { log: (m) => ctx.log('[code] ' + m) },
@@ -189,6 +361,8 @@ ${code}
       return { ok: true, output: result === undefined ? '' : String(result) }
     } catch (e) {
       return { ok: false, error: (e && e.message) || String(e), output }
+    } finally {
+      if (watchdog) clearInterval(watchdog)
     }
   }
 
@@ -432,4 +606,5 @@ function extractCode (text) {
   return null
 }
 
-module.exports = { Coder, extractCode, checkSafety }
+module.exports = {
+  hasNoProgressExit, Coder, extractCode, checkSafety }
