@@ -2400,33 +2400,52 @@ class Actions {
 
     // 关键：放置距离必须 <= 4.5 格（跟挖掘一样）。
     // 之前 findPlaceSpot(8) 会挑到 8 格甚至 16 格外的高分位置，
-    // 服务端直接丢弃 use_item_on，回一句 "the block is still air"，
-    // 5 次尝试全废。现在先只在伸手范围内找，找不到就走近点再找。
+    // 服务端直接丢弃 use_item_on，回一句 "the block is still air"。
+    //
+    // 【实测的坑 · 2026-11-13 e2e 08:36:33】
+    // 更麻烦的是：**即使距离够，某个具体格子也可能永远放不上**。
+    // 日志里 placeNearby 连试 5 次，每次都对着 (10, 64, -88)：
+    //   try0..try4: Server refused to place crafting_table at (10, 64, -88):
+    //               the block is still air
+    // 原因是 findPlaceSpot 只返回 1 个 spot，重试时又挑回同一个。
+    // 那格虽然通过"at 是空气 / up 不挡 / base 是实体"三项检查，
+    // 但服务端碰撞盒判定更严（人站格子边缘、身体探进目标格）。
+    // 换一格就能放 —— 所以现在用 findPlaceSpots 拿一串备选，失败就换。
     const REACH = 4.0
-    let spot = this.findPlaceSpot(8, REACH)
-    if (!spot) {
+    let spots = this.findPlaceSpots(8, REACH, 10)
+    if (!spots.length) {
       // 附近伸手范围内没有空地：走两步换位置再试
-      for (let i = 0; i < 3 && !spot; i++) {
+      for (let i = 0; i < 3 && !spots.length; i++) {
         try { await this.wander(4) } catch (e) {}
         await sleep(300)
-        spot = this.findPlaceSpot(8, REACH)
+        spots = this.findPlaceSpots(8, REACH, 10)
       }
     }
-    if (!spot) {
+    if (!spots.length) {
       // 还是没有：放宽到 6 格，走过去再放
-      spot = this.findPlaceSpot(10, 6)
+      spots = this.findPlaceSpots(10, 6, 10)
     }
-    if (!spot) {
+    if (!spots.length) {
       this.log('[place] 附近找不到能放的格子')
       return null
     }
 
     await this.bot.equip(item, 'hand')
-    for (let attempt = 0; attempt < 5; attempt++) {
-      // 每次重新挑，但必须仍然在伸手范围内
-      let sp = attempt === 0 ? spot : this.findPlaceSpot(8 + attempt * 2, REACH)
-      if (!sp) sp = this.findPlaceSpot(10, 6)
-      if (!sp) break
+    const usedSpots = new Set()
+    for (let attempt = 0; attempt < 8; attempt++) {
+      // 按候选列表**依次换格子**（不再每次挑回同一个）
+      let sp = spots.find(c => !usedSpots.has(`${c.x},${c.y},${c.z}`))
+      if (!sp) {
+        // 这一批都用完了：重新扫一批（半径放大，位置也可能变了）
+        const more = this.findPlaceSpots(10, 6, 10)
+          .filter(c => !usedSpots.has(`${c.x},${c.y},${c.z}`))
+        if (!more.length) {
+          this.log('[place] 候选格都用完了')
+          break
+        }
+        sp = more[0]
+      }
+      usedSpots.add(`${sp.x},${sp.y},${sp.z}`)
 
       // 站太远就先走过去（放置判定按眼睛到方块面的距离算）
       const basePos = sp.base.position
@@ -2594,53 +2613,103 @@ class Actions {
     // 直接 mine() 撞死在里面。craftSmart 这里就是唯一能插手的降级点。
     const STONE_MATS = /^(cobblestone|cobbled_deepslate|stone|deepslate|raw_iron|raw_copper|coal)$/
 
-    for (const [iid, n] of Object.entries(pick.needs)) {
-      const item = mcData.items[parseInt(iid, 10)]
-      if (!item) continue
-      if (this.countOf(item.name) >= n) continue
+    // 【实测的 bug · 2026-11-13 08:47】补料必须**多遍**，不能单遍。
+    //
+    // 木镐配方 = 3 木板 + 2 木棍。单遍循环发生的事：
+    //   第 1 轮 · 木板：0 < 3 -> craftSmart('oak_planks', 3)
+    //                     -> 消耗 1 原木，得到 4 张木板
+    //   第 1 轮 · 木棍：0 < 2 -> craftSmart('stick', 2)
+    //                     -> **消耗 2 张木板**，得到 4 根木棍
+    //   循环结束。此时木板只剩 2 张，而配方要 3 张。
+    //   -> safeCraft 抛 "missing ingredient"
+    //   -> 日志就是 `craftSmart -> 木镐=0 err=材料不够，配方已不可用`
+    //
+    // 更要命的是这个 bug 只在"原木刚好够"时暴露：原木多的时候
+    // 第 2 遍会自己补上，原木少就直接失败。
+    //
+    // 修法：反复扫 needs，直到"全部满足"或"某一遍完全没进展"。
+    // 每遍内部仍然是原来的三重降级（递归合成 -> 采集 -> 石头类先弄镐子）。
+    let fillPass = 0
+    const MAX_FILL_PASS = 4
+    let unsatisfied = []
 
-      let got = false
-      let firstErr = null
+    while (fillPass < MAX_FILL_PASS) {
+      fillPass++
+      unsatisfied = []
+      let progressed = false
 
-      // 3a. 先试递归合成（木板/木棍这种链短的走这条）
-      try {
-        await this.craftSmart(item.name, n, depth + 1)
-        got = this.countOf(item.name) >= n
-      } catch (e) {
-        firstErr = e
-      }
+      for (const [iid, n] of Object.entries(pick.needs)) {
+        const item = mcData.items[parseInt(iid, 10)]
+        if (!item) continue
+        if (this.countOf(item.name) >= n) continue
 
-      // 3b. 合不出来：直接从世界里拿
-      if (!got) {
+        const before = this.countOf(item.name)
+        let got = false
+        let firstErr = null
+
+        // a. 递归合成（木板/木棍这种链短的走这条）
         try {
-          got = await this.gather(item.name, n - this.countOf(item.name))
-        } catch (e) { got = false }
-      }
-
-      // 3c. 还是不行，而且是石头类材料：先保证有镐子，再挖一次。
-      //     没有镐子时挖石头不掉东西，gather 里的 mine() 会一路空转。
-      if (!got && STONE_MATS.test(item.name)) {
-        this.log(`[craft] 缺 ${item.name}，先弄把镐子`)
-        let pick = null
-        try {
-          pick = await this.ensurePickaxe()
+          await this.craftSmart(item.name, n - before, depth + 1)
+          got = this.countOf(item.name) >= n
         } catch (e) {
-          this.log('[craft] 镐子也没弄到: ' + e.message)
+          firstErr = e
         }
-        if (pick) {
-          this.log(`[craft] 有 ${pick} 了，再挖 ${item.name}`)
+
+        // b. 合不出来：直接从世界里拿
+        if (!got) {
           try {
-            got = await this.gather(item.name, Math.max(1, n - this.countOf(item.name)))
+            got = await this.gather(item.name, n - this.countOf(item.name))
           } catch (e) { got = false }
         }
+
+        // c. 石头类材料：先保证有镐子，再挖一次。
+        //    没有镐子时挖石头不掉东西，gather 里的 mine() 会一路空转。
+        if (!got && STONE_MATS.test(item.name)) {
+          this.log(`[craft] 缺 ${item.name}，先弄把镐子`)
+          let pick2 = null
+          try {
+            pick2 = await this.ensurePickaxe()
+          } catch (e) {
+            this.log('[craft] 镐子也没弄到: ' + e.message)
+          }
+          if (pick2) {
+            this.log(`[craft] 有 ${pick2} 了，再挖 ${item.name}`)
+            try {
+              got = await this.gather(item.name, Math.max(1, n - this.countOf(item.name)))
+            } catch (e) { got = false }
+          }
+        }
+
+        if (this.countOf(item.name) >= n) {
+          progressed = true
+        } else {
+          // 记下还没满足的，别在循环里直接抛 —— 下一遍可能就够了
+          // （木棍消耗木板正是这种情况）
+          unsatisfied.push({ name: item.name, need: n, have: this.countOf(item.name), err: firstErr })
+          if (this.countOf(item.name) > before) progressed = true
+        }
       }
 
-      // 3d. 记录最终结果，别把"我试过什么"丢掉
-      if (!got) {
-        const attempt = firstErr ? String(firstErr.message || firstErr) : '合不出来'
-        throw new Error(`缺 ${item.name}（要 ${n} 个，有 ${this.countOf(item.name)} 个），` +
-          `合成/采集都失败：${attempt}`)
+      if (!unsatisfied.length) break
+      if (!progressed) {
+        this.log(`[craft] 第 ${fillPass} 遍补料没有进展，停手`)
+        break
       }
+      this.log(`[craft] 第 ${fillPass} 遍补料后还缺 ` +
+        unsatisfied.map(u => `${u.name}(${u.have}/${u.need})`).join('、') + '，再来一遍')
+    }
+
+    // 补料收尾：还有缺口就明确报出来（比 safeCraft 的 missing ingredient 清楚）
+    const stillShort = Object.entries(pick.needs).filter(([iid, n]) => {
+      const item = mcData.items[parseInt(iid, 10)]
+      return item && this.countOf(item.name) < n
+    })
+    if (stillShort.length) {
+      const detail = stillShort.map(([iid, n]) => {
+        const it = mcData.items[parseInt(iid, 10)]
+        return `${it.name} 要 ${n} 有 ${this.countOf(it.name)}`
+      }).join('、')
+      throw new Error(`补料 ${fillPass} 遍后仍缺：${detail}`)
     }
 
     // 4. 正式合成
@@ -3179,16 +3248,45 @@ class Actions {
       const p = this.pos()
       const F = Math.floor(p.y)
 
-      // 没有垫脚方块就自己造：先挖头顶的石头/泥土，捡起来当料。
-      // 之前这里直接 return false，背包一空就彻底爬不动了
-      // （实测：dirt x3 垫完 3 格就卡死在 y=53）。
+      // 没有垫脚方块：试着挖「能挖出料」的方块补一点。
+      //
+      // 关键：空手挖 stone/granite/andesite **0 掉落**（实测：挖掉掉 3 个
+      // 物品实体全躺地上，背包 0 增加）。所以这里只能挖软方块，
+      // 否则每轮都会白挖掉头顶一块石头 —— 地形被破坏了，料还是 0，
+      // 这就是 54↔55 反复震荡的根源。
       let fill = filler()
       if (!fill) {
-        const fs0 = firstSolidAbove(p, 6)
-        if (fs0 > 0) {
-          for (let dy = fs0; dy <= fs0 + 1; dy++) {
-            if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
+        const hasPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
+        const SOFT = /^(dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium|gravel|sand|red_sand|clay|snow_block|soul_soil|moss_block)$/
+        const okToTake = (nm) => hasPick || SOFT.test(nm)
+
+        let target = null
+        // 头顶 4 格内找
+        for (let dy = 1; dy <= 4; dy++) {
+          const v = p.offset(0, dy, 0)
+          if (!isSolid(v)) continue
+          const nm = nameAt(v)
+          if (/bedrock|lava|water/.test(nm)) break
+          if (okToTake(nm)) { target = v; break }
+        }
+        // 头顶没有就找脚边的（脚和身体两层）
+        if (!target) {
+          for (const [dx, dz] of DIRS) {
+            for (const dy of [0, 1]) {
+              const v = p.offset(dx, dy, dz)
+              if (!isSolid(v)) continue
+              const nm = nameAt(v)
+              if (/bedrock|lava|water/.test(nm)) continue
+              if (!okToTake(nm)) continue
+              target = v
+              break
+            }
+            if (target) break
           }
+        }
+
+        if (target) {
+          await digOne(target)
           await grabDrops(4)
           fill = filler()
         }
@@ -3381,8 +3479,18 @@ class Actions {
           return true
         }
 
-        // ===== 主策略：原地往上顶一格 =====
-        if (await tryPillar()) continue
+        // ===== 每步重新决策：按「手上还有几块料」选策略 =====
+        //
+        // 为什么不一次性决定：挖台阶会顺手捡到 dirt/gravel，料会变多；
+        // 反过来塔升一格消耗 1 块，料会变少。每步都重新看才跟得上。
+        //
+        //   料 >= 1  -> 先试塔升（23s/格，比挖台阶快 2~3 倍）
+        //   料 == 0  -> 直接挖台阶（塔升没料必然失败，跑了也是白跑）
+        const fillerNow = fillerCount()
+        if (fillerNow >= 1) {
+          if (await tryPillar()) continue
+          // 塔升失败（头顶基岩 / 放不上去）：掉到挖台阶，不换方向不重试
+        }
 
         // ===== 兜底：挖台阶（头顶有水/岩浆、或者没垫脚方块时才走这里）=====
         const p = this.pos()
@@ -3842,9 +3950,81 @@ class Actions {
     }
 
     if (!cands.length) return null
-    // 挑分数最高的
     cands.sort((a, b) => b.score - a.score)
+    // 默认只返回最优的那个（老调用方按"单个 spot"用）
     return cands[0]
+  }
+
+  /**
+   * 同上，但返回**排好序的多个**候选。
+   *
+   * 为什么需要：`findPlaceSpot` 只给一个 spot，而 `placeNearby` 会在失败时
+   * 重试同一个坐标。实测（e2e 08:36:33 日志）：
+   *
+   *   placeNearby try0: Server refused ... at (10, 64, -88): the block is still air
+   *   placeNearby try1: ... at (10, 64, -88)   ← 同一个坐标
+   *   placeNearby try2/3/4: ... 全是 (10, 64, -88)
+   *
+   * 服务端连续拒绝 5 次，`ensureTable()` 返回 null，
+   * 上层就报"需要工作台但放不下" —— 这就是「做木镐」失败的真正原因。
+   *
+   * 那个坐标之所以永远放不上，是因为它虽然通过了 findPlaceSpot 的
+   * "at 是空气 / up 不是实体 / base 是实体"三项检查，但实际放置时
+   * 客户端与服务端的碰撞盒判定不一致（站在边缘、身体探进目标格）。
+   * 换成**别的格子**就能成 —— 所以这里要给多个备选。
+   */
+  findPlaceSpots (radius = 6, maxDist = 0, limit = 8) {
+    const p = this.pos()
+    const solid = (n) => {
+      if (!n || n === 'air' || n === 'cave_air') return false
+      if (/water|lava/.test(n)) return false
+      return true
+    }
+    const baseScore = (name) => {
+      if (!name) return -1
+      if (/^(stone|cobblestone|deepslate|cobbled_deepslate|andesite|diorite|granite|tuff)$/.test(name)) return 10
+      if (/^(dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium)$/.test(name)) return 9
+      if (/^(sand|red_sand|gravel|clay)$/.test(name)) return 7
+      if (/_planks$|_log$/.test(name)) return 8
+      if (/_ore$|^raw_/.test(name)) return 2
+      if (/leaves|glass|ice|magma|soul_sand/.test(name)) return 0
+      return 5
+    }
+
+    const cands = []
+    const seen = new Set()
+    for (let r = 1; r <= radius; r++) {
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          if (r > 1 && Math.abs(dx) !== r && Math.abs(dz) !== r) continue
+          for (let dy = -2; dy <= 2; dy++) {
+            const base = this.bot.blockAt(p.offset(dx, dy - 1, dz))
+            const at = this.bot.blockAt(p.offset(dx, dy, dz))
+            const up = this.bot.blockAt(p.offset(dx, dy + 1, dz))
+            if (!base || !at || !up) continue
+            if (!solid(base.name)) continue
+            const atFree = at.name === 'air' || at.name === 'cave_air' || at.boundingBox === 'empty'
+            const upOk = up.boundingBox !== 'block'
+            if (!atFree || !upOk) continue
+
+            const tp = new Vec3(Math.floor(p.x + dx), Math.floor(p.y + dy), Math.floor(p.z + dz))
+            const key = `${tp.x},${tp.y},${tp.z}`
+            if (seen.has(key)) continue
+            if (maxDist > 0 && tp.distanceTo(p) > maxDist) continue
+            seen.add(key)
+
+            cands.push({
+              x: tp.x, y: tp.y, z: tp.z,
+              base,
+              score: baseScore(base.name) - r * 0.5 - Math.abs(dy) * 0.3
+            })
+          }
+        }
+      }
+    }
+    if (!cands.length) return []
+    cands.sort((a, b) => b.score - a.score)
+    return cands.slice(0, limit)
   }
 
   /**
@@ -4153,16 +4333,34 @@ class Actions {
       const need = n - count()
       // 一棵树平均给 3~6 块原木，别一次要太多（砍不完白耗时间）
       const wantTrees = Math.min(3, Math.max(1, Math.ceil(need / 3)))
-      // 第一轮拿大部分预算，第二轮用剩下的
-      const roundBudget = deadline
-        ? Math.max(60000, Math.floor(left() / (2 - round)))
-        : 0
-      if (deadline && left() < 60000) {
-        this.log(`[wood] 只剩 ${Math.round(left() / 1000)}s，不够再砍一轮`)
-        break
+      // 第一轮拿大部分预算，第二轮用剩下的。
+      //
+      // 坑：`Math.max(60000, ...)` 会在剩余预算已经不足时**强行给 60 秒**，
+      // 于是 chopTree 打出"预算 150s（调用方给 60s）"，
+      // 跑完之后剩余预算变成 -45 秒（实测日志 `只剩 -45s`）。
+      // 现在：剩余不够 60 秒就明确不再开这一轮，且 roundBudget 不超过剩余。
+      if (deadline) {
+        const remain = left()
+        if (remain < 60000) {
+          this.log(`[wood] 只剩 ${Math.round(remain / 1000)}s，不够再砍一轮（最少 60s）`)
+          break
+        }
+        const share = Math.floor(remain / (2 - round))
+        const roundBudget = Math.max(60000, Math.min(share, remain - 5000))
+        try {
+          const got = await this.chopTree(wantTrees, { budgetMs: roundBudget })
+          if (!got) {
+            this.log('[wood] 这一轮没砍到树')
+            break
+          }
+        } catch (e) {
+          this.log('[wood] 砍树失败: ' + e.message)
+          break
+        }
+        continue
       }
       try {
-        const got = await this.chopTree(wantTrees, roundBudget ? { budgetMs: roundBudget } : {})
+        const got = await this.chopTree(wantTrees)
         if (!got) {
           this.log('[wood] 这一轮没砍到树')
           break
@@ -4531,7 +4729,11 @@ class Actions {
    * @returns {Promise<string|null>} 拿到了什么（null = 没找到）
    */
   async findFood (opts = {}) {
-    const budgetMs = opts.budgetMs || 60000
+    // 默认预算 120 秒（原来是 60）。
+    // 实测（/tmp/probe-food.js）：这个服务器的动物动辄在 55~90 格外，
+    // 光追一只猪就要 40 秒，打猎 + 捡肉 + 找下一个 60 秒根本不够。
+    // e2e 给"找食物"的预算是 200 秒，这里留出余量给上层收尾。
+    const budgetMs = opts.budgetMs || 120000
     const allowCook = opts.allowCook !== false
     const deadline = Date.now() + budgetMs
     const left = () => deadline - Date.now()
@@ -4562,6 +4764,29 @@ class Actions {
           else await this.digOutSelf()
         } catch (e) {}
       }
+    }
+
+    // 0.6 在地下就基本找不到吃的 —— 先回地面。
+    //
+    // 【实测】e2e --only 找食物 08:53 那轮：出生点 y=38（地下），
+    // 80 格内唯一一只猪在 78 格外、在洞外，chase 6 秒就"自己卡住了"，
+    // 30 秒后返回 null。而"能动"这个判据（水平挪得动）在洞里是成立的，
+    // 所以它压根没触发上面的挖出去分支。
+    // 动物/浆果/作物全在地表，在地下找食物等于白跑。
+    if (this.isUnderground() && left() > 30000) {
+      this.log('[food] 在地下，先回地面再找吃的')
+      try {
+        const ok = await Promise.race([
+          this.getToSurface(),
+          sleep(Math.min(60000, left() - 20000)).then(() => false)
+        ])
+        if (ok) {
+          this.log('[food] 回到地面了')
+          await this.ensureChunks(3000)
+        } else {
+          this.log('[food] 没爬出去，就地找找看')
+        }
+      } catch (e) {}
     }
 
     /** 打死一只动物并捡回掉落物。budgetMs 是这个动物身上的总时间 */
@@ -4617,35 +4842,88 @@ class Actions {
       return null
     }
 
-    // 1. 打动物（最近的那只，预算内打不完就换下一只，最多试 2 只）
+    // 1. 打动物
+    //
+    // 【实测修正】原来是 `nearestEntity(n, 48)` —— 48 格内找不到就整只跳过。
+    // 探针（/tmp/probe-food.js）在真实出生点量到的分布：
+    //   pig   全局 2 只 → 48 格 = 无，64 格 = 55 格
+    //   sheep 全局 1 只 → 48 格 = 无，96 格 = 89 格
+    //   cow/chicken/rabbit 全局 0 只
+    // 也就是说**48 格一刀切直接把 1 级打猎整级跳过了**，
+    // 日志里 `试过: 附近没有目标`、1.5 秒就返回 null，就是这个原因。
+    // 现在按 24 → 48 → 80 逐级放宽，并且真的走过去试，而不是看距离就放弃。
     const animals = ['cow', 'pig', 'sheep', 'chicken', 'rabbit']
-    const near = animals
-      .map(n => ({ n, e: this.nearestEntity(n, 48) }))
+    const pickAnimal = (range) => animals
+      .map(n => ({ n, e: this.nearestEntity(n, range) }))
       .filter(x => x.e)
       .sort((a, b) => a.e.position.distanceTo(this.pos()) - b.e.position.distanceTo(this.pos()))
 
+    let near = []
+    for (const range of [24, 48, 80]) {
+      near = pickAnimal(range)
+      if (near.length) {
+        if (range > 48) this.log(`[food] 48 格内没有，放宽到 ${range} 格找到 ${near.length} 只`)
+        break
+      }
+    }
+    if (!near.length) {
+      // 80 格内一只动物都没有 —— 别急着返回 null，先换个方向走一段再扫。
+      // 实测（e2e --only 找食物 08:52）：出生点 80 格内 0 只动物，
+      // 结果 25 秒就返回 null。而这个服务器的动物分布很稀，
+      // 走 30~40 格常常就有一群。
+      this.log('[food] 80 格内没有任何动物，换个方向找')
+      for (let round = 0; round < 3 && left() > 25000 && !near.length; round++) {
+        const yaw = Math.random() * Math.PI * 2
+        const p = this.pos()
+        const tx = p.x + Math.cos(yaw) * 34
+        const tz = p.z + Math.sin(yaw) * 34
+        try {
+          await this.goto(tx, p.y, tz, 3, Math.min(25000, left() - 20000))
+        } catch (e) {}
+        await this.ensureChunks(3000)
+        for (const range of [48, 80]) {
+          near = pickAnimal(range)
+          if (near.length) break
+        }
+        if (near.length) {
+          this.log(`[food] 换方向后找到 ${near.length} 只动物`)
+          break
+        }
+      }
+      if (!near.length) this.log('[food] 换方向也没找到动物')
+    }
+
     let animalTries = 0
     for (const { n: a, e } of near) {
-      if (left() < 12000 || animalTries >= 2) break
+      // 原来 `animalTries >= 2` 只试两只就收手。实测动物很稀（80 格内常常 1 只），
+      // 试两只之后如果第一只"跑了"，整条打猎链就断了。放到 4。
+      if (left() < 12000 || animalTries >= 4) break
       animalTries++
       const dist = e.position.distanceTo(this.pos())
       this.log(`[food] 目标 ${a} 在 ${Math.round(dist)} 格外`)
 
-      // 太远就先拉近，但只给有限时间（别把预算烧在赶路上）
+      // 太远就先拉近。追路时间按剩余预算给，别一上来就给 12 秒。
       if (dist > 12) {
-        const chaseMs = Math.min(12000, Math.max(3000, left() - 10000))
+        const chaseMs = Math.min(20000, Math.max(6000, left() - 12000))
         try { await this.chase(a, chaseMs) } catch (err) {}
       }
-      // 还没贴近就跳过这只，别对着够不着的实体空挥
+      // 贴近后再确认一次（动物会动）
       const now = this.nearestEntity(a, 64)
       if (!now) { tried.push(a + '(跑了)'); continue }
-      if (now.position.distanceTo(this.pos()) > 6) {
-        this.log(`[food] ${a} 还是够不着，换下一只`)
-        tried.push(a + '(够不着)')
-        continue
+      const d2 = now.position.distanceTo(this.pos())
+      if (d2 > 8) {
+        // 还差得远：再追一次，这次给足预算（原来这里直接 continue，等于白追）
+        this.log(`[food] ${a} 还差 ${Math.round(d2)} 格，再追一次`)
+        try { await this.chase(a, Math.min(18000, Math.max(5000, left() - 8000))) } catch (err) {}
+        const now2 = this.nearestEntity(a, 64)
+        if (!now2 || now2.position.distanceTo(this.pos()) > 8) {
+          this.log(`[food] ${a} 追不上，换下一只`)
+          tried.push(a + '(够不着)')
+          continue
+        }
       }
 
-      await hunt(a, Math.min(20000, Math.max(4000, left() - 4000)))
+      await hunt(a, Math.min(25000, Math.max(6000, left() - 4000)))
       const raw = this.item('beef') || this.item('porkchop') || this.item('mutton') ||
         this.item('chicken') || this.item('rabbit')
       if (raw) {
@@ -4660,11 +4938,13 @@ class Actions {
     }
 
     // 2. 野生浆果 / 作物（比打猎稳，但要走过去）
+    //    半径从 32 放到 48：探针里 32 格内全都没有，动物又在 55 格外，
+    //    32 格太紧，等于把这一级也跳掉了。
     if (left() > 10000) {
       for (const bush of ['sweet_berry_bush', 'cave_vines', 'cave_vines_plant']) {
         if (left() < 6000) break
         let b = null
-        try { b = this.findBlock(bush, 32) } catch (e) {}
+        try { b = this.findBlock(bush, 48) } catch (e) {}
         if (!b) continue
         try {
           await this.digAt(b)
@@ -4682,12 +4962,12 @@ class Actions {
       }
     }
 
-    // 3. 瓜类
+    // 3. 瓜类 / 蔬菜
     if (left() > 10000) {
-      for (const crop of ['melon', 'pumpkin']) {
+      for (const crop of ['melon', 'pumpkin', 'carrots', 'potatoes', 'beetroots', 'wheat']) {
         if (left() < 6000) break
         let b = null
-        try { b = this.findBlock(crop, 32) } catch (e) {}
+        try { b = this.findBlock(crop, 48) } catch (e) {}
         if (!b) continue
         try {
           await this.digAt(b)
@@ -4701,11 +4981,68 @@ class Actions {
       }
     }
 
-    // 4. 抓鱼：只有时间充裕才试（鱼会跑，最耗时间）
+    // 3.5 海带 —— 生 kelp 本身不能吃，但熔炉烤一下就是 dried_kelp（food=1）。
+    //
+    // 【实测依据】/tmp/probe-food2.js 在一个"80 格内一只动物都没有"的出生点量到：
+    //   动物 24/48/80 格全无，128 格才有 pig@80（chase 30 秒只拉到 20 格，放弃）
+    //   但植物清单里: kelp@23 —— 是最近的可用食物来源
+    // 另外查过 minecraft-data：kelp/sugar_cane/bamboo/蘑菇**都不是食物**
+    // （只有 dried_kelp 是），所以这里只拿海带，并且交给 tryCook 处理。
+    if (left() > 12000) {
+      let got = 0
+      for (const plant of ['kelp', 'kelp_plant']) {
+        if (left() < 8000) break
+        for (let k = 0; k < 3 && left() > 8000; k++) {
+          let b = null
+          try { b = this.findBlock(plant, 40) } catch (e) {}
+          if (!b) break
+          try {
+            const okDig = await this.digAt(b)
+            if (!okDig) break
+            await this.pickupNearby(8)
+            got += this.countOf('kelp')
+          } catch (e) { break }
+          if (got >= 3) break
+        }
+        if (got) break
+      }
+      if (got > 0) {
+        this.log(`[food] 采到 ${got} 个 kelp，试着烤成 dried_kelp`)
+        const r = await settleRaw('kelp').catch(() => null)
+        if (r) return r
+        if (this.hasFood()) {
+          const f = this.foodList()[0]
+          if (f) return '弄到 ' + f.name
+        }
+        tried.push('kelp(没烤成)')
+      }
+    }
+
+    // 4. 蘑菇 —— minecraft-data 里 brown/red_mushroom 的 foodPoints 是 0，
+    //    单独吃没用（要么熬汤，要么当烤制材料）。这里只捡不指望它当主食。
+    if (left() > 8000) {
+      for (const shroom of ['brown_mushroom', 'red_mushroom']) {
+        if (left() < 5000) break
+        let b = null
+        try { b = this.findBlock(shroom, 40) } catch (e) {}
+        if (!b) continue
+        try {
+          await this.digAt(b)
+          await this.pickupNearby(6)
+          if (this.hasFood()) {
+            const f = this.foodList()[0]
+            if (f) return '挖到 ' + f.name + ' x' + f.count
+          }
+        } catch (e) {}
+        tried.push(shroom)
+      }
+    }
+
+    // 5. 抓鱼：只有时间充裕才试（鱼会跑，最耗时间）
     if (left() > 20000) {
       for (const fish of ['cod', 'salmon']) {
         if (left() < 14000) break
-        const e = this.nearestEntity(fish, 24)
+        const e = this.nearestEntity(fish, 40)
         if (!e) continue
         try {
           await hunt(fish, Math.min(15000, left() - 6000))
@@ -4717,6 +5054,19 @@ class Actions {
         } catch (err) {}
         tried.push(fish)
       }
+    }
+
+    // 6. 最后兜底：地上有没有现成的可食物品（别人打怪掉的腐肉等）
+    //    探针里见过 `rotten_flesh x1` 就是僵尸掉落 —— 饿的时候是保命食物。
+    //    _edible() 里腐肉的分数被压得很低，但"有"总比"没有"强。
+    if (left() > 3000) {
+      try {
+        await this.pickupNearby(10)
+        if (this.hasFood()) {
+          const f = this.foodList()[0]
+          if (f) return '捡到 ' + f.name + ' x' + f.count
+        }
+      } catch (e) {}
     }
 
     this.log(`[food] ${Math.round(budgetMs / 1000)}s 预算内没弄到吃的（试过: ${tried.join('/') || '附近没有目标'}）`)
@@ -4823,6 +5173,8 @@ class Actions {
       .replace(/^rabbit$/, 'cooked_rabbit')
       .replace(/^cod$/, 'cooked_cod')
       .replace(/^salmon$/, 'cooked_salmon')
+      .replace(/^kelp$/, 'dried_kelp')
+      .replace(/^potato$/, 'baked_potato')
     if (cookedName === rawName) return null
     if (this.item(cookedName)) return cookedName
     if (!this.item(rawName)) return null
@@ -4948,6 +5300,9 @@ class Actions {
     const t0 = Date.now()
     let lastDist = 1e9
     let stillSince = 0
+    let stuckSince = 0
+    let recovered = false
+    let lastPos = this.pos().clone()
 
     while (Date.now() - t0 < timeoutMs) {
       this.check()
@@ -4964,11 +5319,44 @@ class Actions {
       } catch (err) {}
       await sleep(300)
 
+      // 【实测修正】原来只看"距离没变近"就 10 秒放弃。
+      // 但目标在 60 格外时，前 10 秒可能一直在正常赶路（只是还没显著拉近），
+      // 于是 /tmp/probe-food.js 里出现 `[chase] 追不上 pig` × 2、48 秒白跑。
+      // 现在分两种卡死：
+      //   · 距离没变近  -> 放宽到 18 秒（动物会跑，短暂不靠近很正常）
+      //   · 自己根本没挪窝 -> 6 秒就判定真卡住（这个才是真失败）
+      const pos = this.pos()
+      if (pos.distanceTo(lastPos) < 0.35) stuckSince += 300
+      else stuckSince = 0
+      lastPos = pos.clone()
+
       if (Math.abs(d - lastDist) < 0.3) stillSince += 300
       else stillSince = 0
       lastDist = d
-      if (stillSince > 10000) {
-        this.log('[chase] 追不上 ' + name)
+
+      if (stuckSince > 6000) {
+        // 【实测】e2e 找食物 08:55：目标猪在 78 格外，chase 6 秒就"自己卡住"，
+        // 整条打猎链断掉。而 6 秒对"从洞里刚爬出来、正在下坡"来说是正常的。
+        // 现在先自救一次（清目标 + 往前拱一下），还卡再放弃。
+        if (!recovered) {
+          recovered = true
+          this.log('[chase] 卡住了，自救一次（清目标重发）')
+          try { bot.pathfinder.setGoal(null) } catch (err) {}
+          await sleep(400)
+          try {
+            bot.pathfinder.setGoal(new goals.GoalFollow(e, Math.max(1, stopDist - 1)), true)
+          } catch (err) {}
+          stuckSince = 0
+          lastPos = this.pos().clone()
+          await sleep(300)
+          continue
+        }
+        this.log('[chase] 自己卡住了（6 秒没挪窝），放弃 ' + name)
+        try { bot.pathfinder.setGoal(null) } catch (err) {}
+        return false
+      }
+      if (stillSince > 18000) {
+        this.log('[chase] 追不上 ' + name + '（18 秒没拉近距离）')
         try { bot.pathfinder.setGoal(null) } catch (err) {}
         return false
       }
