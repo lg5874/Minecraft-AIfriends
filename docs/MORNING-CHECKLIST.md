@@ -492,3 +492,62 @@ return { ratio: clamp01(d / want), text: `走了 ${Math.round(d)}/${want} 格` }
 要求 `goals.stageProgress().ratio >= 0.8` 才算通过 —— **而不是"有位移就算"**。
 
 **这是「假成功」这条线上的最后一个入口**，今晚从 17 条压到了 1 条，剩下这一条属于"性质相同但后果最轻"。
+
+---
+
+## 十七、明天最值钱的一项结构性工作：379 个空 catch
+
+```bash
+for f in main.js src/*.js; do
+  n=$(grep -cE "catch \(e\) \{\}|catch \(\) \{\}|catch \{\}" "$f")
+  [ "$n" -gt 0 ] && printf "%-22s %s\n" "$(basename $f)" "$n"
+done | sort -k2 -rn
+```
+
+```
+actions.js        173
+main.js            55
+reflex.js          39
+session.js         20
+invite.js          13
+home.js            13
+audience.js        12
+goals.js           11
+spontaneous.js      6
+talk.js             5
+----------------------
+全项目            379
+```
+
+### 为什么它值钱
+
+**今晚七个「没连上」，第七个就藏在这种地方：**
+
+```js
+try {
+  const pr = this.goals.stageProgress()   // TypeError，Goals 上没这个方法
+} catch (e) {}                            // ← 于是这个守卫一次都没执行过
+```
+
+**我自己写的代码，我自己加的 try/catch，我以为它安全。**
+
+### 但不是 379 个都要改
+
+**很多是合理的**（`try { bot.quit() } catch {}` 这种清理代码，出错就该忽略）。
+
+**优先改这四类**：
+1. **catch 里包着"决定行为"的调用**（判据、进度、状态读取）—— 错了就静默失效
+2. **catch 里包着"我以为一定会成功"的新代码** —— 最容易自我欺骗
+3. `main.js` 和 `goals.js` 里的（这两个文件承载判据和主循环）
+4. 任何**这周新加的** `catch`
+
+**不急着改的**：清理/退出/关连接类的（`bot.quit`、`clearInterval`、`removeListener`）。
+
+### 一个便宜的检查脚本
+
+```bash
+# 找出「catch 里只有空块，但 try 里调了 xxx.yyy()」的可疑行
+grep -n -A1 "try {" main.js src/*.js | grep -B1 "catch (e) {}" | grep -E "\.\w+\(" | head -40
+```
+
+**看这 40 行，就够了** —— 不需要 379 个全看。
