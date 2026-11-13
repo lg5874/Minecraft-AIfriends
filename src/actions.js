@@ -734,11 +734,22 @@ class Actions {
       return false
     }
 
-    // 选对工具（挖不动就明确报错，不拿泥土硬挖石头）
+    // 选对工具
+    //
+    // 两种模式：
+    //   allowBare=true  -> 开路模式：没有镐也挖（空手挖石头慢、不掉料，但能挖通）
+    //   allowBare=false -> 收集模式：没工具就不挖（挖了也白挖）
+    //
+    // 实测：e2e 的地下夹具第 3 格挖不动，就是因为空手挖石头被这里拦住。
+    // 而 getToSurface / digUpOne 开路时根本不需要掉落物，只要通路。
     const toolResult = await this.bestToolFor(block)
     if (!toolResult.ok) {
-      this.log(`[dig] 挖不了 ${block.name}：${toolResult.reason}`)
-      return false
+      if (opts.allowBare) {
+        this.log(`[dig] 没工具，空手挖 ${block.name}（开路用，不掉落）`)
+      } else {
+        this.log(`[dig] 挖不了 ${block.name}：${toolResult.reason}`)
+        return false
+      }
     }
     if (toolResult.tool) {
       this.log(`[dig] 用 ${toolResult.tool} 挖 ${block.name}`)
@@ -2769,9 +2780,21 @@ class Actions {
         let firstErr = null
 
         // a. 递归合成（木板/木棍这种链短的走这条）
+        //
+        // 【实测的 bug · 2026-11-13 10:23】递归时传的是**差值**，
+        // 而 craftSmart 内部又会减一次 countOf —— 等于重复扣减。
+        //   countOf(oak_planks) = 3，配方要 8 -> 传 craftSmart('oak_planks', 5)
+        //   内部 need = 5 - 3 = 2，times = ceil(2/4) = 1
+        //   -> 只产 4 张，总数 7，还差 1 张
+        //   -> 日志 `补 oak_planks 后：7/8 got=false`
+        //   -> 第 2 遍传 craftSmart('oak_planks', 1)，need = 1-7 < 0 -> 直接 return true
+        //      -> `补料 2 遍后仍缺：oak_planks 要 8 有 7`
+        //
+        // craftSmart(name, count) 的语义是"最终要 count 个"（绝对值），
+        // 不是"再补 count 个"。所以这里直接传绝对目标 n。
         try {
-          this.log(`[craft] 补 ${item.name}：要 ${n}，有 ${before}，请求 +${n - before}`)
-          await this.craftSmart(item.name, n - before, depth + 1)
+          this.log(`[craft] 补 ${item.name}：目标 ${n}（现有 ${before}）`)
+          await this.craftSmart(item.name, n, depth + 1)
           got = this.countOf(item.name) >= n
           this.log(`[craft] 补 ${item.name} 后：${this.countOf(item.name)}/${n} got=${got}`)
         } catch (e) {

@@ -502,7 +502,9 @@ const TASKS = [
           break
         }
         let ok = false
-        try { ok = await a.digAt(below) } catch (e) { break }
+        // allowBare: 空手也挖。夹具只是要"下到地下"，不需要掉落物。
+        // 原来没传这个选项，空手挖石头被 bestToolFor 拦住，夹具造不出来。
+        try { ok = await a.digAt(below, { allowBare: true }) } catch (e) { break }
         if (!ok) { fixture.push(`第${i + 1}格挖不动`); break }
         dugDown++
         await sleep(700)   // 等掉落 + 等自己掉下去
