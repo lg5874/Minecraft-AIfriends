@@ -187,11 +187,25 @@ const QUOTE_HISTORY = /(刚才|刚刚|之前|前面)[^，。]{0,8}说[了过]?[^
  */
 const BRACKET_LABEL = /\[[\u4e00-\u9fa5]{1,6}\]/
 
+/**
+ * 提示词在"点评自己的用词"时被念出来（2026-11-14）。
+ *
+ * 【现场 · 05:48:22】
+ *   [say] 你说过的话里，"又"字已经用过太多次了，别再用。
+ * 提示词里有一条「某个字重复太多次就换一个」的规则，模型把**这条规则本身**念了出来。
+ *
+ * 玩家听到的是"有人在教他说话" —— 比说错话更暴露。
+ *
+ * QUOTE_HISTORY 拦不住它：那条要求「刚才/之前/前面」开头，这句是「你说过的话里」。
+ */
+const META_WORD_CHECK = /(你说过的话|用过太多|用得太多次|别再用|重复太多|换个说法|换个词)/
+
 function isBrokenUtterance (text) {
   const t = String(text || '').trim()
   if (!t) return true
   if (LEADING_PUNCT.test(t)) return true
   if (BRACKET_LABEL.test(t)) return true
+  if (META_WORD_CHECK.test(t)) return true
   if (QUOTE_HISTORY.test(t)) return true
   // 只有一个字（「嗯」「哦」「不」）—— 昨晚 UNHUMAN-SCAN 第 1 条的另一种形态
   if (t.replace(/[\s，。、；：！？,.!?]/g, '').length <= 1) return true
