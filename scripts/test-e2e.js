@@ -507,7 +507,34 @@ const TASKS = [
         try { ok = await a.digAt(below, { allowBare: true }) } catch (e) { break }
         if (!ok) { fixture.push(`第${i + 1}格挖不动`); break }
         dugDown++
-        await sleep(700)   // 等掉落 + 等自己掉下去
+
+        // 挖完必须真正掉进坑里再挖下一格。
+        //
+        // 实测（/tmp/fix1.js）：挖掉脚下方块后，人经常卡在坑口边缘，
+        // 连挖 2 格 y 只降 0.54 格，第 3 格脚下就变 air 了 ——
+        // 而 dogDown<3 判定因此永远不满足，每轮 skip。
+        // 解决：把人挪到格子正中心，逼它掉下去。
+        const cx = Math.floor(p.x) + 0.5
+        const cz = Math.floor(p.z) + 0.5
+        try { await a.goto(cx, p.y - 1, cz, 0, 6000) } catch (e) {}
+
+        // 确认真的掉下去了。没掉下去就自己再挖一次（可能是脚下又冒出一层）
+        let dropped = false
+        for (let k = 0; k < 12; k++) {
+          const q = a.pos()
+          if (bot.entity.onGround && q.y <= p.y - 0.6) { dropped = true; break }
+          await sleep(150)
+        }
+        if (!dropped) {
+          // 还悬着：把脚下再挖一格，然后再等
+          const q = a.pos()
+          const again = bot.blockAt(q.offset(0, -1, 0))
+          if (again && !/bedrock|lava|water/.test(again.name)) {
+            try { await a.digAt(again, { allowBare: true }) } catch (e) {}
+          }
+          for (let k = 0; k < 12 && !bot.entity.onGround; k++) await sleep(150)
+        }
+        await sleep(250)
       }
 
       if (dugDown < 3) {

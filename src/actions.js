@@ -2521,9 +2521,33 @@ class Actions {
 
   // 在脚边找个地方放方块（比如放工作台）
   // 如果附近已经有这个方块了，直接返回它
-  async placeNearby (blockName) {
-    const exist = this.findBlock(blockName, 10)
-    if (exist) return exist
+  /**
+   * 在脚边放一个方块。
+   *
+   * @param {string} blockName
+   * @param {{force?:boolean}} opts
+   *   force=true 时**忽略附近已有的同类方块**，强制再放一个新的。
+   *   为什么需要：`ensureTable` 复用旧工作台是对的（省材料），
+   *   但「放箱子」这种任务要求"世界里的箱子数量真的增加了"——
+   *   复用旧箱子等于一次都没放（实测 e2e：`世界内 chest 1 -> 1（没放出来，只是找到了旧箱子）`）。
+   */
+  async placeNearby (blockName, opts = {}) {
+    // 复用已有方块的判定要更谨慎：
+    //   · 工作台：复用是对的（省材料，ensureTable 也依赖这个行为）
+    //   · 箱子/熔炉这类"任务产物"：复用等于没放
+    //
+    // 实测（e2e 10:50）：`世界内 chest 1 -> 1（没放出来，只是找到了旧箱子）`
+    // —— 测试要求"世界里的箱子数量真的增加"，而这里第一行就把旧箱子返回了。
+    //
+    // 现在的规则：**手上有这个物品的存货**就优先真放一个新的；
+    // 只有手上没有、但附近有旧的，才复用。
+    const REUSE_OK = /^(crafting_table|furnace)$/.test(blockName)
+    const held = this.countOf(blockName)
+    const shouldReuse = !opts.force && (REUSE_OK || held === 0)
+    if (shouldReuse) {
+      const exist = this.findBlock(blockName, 10)
+      if (exist) return exist
+    }
 
     const item = this.item(blockName)
     if (!item) throw new Error('没有 ' + blockName)
@@ -2727,6 +2751,37 @@ class Actions {
     })
     if (reachable.length) cands = reachable
 
+    // 2.7 如果配方要用木板，而手上**一块木板和一个原木都没有**，
+    //     那"选哪个品种"这个问题在信息上是无解的 —— 12 份配方全打平
+    //     （实测 /tmp/probe-score.js：missing=5 kind=0 × 12），
+    //     排序后稳定拿到数组第一份 cherry_planks，然后去补 cherry_log 补不到，
+    //     白烧 176 秒（e2e --only 做木镐）。
+    //
+    //     正确做法：**先去弄一根任意原木**，回来再据实选品种。
+    //     手里有 oak_log 时，oak 那份配方 species 分是 5，自然赢过其它。
+    const __needsPlank = cands.some(r => r.delta.some(d => {
+      if (d.count >= 0) return false
+      const it = mcData.items[d.id]
+      return it && /_planks$/.test(it.name)
+    }))
+    if (__needsPlank && this.plankTotal() === 0 && this.woodCount() === 0) {
+      this.log(`[craft] 做 ${name} 要先有木头（木板 0、原木 0），先去弄一根`)
+      try {
+        await this.ensureWood(1)
+      } catch (e) {
+        this.log('[craft] 弄木头失败: ' + e.message)
+      }
+      if (this.woodCount() > 0) {
+        this.log(`[craft] 弄到 ${this.woodCount()} 个原木（${this.bestLog() || '品种未知'}），重新选配方`)
+        // 重新按"现在手上有什么"挑一次配方
+        return await this.craftSmart(name, count, depth)
+      }
+      // 弄不到木头：**立刻失败**，别回去继续挑 cherry。
+      // 实测（/tmp/probe-craft-repro.js）：ensureWood 跑了 127 秒没弄到原木，
+      // 然后流程又回到配方选择，继续去补 cherry_planks，再白烧 176 秒。
+      throw new Error(`做 ${name} 需要木板，但一根原木都弄不到（附近找不到能砍的树）`)
+    }
+
     // 3. 挑一个"手头材料最足、需要额外弄的最少"的配方
     //
     // 【实测的 bug · 2026-11-13 10:38】只按 missing/inHand 打分时，
@@ -2859,7 +2914,44 @@ class Actions {
       // 每遍用"当前背包"重算需求（见上面 recomputeNeeds 的说明）
       pick.needs = recomputeNeeds()
 
-      for (const [iid, n] of Object.entries(pick.needs)) {
+      /**
+       * 补料顺序：**会被别人消耗的材料最后补**。
+       *
+       * 【实测的 bug · 2026-11-13 11:00 e2e】`补料 1 遍后仍缺：oak_planks 要 3 有 1`，
+       * 而背包明明有 7 个原木。推演：
+       *   木镐 = 3 oak_planks + 2 stick，而 stick 配方是 **oak_planks -2 => stick +4**
+       *   第 1 遍按 Object.entries 顺序补：先 oak_planks 补到 4，
+       *   再 stick（要 2）-> craftSmart('stick',2) 内部 need=2、times=1，
+       *   消耗 **2 张** 木板 -> 木板剩 2 < 3 -> 报缺。
+       *   （日志里"有 1"是因为它还多补了一轮 stick，共吃 4 张。）
+       *
+       * 所以：如果是"原料 A 会消耗原料 B"这种关系，**B 必须最后补**，
+       * 否则 B 补好的量会被 A 吃掉，而这一遍的需求判断已经过去了。
+       */
+      const consumesOther = (selfId, otherId) => {
+        try {
+          const it = mcData.items[selfId]
+          if (!it) return false
+          const rs = (mcData.recipes[it.id] || [])
+          for (const raw of rs) {
+            const rec = new (require('prismarine-recipe')(mcData).Recipe)(raw, mcData)
+            if (rec.delta.some(d => d.id === otherId && d.count < 0)) return true
+          }
+        } catch (e) {}
+        return false
+      }
+      const needEntries = Object.entries(pick.needs)
+      needEntries.sort((a, b) => {
+        const ai = parseInt(a[0], 10)
+        const bi = parseInt(b[0], 10)
+        const aEatsB = consumesOther(ai, bi)     // a 会吃掉 b -> a 先补
+        const bEatsA = consumesOther(bi, ai)
+        if (aEatsB && !bEatsA) return -1
+        if (bEatsA && !aEatsB) return 1
+        return 0
+      })
+
+      for (const [iid, n] of needEntries) {
         const item = mcData.items[parseInt(iid, 10)]
         if (!item) continue
         if (this.countOf(item.name) >= n) continue
@@ -2938,6 +3030,14 @@ class Actions {
           unsatisfied.push({ name: item.name, need: n, have: this.countOf(item.name), err: firstErr })
           if (this.countOf(item.name) > before) progressed = true
         }
+
+        // 【方案 B · 2026-11-13 11:00】每补完一项就**立刻重算** needs。
+        //
+        // 只靠"每遍开头重算"不够：同一遍里补 stick 会吃掉 oak_planks，
+        // 而被吃掉的那一项可能已经补过了（判断用的还是补之前的数量），
+        // 于是这一遍结束时木板 2 < 3，直接报"补料 1 遍后仍缺"。
+        // 每项补完重算，下一项用的就是最新的真实缺口。
+        pick.needs = recomputeNeeds()
       }
 
       if (!unsatisfied.length) break
@@ -3015,11 +3115,27 @@ class Actions {
     // 站太远时服务端直接丢弃 use_item_on，客户端会静默等满 20 秒 windowOpen 超时，
     // 然后 safeCraft 重试 4 次 = 白烧 84 秒。宁可在第一步就失败。
     if (table) {
-      const arrived = await this.goto(table.position.x, table.position.y, table.position.z, 3, 15000)
+      let arrived = await this.goto(table.position.x, table.position.y, table.position.z, 3, 15000)
+      let dTable = table.position.distanceTo(this.pos())
       if (arrived !== true && arrived !== 'ok') {
-        throw new Error('走不到工作台（差 ' +
-          table.position.distanceTo(this.pos()).toFixed(1) + ' 格）')
+        // 【实测 · 2026-11-13 10:47】`走不到工作台（差 11.0 格）` ——
+        // 工作台就在 11 格外，走过去却被地形挡住（树顶/坑边/水边）。
+        // 直接 throw 会让整个合成失败，但**工作台是自己刚放的**，
+        // 完全可以在脚边另找一个地方重放一个 —— 比原地放弃划算得多。
+        this.log(`[craft] 走不到工作台（差 ${dTable.toFixed(1)} 格），试着在脚边重放一个`)
+        try { await this.flattenSpot() } catch (e) {}
+        const placed = await this.placeNearby('crafting_table')
+        if (placed) {
+          table = placed
+          arrived = await this.goto(table.position.x, table.position.y, table.position.z, 3, 12000)
+          dTable = table.position.distanceTo(this.pos())
+        }
       }
+      // 只要真的在伸手范围内（<= 4.2），即使 goto 判"没到"也可以合
+      if (arrived !== true && arrived !== 'ok' && dTable > 4.2) {
+        throw new Error('走不到工作台（差 ' + dTable.toFixed(1) + ' 格）')
+      }
+      if (dTable <= 4.2) this.log(`[craft] 工作台在 ${dTable.toFixed(1)} 格内，可以合`)
     }
     const usable = this.bot.recipesFor(id, null, Math.max(1, count - this.countOf(name)), table || null)
     // 关键：优先用补料时选的那个配方，别让 usable[0] 换成别的变体
@@ -4478,6 +4594,16 @@ class Actions {
    * 返回"这个原木能做出来的木板"（只是名字，countOf 仍是 0），
    * 让上层知道"该往哪个方向备料"。
    */
+  /** 手上所有品种的木板加起来有多少张（craftSmart/ensurePickaxe 都要用） */
+  plankTotal () {
+    const planks = ['oak_planks', 'birch_planks', 'spruce_planks', 'jungle_planks',
+      'acacia_planks', 'dark_oak_planks', 'cherry_planks', 'mangrove_planks',
+      'pale_oak_planks', 'bamboo_planks', 'crimson_planks', 'warped_planks']
+    let n = 0
+    for (const p of planks) n += this.countOf(p)
+    return n
+  }
+
   bestPlank () {
     const planks = ['oak_planks', 'birch_planks', 'spruce_planks', 'jungle_planks',
       'acacia_planks', 'dark_oak_planks', 'cherry_planks', 'mangrove_planks',
@@ -4968,6 +5094,22 @@ class Actions {
           // 必须按"够不够 count 个"返回。
           if (after >= count) return true
           this.log(`[gather] ${itemName} 要 ${count}，只拿到 ${after}（本次 +${after - before}）`)
+          // 【实测 · 2026-11-13 10:45】`[mine] 到时间上限（50s），已挖到 3 个`
+          // 紧接着 `[gather] cobblestone 要 3，只拿到 0（本次 +0）` ——
+          // mine 的 got++ 数的是"挖了几次"，不是"背包里多了几个"。
+          // 掉落物还在地上时 mine 就返回了。
+          // 这里补一次更宽的拾取（掉落物 5 分钟才消失，通常还在脚边）。
+          try {
+            await this.pickupNearby(10)
+            await sleep(500)
+          } catch (e) {}
+          const afterPickup = this.countOf(itemName) +
+            (itemName === 'cobblestone' ? this.countOf('cobbled_deepslate') : 0)
+          if (afterPickup >= count) {
+            this.log(`[gather] 补捡后 ${itemName} = ${afterPickup}，够了`)
+            return true
+          }
+          this.log(`[gather] 补捡后 ${itemName} 仍只有 ${afterPickup}/${count}`)
           return false
         }
         await this.chopTree(Math.max(1, Math.ceil(count / 3)))
@@ -5294,8 +5436,24 @@ class Actions {
         const ate = await this.eat()
         if (ate) return '吃了 ' + ate
       }
+      // 【实测的 bug · 2026-11-13 10:58 e2e】这里原来无条件 `return '拿到 xxx'`，
+      // 于是 `findFood 返回 "拿到 kelp x2"` 被当成成功 —— 但 **生 kelp 不是食物**
+      // （mcData.foodsByName.kelp === undefined，只有 dried_kelp 是 food=1）。
+      // 回报"拿到"，上层以为有吃的了，实际背包里全是不能吃的东西。
+      // 现在：只有确实拿到了**可食用**的东西才算数。
       const it = this.item(rawName)
-      if (it) return '拿到 ' + rawName + ' x' + it.count
+      const edible = this._edible(rawName)
+      if (it && edible) return '拿到 ' + rawName + ' x' + it.count
+
+      // 生海带没烤成：如果背包里已经有别的可吃的，就报那个
+      if (this.hasFood()) {
+        const f = this.foodList()[0]
+        if (f) return '拿到 ' + f.name + ' x' + f.count
+      }
+      // 只有生的、不可食用的东西 -> 不算成果
+      if (it && !edible) {
+        this.log(`[food] 拿到 ${rawName} x${it.count} 但它不能吃，继续找别的`)
+      }
       return null
     }
 
@@ -5548,7 +5706,12 @@ class Actions {
           const f = this.foodList()[0]
           if (f) return '弄到 ' + f.name
         }
-        tried.push('kelp(没烤成)')
+        // 烤不成：生 kelp 不是食物（查过 mcData，foodsByName 里没有 kelp）
+        // 明确把这批 kelp 记成"没用的"，别让上层以为找到食物了
+        // 生 kelp 不能吃（foodsByName 里没有 kelp），只有烤成 dried_kelp 才行。
+        // 这里只记一笔，不返回成功 —— settleRaw 内部已经做了 _edible 校验。
+        this.log('[food] kelp 没烤成，生的不能吃')
+        tried.push(`kelp x${got} 没烤成（生的不能吃）`)
       }
     }
 
