@@ -1465,8 +1465,21 @@ class Actions {
     const fillerT0 = Date.now()
     let fillerDryRounds = 0
 
-    if (fillerCount() < 8) {
-      this.log(`[chop] 垫脚料只有 ${fillerCount()}，先挖几块（最多 20s）`)
+    // 【实测的浪费 · 2026-11-13 09:23】无条件先挖垫脚料，结果 48 格内根本没树：
+    //   `[chop] 垫脚料准备完毕：5 块（用了 22.4s）`
+    //   `[chop] 48 格内没扫到树，先确认区块再决定要不要走远`
+    // 22 秒白烧，而调用方只给了 67 秒。
+    // 现在：**先确认附近有树且树比人高**，才去攒料，否则直接跳过。
+    const treeForFiller = (() => {
+      try {
+        const t = this.findAny(logs, 48)
+        return t ? t.position : null
+      } catch (e) { return null }
+    })()
+    const worthFiller = !!treeForFiller && treeForFiller.y > this.pos().y + 2
+
+    if (fillerCount() < 8 && worthFiller) {
+      this.log(`[chop] 树在高 ${Math.round(treeForFiller.y - this.pos().y)} 格处，先攒垫脚料（现有 ${fillerCount()}，最多 20s）`)
       while (fillerCount() < 8 && Date.now() - fillerT0 < FILLER_BUDGET) {
         if (Date.now() > DEADLINE - 15000) break
         if (fillerDryRounds >= 2) {
@@ -2633,10 +2646,33 @@ class Actions {
     const MAX_FILL_PASS = 4
     let unsatisfied = []
 
+    /**
+     * 按当前背包重新算一遍"这个配方还缺什么"。
+     *
+     * 【实测的 bug · 2026-11-13 09:15】原实现只算了一次 pick.needs 就循环补，
+     * 但**木棍会消耗木板**：chest 要 8 木板，补到 4 张木板后去做木棍，
+     * 木棍吃掉 2 张木板，木板又不够了 —— 而 needs 里记的还是"要 8"，
+     * 循环判断 `countOf >= n` 用的是过期需求，于是补料在 7/8 处停手，
+     * 报 `补料 1 遍后仍缺：oak_planks 要 8 有 7`。
+     * 现在每遍都重算，木棍吃掉多少就补多少。
+     */
+    const recomputeNeeds = () => {
+      const out = {}
+      for (const d of pick.r.delta) {
+        if (d.count < 0) out[d.id] = (out[d.id] || 0) - d.count * Math.max(1, times0)
+      }
+      // times0 = 一次合成要几份；craftSmart 的 count 用 need/结果数算过
+      return out
+    }
+    const times0 = Math.ceil(need / pick.r.result.count)
+
     while (fillPass < MAX_FILL_PASS) {
       fillPass++
       unsatisfied = []
       let progressed = false
+
+      // 每遍用"当前背包"重算需求（见上面 recomputeNeeds 的说明）
+      pick.needs = recomputeNeeds()
 
       for (const [iid, n] of Object.entries(pick.needs)) {
         const item = mcData.items[parseInt(iid, 10)]
@@ -2715,7 +2751,7 @@ class Actions {
     // 4. 正式合成
     const table = pick.r.requiresTable ? await this.ensureTable() : this.findBlock('crafting_table', 12)
     if (pick.r.requiresTable && !table) throw new Error('需要工作台但放不下')
-    const times = Math.ceil(need / pick.r.result.count)
+    const times = times0        // 跟补料用的是同一个份数，别各算各的
 
     // 走到工作台旁边再确认配方
     // 关键：走不到就立刻报错。openBlock 不做距离校验，
@@ -3469,14 +3505,60 @@ class Actions {
     }
     await stockFiller(12)
 
+    /**
+     * 「真的出来了」还是「只是钻进了个浅缝」？
+     *
+     * 只看 isUnderground() 不够 —— 实测在 y=50 全石头环境里，
+     * 往上挪一格恰好挪进了个浅缝，isUnderground() 立刻变 false，
+     * 于是打出一行「出来了！y=65（上升 1 格）」的假成功。
+     *
+     * 真出来的判据：头顶 20 格内没有任何实心方块（不含树叶/原木/草）。
+     */
+    const reallyOut = () => {
+      if (this.isUnderground()) return false
+      const p = this.pos()
+      for (let dy = 1; dy <= 20; dy++) {
+        const b = bot.blockAt(p.offset(0, dy, 0))
+        if (!b) continue                        // 看不见就不下结论
+        if (b.boundingBox === 'block' && !/leaves|log|_grass$|fern/.test(b.name)) return false
+      }
+      return true
+    }
+
+    // 死锁检测：连续多少步高度一点没变
+    let stuckSteps = 0
+    let lastY = startY
+    const STUCK_LIMIT = 14          // 约 14 步没动就认输（每步 ~3-4 秒 => 60 秒内退出）
+
     try {
       for (let step = 0; step < maxSteps; step++) {
         this.check()
 
-        if (!this.isUnderground()) {
+        if (reallyOut()) {
           const climbed = Math.round(this.pos().y - startY)
           this.log(`[surface] 出来了！y=${Math.round(this.pos().y)}（上升 ${climbed} 格）`)
           return true
+        }
+        // 只是 isUnderground() 变 false，但头顶还压着石头 -> 不算出来，继续爬
+        if (!this.isUnderground()) {
+          const climbed = Math.round(this.pos().y - startY)
+          this.log(`[surface] 头顶还有石头（只升了 ${climbed} 格），继续`)
+        }
+
+        // 死锁检测：高度长时间不动就认输，别烧穿上层预算。
+        // 实测 y=50 全石头 + 空手时，三个手段（塔升/挖台阶/就地掏）同时失效，
+        // 会一直「换方向」到 240 秒超时，e2e 直接 0%。
+        if (Math.abs(this.pos().y - lastY) < 0.5) {
+          stuckSteps++
+        } else {
+          stuckSteps = 0
+          lastY = this.pos().y
+        }
+        if (stuckSteps >= STUCK_LIMIT) {
+          const climbed = Math.round(this.pos().y - startY)
+          this.log(`[surface] 连续 ${stuckSteps} 步没升高（升了 ${climbed} 格），` +
+            `判定走不通：${fillerCount() === 0 ? '空手' : '有料'} + 头顶 ${nameAt(this.pos().offset(0, 2, 0))}`)
+          break
         }
 
         // ===== 每步重新决策：按「手上还有几块料」选策略 =====
@@ -3543,15 +3625,17 @@ class Actions {
             if (moved) break
           }
           if (!moved) {
-            // 真走不动了：把头顶第一个实心块挖开，再往上多挖两格
-            const fs2 = firstSolidAbove(p, 8)
-            if (fs2 > 0) {
-              this.log(`[surface] 挪不动了，挖开头顶 +${fs2} 往上顶`)
-              for (let dy = fs2; dy <= fs2 + 2; dy++) {
-                if (isSolid(p.offset(0, dy, 0))) await digOne(p.offset(0, dy, 0))
-              }
+            // 四个方向都试遍了还挪不动 —— 这是「空手 + 全石头 + 没台阶」的死角。
+            // 实测就在这里空转了 10 分钟（y=55 一直「上不去，换方向」）。
+            // 正确做法：别管台阶了，就地往上掏一格（digUpOne 不需要任何材料）。
+            const yBefore = this.pos().y
+            let bore = false
+            try { bore = await this.digUpOne() } catch (e) {}
+            if (bore && this.pos().y > yBefore + 0.5) {
+              this.log(`[surface] 无路可走，就地往上掏了一格（y=${Math.round(this.pos().y)}）`)
+              bad.clear()          // 换了一层，之前拉黑的方向作废
             } else {
-              this.log('[surface] 挪不动了，头顶也是空的')
+              this.log('[surface] 就地掏也上不去，这一层没戏了')
             }
           }
           await sleep(200)
@@ -3576,7 +3660,17 @@ class Actions {
           const sup = bot.blockAt(p.offset(dx, -1, dz))
           if (!fill || !sup) {
             bad.add(`${here}|${dx},${dz}`)
-            this.log('[surface] 没有垫脚方块或下方没支撑，换方向')
+            // 没料垫台阶：先记下这个方向不行，同时试着原地往上掏一格。
+            // 只拉黑不动作的话，四个方向很快全黑，然后就是无限「换方向」。
+            if (bad.size >= DIRS.length) {
+              const yB = this.pos().y
+              let b2 = false
+              try { b2 = await this.digUpOne() } catch (e) {}
+              if (b2 && this.pos().y > yB + 0.5) {
+                this.log(`[surface] 没料垫台阶，就地掏一格（y=${Math.round(this.pos().y)}）`)
+                bad.clear()
+              }
+            }
             continue
           }
           try {
@@ -3620,12 +3714,17 @@ class Actions {
     }
 
     const climbed = this.pos().y - startY
-    this.log(`[surface] 挖了 ${maxSteps} 步，上升 ${Math.round(climbed)} 格，还没出去`)
-    // isUnderground() 是三态：true 地下 / false 露天 / null 看不清。
-    // 写成 `!this.isUnderground()` 的话 null 会变成 true ——
-    // 断线或区块没加载时就打出"出来了！"的假成功日志，调用方也以为爬到地面了。
-    // 只认明确的 false 才算出去。
-    return this.isUnderground() === false
+    const out = reallyOut()
+    if (out) {
+      this.log(`[surface] 出来了！y=${Math.round(this.pos().y)}（上升 ${Math.round(climbed)} 格）`)
+    } else {
+      this.log(`[surface] 没上去：上升 ${Math.round(climbed)} 格，` +
+        `头顶 ${nameAt(this.pos().offset(0, 2, 0))}，料 ${fillerCount()} 块`)
+    }
+    // 只用 reallyOut() 判定，不再看 isUnderground()：
+    //   · 它会把 null（断线/区块没加载）当成 truthy，打出假成功
+    //   · 它也会把"钻进了个浅缝"当成出来了（实测 y=50 只升 1 格就报成功）
+    return out
   }
 
   // ============================================================
@@ -3688,13 +3787,25 @@ class Actions {
     const F = Math.floor(p.y)
 
     // 头顶到 F+3 全清空（脚/身体/头要有位置）
+    //
+    // 这里**不走 digAt**，也不拦 bestToolFor 的 ok：
+    //   · digAt 会先 goto 走过去；头顶方块 y 比人高，gotoVertical 判「高度到不了」，
+    //     结果是连头上那片树叶都挖不掉（实测报「够不到（差 14.1 格）」）
+    //   · bestToolFor 没镐时返回 ok=false（"需要镐子"），但**开路不需要镐** ——
+    //     空手挖石头慢（约 7.5 秒）但确实挖得掉。我们只要通路，不要掉落。
     let any = 0
     for (let dy = 1; dy <= 3; dy++) {
       const b = bot.blockAt(p.offset(0, dy, 0))
       if (!b || b.boundingBox !== 'block') continue
       if (/bedrock|lava|water/.test(b.name)) return false
-      try { if (await this.digAt(b)) any++ } catch (e) {}
-      await sleep(90)
+      try {
+        await this.bestToolFor(b)        // 有镐就换上，没镐也继续
+        bot.setControlState('forward', false)
+        await sleep(60)
+        await bot.dig(b, true)
+        any++
+      } catch (e) {}
+      await sleep(120)
     }
 
     if (!any) {
@@ -3717,6 +3828,32 @@ class Actions {
         }
       } catch (e) {}
       return false
+    }
+
+    // 挖开了头顶 —— 但如果是空手挖的石头，一块料都拿不到。
+    // 这时候"能站上去"是假的：真站上去也只是把洞挖高了一格，
+    // 下一格还是石头，又得空手挖 7.5 秒。所以顺手横向找块软方块补料。
+    const hasPickNow = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
+    if (!hasPickNow) {
+      const SOFT = /^(dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium|gravel|sand|red_sand|clay|snow_block|soul_soil|moss_block)$/
+      for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        let took = false
+        for (let dy = 0; dy <= 1; dy++) {
+          const v = this.pos().offset(dx, dy, dz)
+          const nb = bot.blockAt(v)
+          if (!nb || nb.boundingBox !== 'block') continue
+          if (!SOFT.test(nb.name)) continue
+          try {
+            await bot.dig(nb, true)
+            await sleep(200)
+            try { await this.pickupNearby(4) } catch (e) {}
+            await sleep(150)
+            took = true
+          } catch (e) {}
+          break
+        }
+        if (took) break
+      }
     }
 
     // 跳上去。一格台阶 pathfinder 比手动跳稳（实测 0.4 秒就上去了）
@@ -4011,12 +4148,32 @@ class Actions {
             const key = `${tp.x},${tp.y},${tp.z}`
             if (seen.has(key)) continue
             if (maxDist > 0 && tp.distanceTo(p) > maxDist) continue
-            seen.add(key)
 
+            // 【实测的坑 · 2026-11-13 e2e 09:04:56】
+            // 候选格通过了三项方块检查，但**眼睛看不见底座**：
+            //   placeNearby try0: refused at (122,71,67)
+            //   [place] 看不见底座，换一个   x6
+            // 于是 8 个候选全废。人在树顶/树冠中间时，
+            // "同层左右两侧"的底座会被树叶挡住，越远的越瞎。
+            //
+            // 现在：
+            //   1. 硬性要求 canSeeBlock(base)，看不见的直接不收
+            //   2. 打分里加"高度贴近自己"的权重 —— 同层的格子看得见、
+            //      也放得上；高出 2 格或低 2 格的经常被挡住
+            let visible = true
+            try {
+              visible = this.bot.canSeeBlock(base)
+            } catch (e) {
+              visible = true      // canSeeBlock 不存在时退回"信任方块检查"
+            }
+            if (!visible) continue
+
+            seen.add(key)
             cands.push({
               x: tp.x, y: tp.y, z: tp.z,
               base,
               score: baseScore(base.name) - r * 0.5 - Math.abs(dy) * 0.3
+                - Math.abs(dy) * 2.0      // 同层优先（dy=0 最优先）
             })
           }
         }
@@ -4935,6 +5092,83 @@ class Actions {
         if (f) return '打猎后有 ' + f.name + ' x' + f.count
       }
       tried.push(a)
+    }
+
+    // 1.5 打猎全失败后：走一段再扫一次。
+    //
+    // 【实测】/tmp/probe-food3.js：出生点 80 格内只有 1 只 cow@79，
+    // chase 卡住 -> 整条打猎链结束 -> 剩下几级都找不到 -> 23.9 秒返回 null，
+    // 而调用方给了 150 秒预算。预算没花完就放弃，是"找食物 55s 就 null"的主因。
+    //
+    // 现在：只要有剩余预算，就换个方向走 30~40 格重新扫，
+    // 最多补 3 轮 —— 直到预算真的用完或者确实找到东西。
+    let extraRounds = 0
+    while (left() > 30000 && !this.hasFood() && extraRounds < 3) {
+      extraRounds++
+      this.log(`[food] 打猎没成，换方向再找（第 ${extraRounds} 轮，剩 ${Math.round(left() / 1000)}s）`)
+      const yaw = Math.random() * Math.PI * 2
+      const p = this.pos()
+      // 注意：这里**不能**用 this.goto —— 它在 |dy|>2 时先走 gotoVertical，
+      // 而"从山坡上往下挪"这种场景 gotoVertical 直接返回 false，
+      // goto 就整条失败。实测日志里连续 3 轮都是
+      // `[goto] 走不通了（差 36.0 格）`，人一格都没动，
+      // 于是每轮都在追同一只猪。
+      // 换地方只需要水平位移，直接给 pathfinder 一个 GoalXZ。
+      try {
+        this.bot.pathfinder.setGoal(new goals.GoalXZ(
+          Math.floor(p.x + Math.cos(yaw) * 36),
+          Math.floor(p.z + Math.sin(yaw) * 36)))
+        const sMove = Date.now()
+        const budget = Math.min(22000, Math.max(6000, left() - 20000))
+        let lastP = this.pos().clone()
+        let stillMove = 0
+        while (Date.now() - sMove < budget) {
+          this.check()
+          const cur = this.pos()
+          if (cur.distanceTo(p) > 28) break
+          if (cur.distanceTo(lastP) < 0.12) stillMove += 250
+          else stillMove = 0
+          lastP = cur.clone()
+          if (stillMove > 5000) break
+          await sleep(250)
+        }
+      } catch (e) {}
+      try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+      await this.ensureChunks(3000)
+
+      let again = []
+      for (const range of [32, 64, 96]) {
+        again = pickAnimal(range)
+        if (again.length) break
+      }
+      if (!again.length) {
+        this.log('[food] 这一轮 96 格内没动物')
+        continue
+      }
+      this.log(`[food] 这一轮找到 ${again.length} 只`)
+      for (const { n: a2 } of again.slice(0, 2)) {
+        if (left() < 15000) break
+        const dist2 = a2 && this.nearestEntity(a2, 96)
+        if (!dist2) continue
+        this.log(`[food] 追 ${a2}（${Math.round(dist2.position.distanceTo(this.pos()))} 格）`)
+        try { await this.chase(a2, Math.min(25000, Math.max(8000, left() - 10000))) } catch (e) {}
+        const now2 = this.nearestEntity(a2, 64)
+        if (!now2 || now2.position.distanceTo(this.pos()) > 8) {
+          tried.push(a2 + '(第' + extraRounds + '轮够不着)')
+          continue
+        }
+        await hunt(a2, Math.min(22000, Math.max(6000, left() - 5000)))
+        const raw2 = this.item('beef') || this.item('porkchop') || this.item('mutton') ||
+          this.item('chicken') || this.item('rabbit')
+        if (raw2) {
+          const rr = await settleRaw(raw2.name)
+          if (rr) return rr
+        }
+        if (this.hasFood()) {
+          const f = this.foodList()[0]
+          if (f) return '换方向打猎拿到 ' + f.name + ' x' + f.count
+        }
+      }
     }
 
     // 2. 野生浆果 / 作物（比打猎稳，但要走过去）

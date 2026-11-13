@@ -761,7 +761,38 @@ async function main () {
   console.log(`\n出生点    : ${baseline.pos}  y=${baseline.y}  在地下: ${baseline.underground}`)
   console.log(`血/饿     : ${baseline.health}/20  ${baseline.food}/20`)
   console.log(`背包      : ${invStr(baseline.inv)}`)
-  console.log(`在线玩家  : ${baseline.players.join(', ') || '（只有我）'}\n`)
+  console.log(`在线玩家  : ${baseline.players.join(', ') || '（只有我）'}`)
+
+  // ---- 出生点健康检查 ----
+  //
+  // 实测发现 e2e 方差极大，出生点决定成败：
+  //   v2 出生在 (60,69,5) 地表  -> 57%
+  //   v3 出生在 (63,50,9) 深层地下 -> 0%（4 个任务各 240 秒全超时）
+  //
+  // y=50 全石头的环境里，空手挖不动石头、没料垫塔、getToSurface 出不来，
+  // 整条链全断。这种出生点的数据没有参考价值。
+  //
+  // 所以开局先确认"能正常开始"：在地下就先爬出来，爬不出来就标记环境异常。
+  let envWarning = ''
+  if (baseline.underground === true || baseline.y < 60) {
+    console.log(`⚠️  出生点在地下（y=${baseline.y}），先爬出来再开始计时...`)
+    const y0 = a.pos().y
+    try {
+      await Promise.race([
+        a.getToSurface(80),
+        new Promise(r => setTimeout(r, 180000))
+      ])
+    } catch (e) {}
+    const y1 = a.pos().y
+    const out = a.isUnderground() === false
+    console.log(`    爬升 ${Math.round(y1 - y0)} 格，现在 y=${Math.round(y1)}，在地下: ${a.isUnderground()}`)
+    if (!out) {
+      envWarning = `出生点在地下且爬不出来（y=${Math.round(y1)}），本轮数据参考价值低`
+      console.log(`⚠️  ${envWarning}`)
+    }
+    await sleep(1000)
+  }
+  console.log('')
 
   // ---- 跑任务 ----
   const results = []
