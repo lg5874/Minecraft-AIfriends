@@ -371,7 +371,16 @@ const POOL = [
     title: '往一个方向走远点，看看那边有什么',
     why: '总在这一小片转，想知道外面是什么样',
     tag: '探索',
+    // ===== 【出生点没树时的出口】=====
+    //
+    // 原来第一步就是「带上吃的和火把」—— 火把要木头/煤，没树就做不出来。
+    // 出生点林子被砍光时，这条目标也一起卡死，他就真的没活可干了。
+    // 真人在一片砍秃的地方会先**走出去看看**，而不是站着等树长出来。
+    //
+    // 所以第一步改成纯走路（不需要任何材料）：走出去 80 格，路上留意树。
+    // 走到新地方通常就有林子，后面备料才有意义。
     stages: [
+      { kind: 'travel', title: '先往远处走走，看看那边有没有树', need: { distance: 80 } },
       { kind: 'gather', title: '带上吃的和火把再出门', need: { '#food': 4, torch: 6 } },
       { kind: 'travel', title: '朝一个方向走出去，走到没见过的地界', need: { distance: 300 } },
       { kind: 'do', title: '在那边转一圈，记下有什么值得回来的', need: { count: 1 } }
@@ -380,6 +389,11 @@ const POOL = [
       let s = 38
       if ((status.health || 20) >= 16) s += 12
       if (itemCount(status.inventory || {}, '#food') >= 3) s += 10
+      // 没镐、也没木头：这会儿最该做的就是出去找树，而不是卡在原地
+      // 反复试「先弄把木镐」。这条加分让 explore 在这种情况下排到第一。
+      const inv = status.inventory || {}
+      const wood = itemCount(inv, '#log') + itemCount(inv, '#planks')
+      if (undergroundOf(status) !== true && pickTier(inv) < 0 && wood < 4) s += 15
       return s
     }
   },
@@ -687,10 +701,14 @@ class Goals {
     const out = []
     const underMin = this.undergroundFor() / 60000
     const isUnder = undergroundOf(status) === true
+    // actions 连续 3 次"挖不动"会打这个标记：这片地形处理不了，
+    // 先往外走。explore 即使正在冷却也放它出来。
+    const actRef = this.ctx && this.ctx.actions
+    const forcedExplore = !!(actRef && actRef._forceExploreUntil && actRef._forceExploreUntil > now)
 
     for (const g of POOL) {
       const until = this.cooldown[g.key] || 0
-      if (until > now) continue
+      if (until > now && !(forcedExplore && g.key === 'explore')) continue
       let score = 0
       try { score = g.score(status) } catch (e) { score = 30 }
 
@@ -782,6 +800,7 @@ class Goals {
         else score += Math.min(80, Math.max(0, (underMin - 3) * 6))
       }
 
+      if (forcedExplore && g.key === 'explore') score += 40
       score += this.tasteBonus(g.tag)
       out.push({
         key: g.key,
@@ -996,6 +1015,9 @@ ${list}
       return stage
     })
     const p0 = posOf(status)
+    // 卡死看门狗：从这一刻开始记"最后一次真的动了"
+    this._watchPos = p0
+    this._watchMoveAt = now
     return {
       key: picked.key,
       title: picked.title,
@@ -1283,6 +1305,38 @@ ${list}
       const rec = this.abandon(`血只剩 ${hp} 格，保命要紧，这事先放下`, { urgent: true })
       if (rec) return { stageCompleted: false, goalCompleted: false, ratio: s.ratio || 0, abandoned: true, urgent: true }
     }
+
+    // ===== 卡死看门狗 =====
+    //
+    // 【实测 · 2026-11-14 01:37】树在石头后面：要挖穿才能过去 -> 没镐挖不动
+    // -> 到不了树 -> 没木头 -> 做不出镐。chopTree 在 DEADLINE 里空转，
+    // busy 一直是 true，70 秒只有心跳、没有一条 [act] 日志。
+    // 用户看到的就是"站着不动"。
+    //
+    // 判据：任务在跑，但 30 秒里既没有动作日志（_lastLogAt）、也没有位移。
+    // 证据是 duration 的阶段（守着/站一会儿）除外 —— 那本来就不该动。
+    try {
+      const pNow = posOf(status)
+      if (!this._watchPos ||
+          Math.hypot(pNow.x - this._watchPos.x, pNow.z - this._watchPos.z) > 0.5) {
+        this._watchPos = pNow
+        this._watchMoveAt = this.now()
+      }
+      const act = this.ctx && this.ctx.actions
+      const lastAct = act && Number(act._lastLogAt) ? Number(act._lastLogAt) : 0
+      const last = Math.max(this._watchMoveAt || 0, lastAct, s.startedAt || this.goal.createdAt || 0)
+      const quiet = this.now() - last
+      const watchable = s.evidence !== 'duration'
+      if (watchable && quiet > (this.cfg.stuckActionMs || 30000) && !this.isResting()) {
+        const reason = `卡死：${Math.round(quiet / 1000)} 秒没有任何动作，先放下`
+        this.log('[goals] ' + reason)
+        this.journal(reason)
+        // 同时打断正在跑的任务，否则它会继续占着 task 锁
+        try { if (act) act.cancel = true } catch (e) {}
+        const rec = this.abandon(reason, { urgent: true })
+        return { stageCompleted: false, goalCompleted: false, ratio: s.ratio || 0, abandoned: !!rec, stuck: true }
+      }
+    } catch (e) {}
 
     const p = stageProgress(s, status)
     const before = s.best || 0

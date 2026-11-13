@@ -149,15 +149,15 @@ function mkSpont (busy) {
       const C4 = mkCost(dir4)
       const l4 = addLoss(C4)
       const S4 = mkSpont(false)
-      const talk4 = mkTalk([false, false, false, true])
-      for (let i = 0; i < 4; i++) {
+      const talk4 = mkTalk([false, false, false, false, false, true])
+      for (let i = 0; i < 6; i++) {
         S4._maybeQueueLoss()
         if (S4.pendingEvents.length) await S4.tick(talk4)
         advance(9000)       // 越过 complain 的 8 秒冷却
       }
-      assert.strictEqual(talk4.said.length, 3, '说了没成最多排 3 回')
-      assert(l4.spokenAt === T, '试满 3 回就放下，当说过')
-      ok('说了没成最多 3 回，之后不再翻旧账')
+      assert.strictEqual(talk4.said.length, 5, '说了没成最多排 5 回')
+      assert(l4.spokenAt === T, '试满 5 回就放下，当说过')
+      ok('说了没成最多 5 回，之后不再翻旧账')
     }
 
     // ------------------------------------------------------------ 5

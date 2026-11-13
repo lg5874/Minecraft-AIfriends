@@ -41,10 +41,10 @@ const GLOBAL_SAY = { lastAt: 0, window: [] }
  * 之前 test-bot-identity 里硬编了旧值，改阈值以后测试测的是空气。
  */
 const SAY_DEFAULTS = {
-  sayGapMs: 2500,
-  fastSayGapMs: 1200,
+  sayGapMs: 2500,       // 常规：2.5 秒内最多 1 条
+  fastSayGapMs: 1200,   // 被点名（话里带我的名字）时放宽
   sayWindowMs: 20000,
-  sayWindowMax: 8
+  sayWindowMax: 8       // 服务器阈值是 20 秒 20 条，这里留一半余量
 }
 
 /**
@@ -114,6 +114,38 @@ function isInstructionLeak (text) {
 }
 
 /**
+ * 反应层：先垫一句（2026-11-14）。
+ *
+ * 【为什么】receive → 模型（2~6 秒）→ 限速 → 才开口。用户问「你在干啥」，
+ * 真人 2~3 秒就回，他 6 秒；而且真人在忙的时候会**先秒回一个短词**："等下""咋了"。
+ * 这不是 bug，是"这人反应好慢" —— 第一分钟就会撞上。
+ *
+ * 【为什么要分池子】固定一个"嗯"就是敷衍机。短词要跟当前状态挂钩：
+ *   busy     → 让对方知道你活着、只是在忙（"等下""等我把这块弄完"）
+ *   called   → 被叫名字，应一声（"咋了""在呢"）
+ *   question → 被问，表示在听（"嗯？""你说"）
+ *   recovery → 垫了话却一直没等到真回复，补一句收尾（比只留一个"等下"强）
+ *
+ * 【为什么池子里给 6 个】同一个词连着出现两次，人就会看出是模板。
+ * pickVaried 会避开最近两次说过的。
+ */
+const ACK_POOLS = {
+  busy: ['等下', '等我把这块弄完', '忙完这阵', '马上', '这就来', '稍等'],
+  called: ['咋了', '在呢', '嗯？', '来了', '说', '我在'],
+  question: ['嗯？', '你说', '咋了', '我听着', '什么'],
+  recovery: ['刚才走神了，你说啥', '刚没听着，再说一遍', '刚才在忙，你说啥来着', '嗯？刚才没注意']
+}
+
+/** 从池子里挑一个，避开最近说过的两个 */
+function pickVaried (pool, recent) {
+  if (!pool || !pool.length) return null
+  const avoid = new Set((recent || []).slice(-2))
+  const left = pool.filter(x => !avoid.has(x))
+  const arr = left.length ? left : pool
+  return arr[Math.floor(Math.random() * arr.length)]
+}
+
+/**
  * 主题级复读拦截（2026-11-13，用户实机截图抓到的病）。
  *
  * 【现场】十句里六句是同一批意思：
@@ -176,10 +208,11 @@ class Talk {
     // 这里只**记录**，降不降概率由 impulse.maybe() 决定 —— 不硬拦。
     this.lastIntention = null
     this.lastSayAt = 0
-    // 【2026-11-14 改】5 秒 → 2.5 秒。
+    // 【2026-11-14 改】5 秒 → 2 秒。
     // 实测日志（/tmp/soak.log）6 次限速拦的全是正常社交回复：
     //   「天黑这么快」「来了啊」「看见你上来了」「玩不玩啊」，间隔 2196~4643ms。
     // 真人聊天间隔 2~4 秒是常态，5 秒的闸门把正常话全拦了，方向反了。
+    // 定 2000：2 秒间隔 = 20 秒 10 条，离服务器的 20 条/20 秒还有一半余量。
     this.sayGapMs = Talk.DEFAULTS.sayGapMs          // 常规：2.5 秒内最多 1 条
     this.fastSayGapMs = Talk.DEFAULTS.fastSayGapMs  // 被点名（话里带我的名字）时放宽到 1.2 秒
     // 硬窗口保持不变：Paper 的 spam 阈值是「20 秒内 20 条」（实测被踢前 20s 说了 21~27 条）。
@@ -190,6 +223,25 @@ class Talk {
     this.sayGapBlocked = 0        // 被限速拦下的条数（验收用）
     this.sayWindowBlocked = 0
     this.noiseBlocked = 0         // 被当成 prompt/指令丢掉的入站消息数
+
+    // ===== 反应层（两级回复）· 2026-11-14 =====
+    // 第一级：忙的时候 500ms 先垫一个短词；第二级：照常走模型。
+    // 垫话**不占发言闸**（sayGap / sayWindow 都不动）—— 它是"反应"，不是"说话"。
+    // 但另有一道更松的硬上限，防的是反应层自己变成刷屏（服务器阈值 20 条/20 秒）。
+    this.ackDelayMs = 500        // 垫话延迟：立刻发反而不像人在打字
+    this.ackRecoveryMs = 8000    // 垫了话，这么久没等到真回复就补一句
+    this.ackGapMs = 10000        // 10 秒内不重复垫
+    this.reactionWindowMs = 20000
+    this.reactionWindowMax = 6
+    this.ackWindow = []          // 反应层最近 20 秒发出去的时刻
+    this.lastAckAt = 0
+    this.recentAcks = []         // 最近垫过哪些词（避免连着重样）
+    this.ackSent = 0             // 垫过几句（验收用）
+    this.ackSkipped = 0          // 该垫但没垫的次数
+    this.ackRecovered = 0        // 补过几句收尾
+    this._ackTimer = null
+    this._ackRecoveryTimer = null
+    this._ackSentAt = 0
   }
 
   /**
@@ -320,6 +372,28 @@ class Talk {
     if (!text) return false
     let t = String(text).trim()
     if (!t) return false
+
+    // ===== 断线了就别再说 =====
+    //
+    // 【实测 · 2026-11-14】p8-final.log 22:08:04 被 disconnect.spam 踢掉，
+    // 之后 13 秒里 `[say]` 还在继续打日志、说了 20 多句（「早撤了 谁还搁那儿泡着」
+    // 「嗯 你走 我后头跟着」…）—— 这些一个字都发不出去（socketClosed），
+    // 但 lastSayAt / GLOBAL_SAY / lastSpokeAt 全被更新了。
+    //
+    // 后果有三层：
+    //   ① 白白消耗限速额度，重连后想说真话时闸门还卡着
+    //   ② 白花 LLM 调用（每句都是几秒钟的往返）
+    //   ③ 如果 mineflayer 在断线期间把消息攒着，重连后一次性倒出来 = 又一个 spam 循环
+    //
+    // 所以：没有实体（没连上/已断）直接拒，且**不更新任何状态**。
+    // 判定用 _client：真实 bot 一定有它，测试里的假 bot 没有（不能把假 bot 全拦了）。
+    // `_client.ended` 是断线，`!bot.entity` 是还没 spawn / 已经掉了。
+    try {
+      if (!this.bot) return false
+      const cli = this.bot._client
+      if (cli && cli.ended) return false
+      if (cli && !this.bot.entity) return false
+    } catch (e) { return false }
     if (t.length > 180) t = t.slice(0, 180)
 
     // ===== 发言限速（B 方案）=====
@@ -431,6 +505,8 @@ class Talk {
         this.trimSayWindows(this.lastSayAt)
       }
       this.ctx.log('[say] ' + t)
+      // 真话已经出去了：还没发的那句垫话就没意义了
+      this.cancelPendingAck()
       // 真的打出去了才记进 recentSaid（语气疲劳 + 复读拦截都靠它）
       this.recentSaid.push({ text: t, at: Date.now(), kind: detectSayKind(t) })
       if (this.recentSaid.length > 10) this.recentSaid.shift()
@@ -449,6 +525,137 @@ class Talk {
     const jitter = Math.random() * 800
     const d = Math.min(cfg.chatMaxDelay, Math.max(cfg.chatMinDelay, base + jitter))
     await sleep(d)
+  }
+
+  // ============================================================
+  // 反应层：两级回复（2026-11-14）
+  // ------------------------------------------------------------
+  //   收到消息 ──500ms──→ 短词（不占发言闸）
+  //        └──2~6 秒──→ 真回复（走模型，占闸）
+  //
+  // 只在"对方确实在问他/叫他 + 他手上正忙"的时候垫。
+  // 闲的时候模型本来就快，多垫一句就是多嘴。
+  // ============================================================
+
+  /**
+   * 该不该先垫一句。
+   * @returns {boolean}
+   */
+  needsAck (message, username, opts = {}) {
+    const m = String(message || '')
+    if (!m) return false
+    // 危险时不垫：那时候短句是另一套规则，血 4 还说"等下"会显得没在跑
+    const danger = opts.danger || 'ok'
+    if (danger !== 'ok') { this.ackSkipped++; return false }
+    // 只在**手上正忙**的时候垫（对方的等待才值得先给个回音）
+    const busy = !!(this.ctx.busy && this.ctx.busy())
+    if (!busy) { this.ackSkipped++; return false }
+    // 刚垫过就不垫：10 秒内不重复，否则每句都"等下"，立刻变敷衍机
+    if (this.lastAckAt && Date.now() - this.lastAckAt < this.ackGapMs) { this.ackSkipped++; return false }
+    // 一定得是在问他/叫他，纯聊天不垫（不然会变成到处插一句"嗯"）
+    const called = /(在不在|在吗|在么|来一下|过来|人呢)/.test(m) || m.includes(this.bot.username)
+    const question = /[?？]/.test(m) || /(吗|呢|么)[\s。.!！?？]*$/.test(m)
+    if (!called && !question) { this.ackSkipped++; return false }
+    return true
+  }
+
+  /**
+   * 挑一个短词。跟当前状态挂钩，不是固定台词。
+   * 优先级：忙 > 被叫 > 被问 —— 忙的时候"等下"比"咋了"有用，
+   * 对方一眼就知道你没死，只是在干活。
+   */
+  pickAck (message) {
+    const m = String(message || '')
+    const busy = !!(this.ctx.busy && this.ctx.busy())
+    const called = m.includes(this.bot.username) || /(在不在|在吗|在么|过来|来一下)/.test(m)
+    const question = /[?？]/.test(m) || /(吗|呢|么)[\s。.!！?？]*$/.test(m)
+    const pool = busy ? ACK_POOLS.busy : (called ? ACK_POOLS.called : (question ? ACK_POOLS.question : null))
+    if (!pool) return null
+    return pickVaried(pool, this.recentAcks)
+  }
+
+  /**
+   * 排一句垫话（500ms 后发）。
+   * 不 await：它必须跟模型请求并行，否则就白垫了。
+   */
+  scheduleAck (message, username, danger) {
+    if (this._ackTimer) return false
+    if (!this.needsAck(message, username, { danger })) return false
+    const text = this.pickAck(message)
+    if (!text) return false
+    const scheduledAt = Date.now()
+    this.ctx.log(`[ack] ${this.ackDelayMs}ms 后先垫一句：${text}`)
+    this._ackTimer = setTimeout(() => {
+      this._ackTimer = null
+      // 模型比 500ms 还快 —— 真话已经在公屏上了，再垫就是重复
+      if ((this.lastSpokeAt || 0) > scheduledAt) {
+        this.ctx.log('[ack 取消] 真回复抢先了')
+        return
+      }
+      this.sendReaction(text, 'ack')
+    }, this.ackDelayMs)
+    if (this._ackTimer.unref) this._ackTimer.unref()
+    return true
+  }
+
+  /**
+   * 发一条"反应"（垫话 / 补话）。
+   *
+   * 不占发言闸：sayGapMs / sayWindow 一个都不碰 —— 这是反应，不是说话。
+   * 但另有一道更松的硬上限（20 秒 6 条），防反应层自己变成刷屏。
+   * 也不动 lastSpokeAt：它不能算"我已经回过了"，否则模型那边会以为回完了。
+   */
+  sendReaction (text, kind = 'ack') {
+    let t = ''
+    try { t = cleanLine(String(text || ''), 30) } catch (e) { return false }
+    if (!t) return false
+    if (isInstructionLeak(t) || persona.isLeak(t) || persona.isMachineTalk(t) || isObsolete(t)) return false
+    const now = Date.now()
+    this.ackWindow = (this.ackWindow || []).filter(x => now - x < this.reactionWindowMs)
+    if (this.ackWindow.length >= this.reactionWindowMax) {
+      this.ctx.log(`[ack 跳过] 反应层 20 秒已发 ${this.ackWindow.length} 条`)
+      return false
+    }
+    try {
+      this.bot.chat(t)
+    } catch (e) { return false }
+    this.ackWindow.push(now)
+    this.lastAckAt = now
+    this.ackSent++
+    this.recentAcks.push(t)
+    if (this.recentAcks.length > 6) this.recentAcks.shift()
+    this.ctx.log(kind === 'recovery' ? `[ack 补话] ${t}（不占发言闸）` : `[ack] ${t}（不占发言闸）`)
+    if (kind === 'ack') {
+      this._ackSentAt = now
+      this.armAckRecovery()
+    }
+    return true
+  }
+
+  /**
+   * 垫了话之后的兜底：8 秒内没等到真回复，补一句收尾。
+   *
+   * 【为什么必须有】"等下"发出去、模型挂了，用户就只收到一个"等下"然后没了 ——
+   * 这比不垫更怪（像被无视）。补一句把话说圆。
+   */
+  armAckRecovery () {
+    if (this._ackRecoveryTimer) { clearTimeout(this._ackRecoveryTimer); this._ackRecoveryTimer = null }
+    this._ackRecoveryTimer = setTimeout(() => {
+      this._ackRecoveryTimer = null
+      // 垫话之后已经说过真话 → 不用补
+      if ((this.lastSpokeAt || 0) >= this._ackSentAt) return
+      const line = pickVaried(ACK_POOLS.recovery, this.recentAcks)
+      if (line && this.sendReaction(line, 'recovery')) this.ackRecovered++
+    }, this.ackRecoveryMs)
+    if (this._ackRecoveryTimer.unref) this._ackRecoveryTimer.unref()
+  }
+
+  /** 真回复抢先发出去时，取消还没发的垫话 */
+  cancelPendingAck (why) {
+    if (!this._ackTimer) return
+    clearTimeout(this._ackTimer)
+    this._ackTimer = null
+    this.ctx.log('[ack 取消] ' + (why || '真回复已发'))
   }
 
   /**
@@ -910,6 +1117,10 @@ ${item.who} 刚才说的是：${item.msg}
     // 危险等级决定这一句能有多长（提示词只是方向，代码里兜底）
     const danger = persona.dangerOf(stateLine).level
     this._danger = danger
+
+    // 两级回复第一级：手上忙 + 对方在问他 → 500ms 先垫一个短词，
+    // 别让人盯着空公屏等 6 秒。不 await，跟下面的模型请求并行。
+    this.scheduleAck(message, username, danger)
 
     const recalled = this.mem.remember(message, {
       people: [username],

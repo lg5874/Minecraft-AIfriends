@@ -813,6 +813,94 @@ console.log('\n[二十一、gather 进度用峰值：挖到就算、消耗不倒
 }
 
 // ================================================================
+console.log('\n[二十二、出生点没树：explore 要能当出口（不需要木镐）]')
+{
+  const g = new Goals(tmp(), { ctx: { log: () => {} } })
+  const st = (inv) => ({ pos: { x: 0, y: 70, z: 0 }, health: 20, food: 18, inventory: inv, time: '白天', underground: false })
+
+  // 没镐、没木头 -> explore 排第一（原来是 house 赢，然后卡在备料）
+  const cs = g.candidates(st({}))
+  ok(cs[0].key === 'explore', '没镐没木头 → explore 是第一', cs.slice(0, 3).map(c => c.key + '(' + c.score + ')').join(' '))
+
+  // 第一步是纯走路，不需要任何材料
+  const ex = Goals.POOL.find(x => x.key === 'explore')
+  ok(ex.stages[0].kind === 'travel' && Number(ex.stages[0].need.distance) >= 64,
+    'explore 第一步是走路（不烧火把、不砍树）', JSON.stringify(ex.stages[0]))
+
+  // 走路阶段的进度只看位移
+  const walk = { kind: 'travel', need: { distance: 80 }, base: { pos: { x: 0, y: 70, z: 0 } } }
+  const p = Goals.stageProgress(walk, { pos: { x: 40, y: 70, z: 0 } })
+  ok(Math.abs(p.ratio - 0.5) < 1e-9, '走出去 40/80 格 → ratio=0.5（不用工具）', p.ratio.toFixed(3))
+
+  // 有木镐、有木头之后，explore 不该再被硬抬
+  const cs2 = g.candidates(st({ wooden_pickaxe: 1, oak_log: 8 }))
+  ok(cs2[0].key !== 'explore', '有镐有木头后，explore 不再排第一', cs2[0].key + '(' + cs2[0].score + ')')
+}
+
+// ================================================================
+console.log('\n[二十三、卡死看门狗 + 连续挖不动 → 强制 explore]')
+{
+  const mkGoal = (t, actions, over = {}) => {
+    const stage = Object.assign({
+      kind: 'gather', title: '攒石头', need: { '#surfacestone': 8 },
+      base: { inv: {}, peak: {} }, startedAt: t - 120000, evidence: 'world',
+      ratio: 0.2, best: 0.2, attempts: 0, fails: 0
+    }, over.stage || {})
+    const g = new Goals(tmp(), { now: () => t, ctx: { log: () => {}, actions } })
+    g.goal = Object.assign({
+      key: 'house', title: '盖房', why: 'x', createdAt: t - 180000,
+      createdY: 70, createdUnderground: false, stageIndex: 0, stages: [stage],
+      attempts: 0, fails: 0, lastProgressAt: t - 60000, journal: [], done: false
+    }, over.goal || {})
+    g._watchPos = { x: 0, y: 70, z: 0 }
+    g._watchMoveAt = t - 60000
+    return g
+  }
+  const st = (x = 0) => ({ pos: { x, y: 70, z: 0 }, health: 20, food: 20, inventory: {}, time: '白天', underground: false })
+
+  // 30 秒没动作、没位移 -> 放弃 + 打断任务
+  {
+    const t = 5000000
+    const actions = { _lastLogAt: t - 60000, cancel: false }
+    const g = mkGoal(t, actions)
+    const r = g.observe(st(0))
+    ok(r.stuck === true && g.goal === null, '30 秒没动作没位移 → 目标放弃（记卡死）', JSON.stringify(r))
+    ok(actions.cancel === true, '同时打断正在跑的任务（不会一直占着 busy）')
+    const h = g.history[g.history.length - 1]
+    ok(h && /卡死/.test(h.reason || ''), 'history 里记了一次卡死', h && h.reason)
+  }
+
+  // 有动作日志 -> 不误杀
+  {
+    const t = 6000000
+    const actions = { _lastLogAt: t - 3000, cancel: false }
+    const g = mkGoal(t, actions)
+    const r = g.observe(st(0))
+    ok(r.stuck !== true && g.goal, '3 秒前刚有动作 → 不判卡死', String(r.stuck))
+  }
+
+  // 有位移 -> 不误杀（走路可能不刷日志）
+  {
+    const t = 7000000
+    const actions = { _lastLogAt: t - 60000, cancel: false }
+    const g = mkGoal(t, actions)
+    const r = g.observe(st(3))
+    ok(r.stuck !== true && g.goal, '30 秒没日志但有 3 格位移 → 不判卡死', String(r.stuck))
+  }
+
+  // actions 连续 3 次挖不动 -> explore 顶上来（冷却中也放行）
+  {
+    const t = 8000000
+    const actions = { _lastLogAt: t, cancel: false, _forceExploreUntil: t + 60000 }
+    const g = new Goals(tmp(), { now: () => t, ctx: { log: () => {}, actions } })
+    g.cooldown.explore = t + 300000
+    const cs = g.candidates({ pos: { x: 0, y: 70, z: 0 }, health: 20, food: 18, inventory: {}, time: '白天', underground: false })
+    ok(cs[0] && cs[0].key === 'explore', 'forceExplore 标记 → explore 排第一（冷却中也放行）',
+      cs.slice(0, 3).map(c => c.key + '(' + c.score + ')').join(' '))
+  }
+}
+
+// ================================================================
 }
 
 main().then(() => {

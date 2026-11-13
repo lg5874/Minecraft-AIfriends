@@ -51,15 +51,38 @@ const DEFAULTS = {
   inviteHardCap: 5,           // 同一个人 5 分钟内最多接 5 次（原来 2 次就拒）
   busyProgress: 0.5,          // 任务进度过半 = "手上有活"，这时才延后
   followThruMs: 60e3,         // 答应了"等我把这块弄完"最多多久，到点主动过去
-  lowHp: 8,                   // 血 ≤ 8：唯一合理的"先回家"
+  lowHp: 8,                   // 血 ≤ 8：先说"我快不行了"，缓过来再过去
   lowFood: 6,                 // 饿得只剩这点渣：别再跟着跑远了
+  recoverHp: 12,              // 血回到这个数就算"缓过来了"
+  recoverMaxMs: 90e3,         // 再怎么缓，90 秒后也得给个交代（过去或再说一句）
   tickMs: 1000,
   shoutGapMs: 15000,       // 喊"等等"的间隔
   chatGapMs: 8000          // 主动搭话的间隔
 }
 
-/** 邀请（"跟我来"这一类） */
-const INVITE_RE = /跟我来|跟我走|跟我去|跟上|跟着我|跟紧|过来|来这里|到这来|来这边|来我这|一起(挖|去|走|打|玩|逛)|带我(去|走)|陪我(去|走|逛)|^走啊|下来|上来|come\s*(here|on|with)|follow\s*me|let'?s\s*go|with\s*me/i
+/**
+ * 邀请（"跟我来"这一类）。
+ *
+ * 【2026-11-14 收窄】原来 `上来|下来|过来` 是裸词，实机踩到：
+ * 别的 bot 说一句「XJJ_VOICE30126 刚上来啊」，他当成邀请跟着走了。
+ * 用户明天随口一句「我刚上来了」也会触发跟随 —— 误触发比没反应更怪。
+ *
+ * 现在 `过来/上来` 要求前面**不是**「我/刚/才/已」这类"叙述自己动作"的字，
+ * `下来` 整条去掉（"下来"当邀请的说法太少，当叙述的太多）。
+ * 「你上来 / 快过来 / 过来」照样认，「我刚过来了 / 他刚上来」不认。
+ */
+const INVITE_RE = new RegExp([
+  '跟我(来|走|去)',
+  '跟上', '跟着我', '跟紧',
+  '(?<![我刚才已正])过来',
+  '(?<![我刚才已正])上来',
+  '来这里', '到这来', '来这边', '来我这',
+  '一起(挖|去|走|打|玩|逛)',
+  '带我(去|走)',
+  '陪我(去|走|逛)',
+  '^走啊',
+  'come\\s*(here|on|with)', 'follow\\s*me', "let'?s\\s*go", 'with\\s*me'
+].join('|'), 'i')
 /** 不要跟了 */
 const STOP_RE = /别跟了|不用跟|不要跟|自己玩|别过来了|停吧|散了|站住|算了别|stop\s*follow|go\s*away|leave\s*me/i
 
@@ -81,6 +104,8 @@ class Invite {
     this._lastInviteAt = {}
     this._inviteStreak = {}
     this._pendingFollow = null   // {user, at}：答应了"等我把这块弄完"还没过去
+    this._pendingRecover = null  // {user, at}：血见底说了"先缓一下"，缓过来要去找他
+    this._everAccepted = false   // 这次上线还没答应过谁（第 1 声无条件答应，attach 时重置）
     this._askedAt = 0
     this._bot = null
     this._timer = null
@@ -106,6 +131,8 @@ class Invite {
       refused: 0,
       deferred: 0,            // 手上有活："等我把这块弄完就来"
       followThru: 0,          // 说完了真的过去了
+      firstCall: 0,           // 这次上线的第 1 声（无条件答应）
+      recover: 0,             // 血见底："先缓一下"，后来真的过去了
       stops: 0,
       shouts: 0,
       lines: 0,
@@ -125,6 +152,9 @@ class Invite {
 
   attach (bot) {
     if (!bot || this._bot === bot) return this
+    this._everAccepted = false      // 新的一次上线 = 新的一次"第 1 声"
+    this._pendingFollow = null
+    this._pendingRecover = null
     this._bot = bot
     if (this._timer) clearInterval(this._timer)
     this._timer = setInterval(() => { this.tick().catch(() => {}) }, this.opts.tickMs)
@@ -159,6 +189,11 @@ class Invite {
       if (this._pendingFollow && this._pendingFollow.user === username) {
         this._pendingFollow = null
         this.log(`[invite] ${username} 说别来了，那个"等会儿过去"撤掉`)
+        return 'stop'
+      }
+      if (this._pendingRecover && this._pendingRecover.user === username) {
+        this._pendingRecover = null
+        this.log(`[invite] ${username} 说别来了，"缓过来去找你"也撤掉`)
         return 'stop'
       }
     }
@@ -203,16 +238,47 @@ class Invite {
     }
     this._lastInviteAt[username] = now
 
-    // ===== 真正的判据：状态条件，不是配置表，也不是概率 =====
+    // 已经在跟这个人：他再喊一声，就当作"我在呢"，不重新判定
+    if (this.active && this.target === username) {
+      this._lastSeen = now
+      return 'invite'
+    }
+    // 说了"等我把这块弄完"之后他又喊：别让他等第二次，立刻过去
+    if (this._pendingFollow && this._pendingFollow.user === username) {
+      this._pendingFollow = null
+      this.start(username, msg)
+      return 'invite'
+    }
+
+    // ===== 第 1 声：无条件答应 =====
+    //
+    // 【Lead 拍板 · 2026-11-14】用户进游戏第一件事大概率是「XJJ 过来」，
+    // 这一声决定他是不是"能一起玩"。所以**这次上线第一次被叫，不看进度、
+    // 不看血、不看任何条件**，直接答应 —— 调阈值（0.5→0.85）只是把问题推后，
+    // 用户试到第三次照样撞上。
+    // 重置点：attach()（每次上线/重连都会重新 attach 一个新 bot）。
+    if (!this._everAccepted) {
+      this._everAccepted = true
+      this.stats.firstCall = (this.stats.firstCall || 0) + 1
+      this._ev({ what: 'firstCall', who: username })
+      this.start(username, msg)
+      return 'invite'
+    }
+
+    // ===== 第 2 声起：状态条件（不是配置表，也不是概率）=====
     const v = this._vitals()
 
-    // 1) 血真的见底了：唯一合理的"先别跟"，而且要说出来
+    // 1) 血真的见底了：说「我快不行了」，然后**真的缓过来再回去找他**
+    //    （原来这里 return null 就完了 —— 用户听到"我得先回家"然后人没了，
+    //     观感是"他跑了"。Lead 的口径：说出来的话要有下文。）
     if (v.health != null && v.health <= this.opts.lowHp) {
       this.stats.refused++
-      this._ev({ what: 'refuse', why: 'lowhp', who: username, hp: +v.health.toFixed(1) })
-      this._say(`你被 ${username} 叫过去，但血只剩 ${Math.round(v.health)}，得先回家养着。` +
-        '把这事说清楚——不是不来，是现在出去会白送一条命', { force: true, people: [username] })
-      this.log(`[invite] 血 ${Math.round(v.health)}，先回家（${username} 叫的）`)
+      this._ev({ what: 'recover', why: 'lowhp', who: username, hp: +v.health.toFixed(1) })
+      this._pendingRecover = { user: username, at: now }
+      this._say(`你被 ${username} 叫过去，但血只剩 ${Math.round(v.health)}，` +
+        '现在出去就是白送一条命。跟他说一声：我快不行了，先缓一下，缓过来就去找你',
+      { force: true, people: [username] })
+      this.log(`[invite] 血 ${Math.round(v.health)}，先缓一下（${username} 叫的），缓过来会主动过去`)
       return null
     }
 
@@ -295,6 +361,48 @@ class Invite {
       line: `你刚才跟 ${p.user} 说"等我把这块弄完就来"，现在活告一段落了。` +
         '主动说一句你来了（要带他名字），然后跟上去'
     })
+  }
+
+  /**
+   * 「我快不行了，先缓一下，缓过来就去找你」之后，真的回去找。
+   *
+   * 【为什么必须有这个方法】原来血 ≤8 只 return null 就完了 ——
+   * 话说出口，人没了。用户听到的是"他跑了"，不是"他待会儿来"。
+   * 现在这里等血回到 recoverHp 以上（或者等满 recoverMaxMs 到极限），
+   * 就主动 start() 过去。跟「等我把这块弄完」是同一个模式：说出来的话有下文。
+   *
+   * 【为什么不看 busy】血少本来就该先养，忙不忙不该拦着这条承诺。
+   */
+  _tickPendingRecover () {
+    const r = this._pendingRecover
+    if (!r) return
+    const bot = this._bot
+    if (!bot || !bot.entity) return
+    if (!bot.players[r.user]) { this._pendingRecover = null; return }   // 人走了
+    const v = this._vitals()
+    const waited = this._now() - r.at
+
+    // 血缓过来了：去找他
+    if (v.health != null && v.health > this.opts.recoverHp) {
+      this._pendingRecover = null
+      this.stats.recover = (this.stats.recover || 0) + 1
+      this._ev({ what: 'recoverDone', who: r.user, waitedMs: waited, hp: +v.health.toFixed(1) })
+      this.log(`[invite] 血回到 ${Math.round(v.health)}（等了 ${Math.round(waited / 1000)} 秒），去找 ${r.user}`)
+      this.start(r.user, '缓过来了', {
+        line: `你刚才跟 ${r.user} 说"先缓一下，缓过来就去找你"，现在血回来了。` +
+          '主动说一句你来了（要带他名字），然后跟上去'
+      })
+      return
+    }
+
+    // 到极限还没缓过来：也别把人吊着，给个交代（这句不硬说，免得变成抱怨）
+    if (waited >= this.opts.recoverMaxMs) {
+      this._pendingRecover = null
+      this._ev({ what: 'recoverGiveUp', who: r.user, waitedMs: waited })
+      this.log(`[invite] ${Math.round(waited / 1000)} 秒血还没回来，${r.user} 那边先不承诺了`)
+      this._say(`你还没缓过来（血 ${v.health == null ? '很少' : Math.round(v.health)}），` +
+        `${r.user} 还在等你。说一句实话：这会儿过去就是送死，让他别等我`, { people: [r.user] })
+    }
   }
 
   /**
@@ -441,7 +549,11 @@ class Invite {
 
   async tick () {
     // 没在跟人的时候也要看一眼："等我把这块弄完就来"的那种约定到点了没有
-    if (!this.active) { this._tickPendingFollow(); return }
+    if (!this.active) {
+      this._tickPendingRecover()    // "我快不行了…缓过来就去找你"这条也得有下文
+      this._tickPendingFollow()
+      return
+    }
     const bot = this._bot
     if (!bot || !bot.entity || !bot.entity.position) return
     if (this._tickBusy) return
@@ -620,6 +732,11 @@ class Invite {
       target: this.target,
       invites: this.stats.invites,
       accepted: this.stats.accepted,
+      refused: this.stats.refused,
+      deferred: this.stats.deferred || 0,
+      followThru: this.stats.followThru || 0,
+      firstCall: this.stats.firstCall || 0,
+      recover: this.stats.recover || 0,
       stops: this.stats.stops,
       lines: this.stats.lines,
       shouts: this.stats.shouts,

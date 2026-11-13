@@ -78,7 +78,7 @@ async function main () {
     ok(inv.stats.stops >= 1, `记了一次结束（stops=${inv.stats.stops}）`)
   }
 
-  console.log('\n[2] 同一个人 5 分钟内反复邀请')
+  console.log('\n[2] 同一个人 5 分钟内反复邀请（2026-11-14 改判据：不再按次数拒绝）')
   {
     const { inv } = makeInvite()
     const results = []
@@ -91,8 +91,14 @@ async function main () {
     }
     console.log('    4 次邀请结果：' + results.join(' '))
     const accepted = results.filter(r => r === '接').length
-    ok(accepted <= 2, `2 分钟内被叫 4 次，最多接 2 次（实际 ${accepted}）`)
-    ok(results[2] === '不接' || results[3] === '不接', '第 3/4 次里至少有一次被挡')
+    // 新口径：1 个真人喊你，前几次必须全接；只有超过很宽的后台上限（5 次）才挡
+    ok(accepted === 4, `2 分钟内被叫 4 次，全部接（实际 ${accepted}）`)
+    ok(results[2] === '接', '第 3 次照样接（旧逻辑在这里就拒了）')
+
+    // 一个人短时间死命叫，超过上限才挡
+    let cap = 0
+    for (let i = 0; i < 6; i++) { if (inv.handleChat('老王', '跟我来') === 'invite') cap++; if (inv.active) inv.stop('detach', { quiet: true }); NOW += 1000 }
+    ok(cap < 6, `叫到第 6 次以后有上限兜底（6 次里接了 ${cap} 次）`)
 
     // 过了冷却，又能接
     NOW += 5 * 60e3 + 1000

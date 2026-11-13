@@ -4,12 +4,14 @@
 
 const { goals } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
+const damage = require('./damage')
 
 const HOSTILE = new Set([
-  'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'enderman',
-  'witch', 'drowned', 'husk', 'stray', 'pillager', 'vindicator', 'ravager',
-  'phantom', 'slime', 'magma_cube', 'blaze', 'ghast', 'piglin_brute',
-  'zoglin', 'hoglin', 'warden', 'silverfish', 'vex', 'evoker'
+  'zombie', 'zombie_villager', 'skeleton', 'creeper', 'spider', 'cave_spider',
+  'enderman', 'witch', 'drowned', 'husk', 'stray', 'bogged', 'pillager',
+  'vindicator', 'ravager', 'phantom', 'slime', 'magma_cube', 'blaze', 'ghast',
+  'piglin_brute', 'zoglin', 'hoglin', 'warden', 'silverfish', 'vex', 'evoker',
+  'breeze', 'creaking', 'guardian', 'elder_guardian', 'shulker', 'zombified_piglin'
 ])
 
 class Reflex {
@@ -29,19 +31,187 @@ class Reflex {
     this.SOS_HP = 6
     this.sosUntil = 0
     this.sosKind = ''
+
+    // ===== 战斗分档（2026-11-14） =====
+    //
+    // 【为什么不是"把 8 改成 14"就完事】
+    // 实测掉血是 2 秒 5 血：20 -> 15 -> 10 -> 5 -> 0 一共 8 秒。
+    // 就算阈值抬到 14，从 20 掉到 14 也只多给 1.2 秒 —— 阈值这条路救不了命。
+    // 真正的问题是他**不知道自己在挨打**：sourceTypeId 解析不出来，
+    // 日志写"环境伤害 未知"，于是反射层选不出应对（跑？跳？退？），干脆什么都不做。
+    //
+    // 所以主触发是**掉血速率**（见 sampleHealth / recoil），
+    // 分档只是"已经知道危险之后再做什么"。
+    this.HP_ALERT = 14   // 有敌对/正在挨打 -> 拉开距离
+    this.HP_FLEE = 10    // 血 <= 10 -> 真跑
+    this.HP_PANIC = 8    // 血 <= 8  -> 跑 + 吃
+    this.HP_CRIT = 5     // 血 <= 5  -> 跑 + 吃 + 不接新任务
+
+    this.hpTrace = []       // 最近几秒的血量采样 {t, hp}
+    this.lastHp = null
+    this.lastRecoilAt = 0
+    this.lastKeepDistAt = 0
+    this.lastThreatLogAt = 0
+    this.lastThreatLog = -1
+    this.panicUntil = 0     // 这段时间内不接新任务（血 <= 5）
+    this.attackUntil = 0    // 这段时间内算"正在挨打"
+    this.lastDamage = null  // { at, id, name, cat, attack, causeId, directId, pos }
+    this._healthBound = null
   }
 
   start () {
     this.timer = setInterval(() => this.tick(), 800)
+    // 掉血最快、最准的信号不是 tick（每 800ms），是服务端的 health 包：
+    // 每挨一下必推一个，几乎和伤害同帧到。挂上它，掉血速率才来得及反应。
+    try {
+      this._healthBound = () => this.sampleHealth()
+      this.bot.on('health', this._healthBound)
+    } catch (e) {}
   }
 
-  stop () { if (this.timer) clearInterval(this.timer) }
+  stop () {
+    if (this.timer) clearInterval(this.timer)
+    try { if (this._healthBound) this.bot.removeListener('health', this._healthBound) } catch (e) {}
+    this._healthBound = null
+  }
 
   reset () {
     this.hitLog = []
     this.stuckSince = 0
     this.lastPos = null
     this.eating = false
+    this.hpTrace = []
+    this.lastHp = null
+    this.panicUntil = 0
+    this.attackUntil = 0
+    this.lastDamage = null
+  }
+
+  // ==================== 掉血速率（核心触发） ====================
+
+  /** 位置快照：Vec3 用 clone，普通 {x,y,z} 原样拷（单测里是普通对象） */
+  _pos (p) {
+    if (!p) return null
+    try { if (typeof p.clone === 'function') return p.clone() } catch (e) {}
+    return { x: p.x, y: p.y, z: p.z }
+  }
+
+  /** 两点距离，兼容 Vec3 和普通 {x,y,z}（单测里是普通对象） */
+  dist (a, b) {
+    if (!a || !b) return Infinity
+    const dx = (a.x || 0) - (b.x || 0)
+    const dy = (a.y || 0) - (b.y || 0)
+    const dz = (a.z || 0) - (b.z || 0)
+    return Math.sqrt(dx * dx + dy * dy + dz * dz)
+  }
+
+  /** 最近 windowMs 内掉了多少血（窗口内最高血 - 现在） */
+  recentDrop (windowMs = 3000) {
+    const now = Date.now()
+    const hp = this.bot.health
+    if (typeof hp !== 'number' || !isFinite(hp)) return 0
+    let max = hp
+    for (const s of this.hpTrace) {
+      if (now - s.t <= windowMs && s.hp > max) max = s.hp
+    }
+    return Math.max(0, max - hp)
+  }
+
+  /**
+   * 采一次血量，算掉血速率。
+   *
+   * 【这条是主触发，不看血绝对值、不看来源】
+   * 真人被烫会立刻弹开，不会先搞清那是岩浆还是火；
+   * 被怪打也一样 —— 只要 3 秒内掉了 4 血，先退开 2 格再说。
+   * 这样即使 sourceTypeId 解析不出来（"环境伤害 未知"），也已经动了。
+   */
+  sampleHealth () {
+    const bot = this.bot
+    const hp = bot && bot.health
+    if (typeof hp !== 'number' || !isFinite(hp) || hp <= 0) return
+    const now = Date.now()
+
+    this.hpTrace.push({ t: now, hp })
+    if (this.hpTrace.length > 64) this.hpTrace = this.hpTrace.slice(-64)
+    this.hpTrace = this.hpTrace.filter(s => now - s.t <= 8000)
+
+    // 掉血 -> 立刻记成"正在挨打"，这是最可靠的信号
+    const drop = this.recentDrop(3000)
+    if (drop >= 4) {
+      this.attackUntil = now + 4000
+      this.recoil(drop, { hp })
+    }
+    if (this.lastHp != null && hp < this.lastHp - 0.01) this.attackUntil = Math.max(this.attackUntil, now + 4000)
+    this.lastHp = hp
+  }
+
+  /**
+   * 立刻弹开：后退 + 跳一下。
+   *
+   * 不用 pathfinder —— 任务可能正在用寻路，设 goal 会把它打断（"Digging aborted"
+   * 那一堆事故就是这么来的）。控制键脉冲只持续 0.4 秒，代价小、见效快，
+   * 而且"退不动"的时候至少跳一下，能脱离岩浆/营火/浆果丛这种持续伤害。
+   */
+  recoil (drop, opts = {}) {
+    const now = Date.now()
+    if (now - this.lastRecoilAt < 900) return
+    this.lastRecoilAt = now
+    const bot = this.bot
+
+    // 往哪个方向退：优先最近一次伤害的来源点，其次最近的敌对生物
+    let origin = null
+    try { origin = this.attackOrigin() } catch (e) {}
+
+    try {
+      const p = bot.entity && bot.entity.position
+      if (p && origin) {
+        // 背对来源（这样"后退"真的是远离，而不是往枪口上撞）
+        const yaw = Math.atan2(p.x - origin.x, p.z - origin.z)
+        try { bot.look(yaw, 0, true) } catch (e) {}
+      }
+      bot.setControlState('back', true)
+      setTimeout(() => { try { bot.setControlState('back', false) } catch (e) {} }, 420)
+      bot.setControlState('jump', true)
+      setTimeout(() => { try { bot.setControlState('jump', false) } catch (e) {} }, 260)
+    } catch (e) {}
+
+    const why = this.lastDamage && now - this.lastDamage.at < 4000
+      ? `被 ${this.lastDamage.name}`
+      : '来源不明'
+    const from = this.lastHpText(opts.hp, drop)
+    this.logThrottled(`[reflex] 掉血 ${drop.toFixed(0)}（${from}，3 秒内）—— ${why}，先退开 2 格 + 跳一下`, 3000)
+  }
+
+  lastHpText (hp, drop) {
+    if (typeof hp !== 'number') return '?'
+    return `${Math.round(hp + drop)}→${Math.round(hp)}`
+  }
+
+  /** 最近一次伤害的来源位置：真实体 -> 位置 -> 最近敌对 -> null */
+  attackOrigin () {
+    const now = Date.now()
+    const d = this.lastDamage
+    if (d && now - d.at < 5000) {
+      if (d.pos && typeof d.pos.x === 'number') return d.pos
+      const ent = d.causeId ? this.bot.entities[d.causeId] : null
+      if (ent && ent.position) return ent.position
+    }
+    const near = this.nearestHostile(12)
+    return near ? near.position : null
+  }
+
+  logThrottled (msg, gapMs) {
+    const now = Date.now()
+    this._logAt = this._logAt || {}
+    const key = msg.slice(0, 24)
+    if (now - (this._logAt[key] || 0) < (gapMs || 5000)) return
+    this._logAt[key] = now
+    try { this.ctx.log(msg) } catch (e) {}
+  }
+
+  /** 血 <= 5：跑到安全为止，并且这段时间不接新任务 */
+  blocksNewTasks () {
+    return Date.now() < this.panicUntil
   }
 
   // 被打：记录，并判断要不要还手
@@ -160,67 +330,215 @@ class Reflex {
    * 线上那次从血 6 掉到 2 死掉，就是因为伤害来自环境、没有 attacker。
    * 现在环境伤害也要走救命逻辑。
    */
-  onHurt (attacker, health, kind) {
+  onHurt (attacker, health, kind, meta = {}) {
     const now = Date.now()
     const hp = typeof health === 'number' ? health : this.bot.health
 
-    if (!attacker) {
-      // 环境伤害：不记恩怨，但**必须救命**
-      this.ctx.log(`[hurt] 环境伤害 ${kind || '未知'}，血 ${Math.round(hp)}`)
+    // ---- 先把"这一下是什么"记下来（哪怕解析不出来也要有记录） ----
+    const info = meta && meta.id != null ? damage.infoOf(meta.id) : null
+    const name = (info && info.name) || kind || 'unknown'
+    const isAttack = meta && meta.attack != null
+      ? !!meta.attack
+      : (info ? info.attack : !!(attacker && attacker.type))
+    const by = (attacker && (attacker.username || attacker.name)) || meta.by || null
+
+    this.lastDamage = {
+      at: now,
+      id: meta && meta.id != null ? meta.id : null,
+      name,
+      cat: (info && info.cat) || (isAttack ? 'mob' : 'env'),
+      attack: isAttack,
+      by,
+      causeId: meta.causeId || 0,
+      directId: meta.directId || 0,
+      pos: meta.pos || (attacker && attacker.position) || null
+    }
+
+    // 不管是什么伤害，先按"掉血速率"过一遍：3 秒掉 4 血就弹开
+    try { this.sampleHealth() } catch (e) {}
+    if (isAttack) {
+      this.attackUntil = now + 6000
+      // 单次挨打（一下 5 血也可能只掉一次）也要有动作
+      if (this.recentDrop(3000) < 4) this.recoil(Math.max(2, this.recentDrop(3000)), { hp })
+    }
+
+    if (!attacker || !attacker.username || attacker.username === this.bot.username) {
+      // ---- 环境伤害 / 看不见来源：不记恩怨，但**必须救命** ----
+      const cn = (info && info.cn) || kind || '未知'
+      const idTxt = meta && meta.id != null ? `${name}/${meta.id}` : String(name)
+      this.logThrottled(`[hurt] ${isAttack ? '被攻击' : '环境伤害'} ${cn}（${idTxt}），血 ${Math.round(hp)}`, 1200)
+
       // 【按威胁类型，不只是按血量】快淹死/岩浆/着火，血 7~10 一样得先离开。
       // 血 10 还在水里往下挖，下一口水就没了；摔伤/饿这种已经发生过的不用停手。
       const LETHAL = kind === 'drown' || kind === 'lava' || kind === 'on_fire' ||
-        kind === 'in_fire' || kind === 'suffocate' || kind === 'out_of_world'
+        kind === 'in_fire' || kind === 'suffocate' || kind === 'out_of_world' ||
+        !!(info && info.continuous)
       if (hp <= this.SOS_HP || (LETHAL && hp <= 10)) {
         // 环境伤害（溺水/岩浆）等不起节流窗口，直接 urgent
-        this.sos(kind, { urgent: true })
+        this.sos(LETHAL ? (kind || name) : (name || kind), { urgent: true })
       }
+
+      // 分档（不管能不能解析来源，只要有威胁就按血量走）
+      this.reactByTier(hp, { near: this.nearestHostile(9), underAttack: isAttack || this.recentDrop(3000) >= 4 })
       return
     }
+
     if (attacker.username && attacker.username !== this.bot.username) {
-      this.hitLog.push({ t: now, by: attacker.username })
-      this.hitLog = this.hitLog.filter(h => now - h.t < 10 * 60 * 1000)
-      this.ctx.mem.hit(attacker.username, 1)
-      const hs = this.ctx.mem.hitStats(attacker.username)
-      this.ctx.log(`[hurt] by=${attacker.username} 累计=${hs.times}`)
+      const isPlayer = !(attacker.type === 'mob' || attacker.type === 'hostile')
+      if (isPlayer) {
+        this.hitLog.push({ t: now, by: attacker.username })
+        this.hitLog = this.hitLog.filter(h => now - h.t < 10 * 60 * 1000)
+        this.ctx.mem.hit(attacker.username, 1)
+        const hs = this.ctx.mem.hitStats(attacker.username)
+        this.ctx.log(`[hurt] by=${attacker.username} 累计=${hs.times}`)
 
-      // 是怪就先打回去
-      const isMob = attacker.type === 'mob' || attacker.type === 'hostile'
-      if (isMob) { this.retaliate(attacker); return }
-
-      // 头一两次懵，不还手
-      if (hs.times <= 2) {
-        this.ctx.onEvent && this.ctx.onEvent('hurt_confused', { by: attacker.username, times: hs.times })
+        // 头一两次懵，不还手
+        if (hs.times <= 2) {
+          this.ctx.onEvent && this.ctx.onEvent('hurt_confused', { by: attacker.username, times: hs.times })
+        } else {
+          // 反复挨打 -> 还手或者跑
+          this.ctx.onEvent && this.ctx.onEvent('hurt_repeat', { by: attacker.username, times: hs.times })
+          if (this.canRetaliate()) this.retaliate(attacker)
+          else this.flee(attacker)
+        }
       } else {
-        // 反复挨打 -> 还手或者跑
-        this.ctx.onEvent && this.ctx.onEvent('hurt_repeat', { by: attacker.username, times: hs.times })
-        const hp = this.bot.health
-        if (hp < 8) { this.flee(attacker); } else { this.retaliate(attacker) }
+        // 怪打的：血够才反打，否则跑（"他会跑"比"他会反击"重要）
+        if (this.canRetaliate()) this.retaliate(attacker)
+        else this.flee(attacker)
       }
+      this.reactByTier(hp, { near: attacker, underAttack: true })
     }
   }
+
+  /**
+   * 按血量分档反应。
+   *
+   *   血 <= 14 且附近有敌对（或正在挨打） -> 拉开距离（不是拼命跑）
+   *   血 <= 10 -> 真跑
+   *   血 <= 8  -> 跑 + 吃
+   *   血 <= 5  -> 跑 + 吃 + 不接新任务
+   *
+   * 返回档位，调用方可以用它决定要不要 return。
+   */
+  threatLevel (hp, opts = {}) {
+    if (typeof hp !== 'number' || !isFinite(hp) || hp <= 0) return 0
+    if (hp <= this.HP_CRIT) return 4
+    if (hp <= this.HP_PANIC) return 3
+    if (hp <= this.HP_FLEE) return 2
+    if (hp <= this.HP_ALERT && (opts.near || opts.underAttack)) return 1
+    return 0
+  }
+
+  reactByTier (hp, opts = {}) {
+    const lvl = this.threatLevel(hp, opts)
+    if (lvl < 1) return 0
+    const now = Date.now()
+    const threat = opts.near || null
+    const from = (threat && threat.position) ? threat : this.attackOrigin()
+
+    if (lvl >= 4) {
+      this.panicUntil = now + 20000
+      this.flee(from)
+      try { this.eatNow() } catch (e) {}
+    } else if (lvl === 3) {
+      if (opts.underAttack || threat) this.flee(from)
+      try { this.eatNow() } catch (e) {}
+    } else if (lvl === 2) {
+      if (opts.underAttack || threat) this.flee(from)
+      else try { this.eatNow() } catch (e) {}
+    } else if (lvl === 1) {
+      this.keepDistance(threat)
+    }
+
+    // 换档才打日志（20 秒一次心跳），别把日志刷满
+    if (lvl !== this.lastThreatLog || now - this.lastThreatLogAt > 20000) {
+      this.lastThreatLog = lvl
+      this.lastThreatLogAt = now
+      const what = lvl === 4 ? '跑 + 吃东西 + 不接新任务'
+        : lvl === 3 ? '跑 + 吃东西'
+          : lvl === 2 ? '跑' : '拉开距离'
+      this.ctx.log(`[reflex] 血 ${Math.round(hp)}（${lvl} 档）—— ${what}`)
+    }
+    return lvl
+  }
+
+  /**
+   * 4 档（血 <= 5）：跑 + 吃 + **这段时间不接新任务**。
+   * 阈值由 blocksNewTasks() 暴露给 main.js 的主循环 —— 血 5 的时候
+   * 再起一个"去挖矿"的任务，等于让他走去死。
+   */
+  panic (hp) {
+    const now = Date.now()
+    this.panicUntil = now + 20000
+    try { this.flee(this.attackOrigin()) } catch (e) {}
+    try { this.eatNow() } catch (e) {}
+    this.logThrottled(`[reflex] 血 ${Math.round(hp)} <= ${this.HP_CRIT}：跑 + 吃东西 + 不接新任务`, 10000)
+  }
+
+  /** 1 档：只是拉开距离，不拼命跑（血还够，别把任务全扔了） */
+  keepDistance (from) {
+    const now = Date.now()
+    if (now - this.lastKeepDistAt < 2500) return
+    this.lastKeepDistAt = now
+    try {
+      const bot = this.bot
+      const p = bot.entity && bot.entity.position
+      if (!p) return
+      const d = from && from.position ? from.position : from
+      const gap = d ? this.dist(p, d) : 99
+      if (gap > 10) return                 // 本来就够远
+      const base = d
+        ? new Vec3(p.x + (p.x - d.x), p.y, p.z + (p.z - d.z))
+        : new Vec3(p.x + (Math.random() - 0.5) * 12, p.y, p.z + (Math.random() - 0.5) * 12)
+      const t = base.offset(0, 0, 0)
+      bot.pathfinder.setGoal(new goals.GoalNear(Math.floor(t.x), Math.floor(p.y), Math.floor(t.z), 2))
+      if (!this._keepLogged || now - this._keepLogged > 8000) {
+        this._keepLogged = now
+        this.ctx.log(`[reflex] 身边有怪（${Math.round(gap)} 格），先拉开点距离`)
+      }
+    } catch (e) {}
+  }
+
+  /** 反打的门槛：血够（> 14）而且怪不多（<= 2 个） */
+  canRetaliate () {
+    if (this.ctx && this.ctx.aggressive === false) return false
+    const hp = this.bot.health
+    if (typeof hp !== 'number' || hp <= this.HP_ALERT) return false
+    if (this.blocksNewTasks()) return false
+    try { if (this.hostileCount(6) > 2) return false } catch (e) {}
+    return true
+  }
+
 
   async retaliate (ent) {
     const now = Date.now()
     if (now - this.lastAttackBack < 1200) return
     this.lastAttackBack = now
     try {
-      const dist = ent.position.distanceTo(this.bot.entity.position)
+      const me = this.bot.entity && this.bot.entity.position
+      const dist = this.dist(ent.position, me)
       if (dist > 3.6) return
-      this.bot.lookAt(ent.position.offset(0, 1.5, 0), true)
+      const aim = new Vec3(ent.position.x, ent.position.y + 1.5, ent.position.z)
+      this.bot.lookAt(aim, true)
       await this.bot.attack(ent)
     } catch (e) {}
   }
 
+  /**
+   * 跑。
+   * @param {object|null} from 实体、Vec3、{position} 都行；null 就朝随机方向
+   */
   flee (from) {
     this.fleeUntil = Date.now() + 4000
     try {
       const bot = this.bot
       const p = bot.entity.position
-      const d = from && from.position ? p.minus(from.position) : null
-      const base = d && d.norm() > 0.1
-        ? p.plus(d.normalize().scaled(12))
-        : p.offset((Math.random() - 0.5) * 20, 0, (Math.random() - 0.5) * 20)
+      const src = from && from.position ? from.position : (from && typeof from.x === 'number' ? from : null)
+      const d = src ? new Vec3(p.x - src.x, 0, p.z - src.z) : null
+      const away = d && d.norm() > 0.1 ? d.normalize().scaled(12) : null
+      const base = away
+        ? new Vec3(p.x + away.x, p.y, p.z + away.z)
+        : new Vec3(p.x + (Math.random() - 0.5) * 20, p.y, p.z + (Math.random() - 0.5) * 20)
       // 找一块脚下有东西、头顶空的落脚点，别往坑里跳
       let target = null
       for (let r = 0; r < 8 && !target; r++) {
@@ -234,6 +552,11 @@ class Reflex {
       }
       if (!target) target = base
       bot.pathfinder.setGoal(new goals.GoalNear(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z), 1))
+      // 边跑边冲（保命时不用省饥饿值）
+      try {
+        bot.setControlState('sprint', true)
+        setTimeout(() => { try { bot.setControlState('sprint', false) } catch (e) {} }, 3000)
+      } catch (e) {}
     } catch (e) {}
   }
 
@@ -269,22 +592,36 @@ class Reflex {
       }
     } catch (e) {}
 
+    // 0.5 采样血量 —— tick 也要采一次：掉血不一定都走了 damage_event
+    //     （毒、凋零、缓慢、饥饿这些都是纯 health 包），
+    //     速率到这里才接得住。
+    try { this.sampleHealth() } catch (e) {}
+
+    const hp = bot.health
+    const near = this.nearestHostile(10)
+    const underAttack = !!near || Date.now() < this.attackUntil || this.recentDrop(3000) >= 4
+    const lvl = this.threatLevel(hp, { near, underAttack })
+
     // ===== 救命线：血 ≤ SOS_HP，不管忙不忙都先保命 =====
     //
     // 实测事故：血 6 -> 5 -> 3 -> 2 只用了 2 秒，而当时他在任务里（busy），
     // 老的 busy 分支只在「有怪」时才跑，环境伤害（淹/摔/岩浆）根本没人管，
     // 于是照常跑任务直到死。
     // 现在这条在最前面，绕开 busy，而且环境伤害也算。
-    const hp = bot.health
     if (typeof hp === 'number' && hp > 0 && hp <= this.SOS_HP) {
-      const near = this.nearestHostile(12)
-      if (near) {
-        this.sos(this.sosKind || 'hostile')
-        this.syncStuckBaseline()
-        return
-      }
-      // 没怪也救命：可能正在溺水/岩浆/摔落，或纯粹血少了
-      this.sos(this.sosKind || 'lowhp')
+      this.sos(this.sosKind || (near ? 'hostile' : 'lowhp'))
+      if (lvl >= 4) this.panic(hp)
+      this.syncStuckBaseline()
+      return
+    }
+
+    // ===== 战斗分档（2026-11-14）=====
+    //
+    // 【为什么放在 busy 之前】
+    // 他昨天晚上就是死在这条 busy 门禁上：任务在跑 -> tick 直接 return ->
+    // 每 2 秒掉 5 血，8 秒就没了。命比任务重要，<=10 血必须抢 bot。
+    if (lvl >= 2) {
+      this.reactByTier(hp, { near, underAttack })
       this.syncStuckBaseline()
       return
     }
@@ -292,10 +629,10 @@ class Reflex {
     // ===== 任务执行中：只保留救命的事 =====
     // 血还够就一律让路。抢 bot 比"少躲一次夜"危险得多。
     if (this.isBusy()) {
-      // 被怪贴脸也要还手（attack 不抢 pathfinder / dig）
-      if (this.ctx.aggressive !== false && bot.health > this.SOS_HP) {
-        const near = this.nearestHostile(2.5)   // 半径收窄：只有真贴脸才打
-        if (near) this.retaliate(near)
+      // 1 档（<=14 且有怪）：不动寻路，怕打断挖掘，但贴脸的照打
+      if (this.canRetaliate()) {
+        const close = this.nearestHostile(2.5)
+        if (close) this.retaliate(close)
       }
       // 关键：busy 期间仍然刷新卡住基线。
       // 不然任务一结束，第一次 checkStuck 会拿很久以前的坐标比，
@@ -315,16 +652,13 @@ class Reflex {
       }
     }
 
-    // 3. 血少就躲
-    if (bot.health <= 8 && Date.now() > this.fleeUntil) {
-      const near = this.nearestHostile(10)
-      if (near) this.flee(near)
-    }
+    // 3. 血不够 + 身边有怪 / 正在挨打 -> 拉开距离（1 档，不拼命跑）
+    if (lvl === 1) this.reactByTier(hp, { near, underAttack })
 
-    // 4. 被怪贴脸 -> 打
-    if (this.ctx.aggressive !== false) {
-      const near = this.nearestHostile(3.2)
-      if (near && bot.health > 10) this.retaliate(near)
+    // 4. 被怪贴脸 -> 打（血 > 14 且怪不多才打；否则等 3 档去跑）
+    if (this.canRetaliate()) {
+      const close = this.nearestHostile(3.2)
+      if (close) this.retaliate(close)
     }
 
     // 5. 天黑 + 血不多 + 没怪贴脸 -> 挖个洞躲着（真人的第一反应）
@@ -341,7 +675,7 @@ class Reflex {
   syncStuckBaseline () {
     try {
       const p = this.bot.entity.position
-      this.lastPos = p.clone()
+      this.lastPos = this._pos(p)
       this.stuckSince = 0
     } catch (e) {}
   }
@@ -474,14 +808,46 @@ class Reflex {
     return false
   }
 
-  nearestHostile (range) {
-    const ents = Object.values(this.bot.entities).filter(e =>
-      e !== this.bot.entity && e.name && HOSTILE.has(e.name) &&
-      e.position.distanceTo(this.bot.entity.position) <= range)
-    if (!ents.length) return null
-    ents.sort((a, b) =>
-      a.position.distanceTo(this.bot.entity.position) - b.position.distanceTo(this.bot.entity.position))
-    return ents[0]
+  /** 是不是敌对生物：先用白名单，再用 minecraft-data 的 category 兜底（新怪不用改代码） */
+  isHostile (ent) {
+    if (!ent || !ent.name) return false
+    if (HOSTILE.has(ent.name)) return true
+    try {
+      const d = this.bot.registry && this.bot.registry.entitiesByName &&
+        this.bot.registry.entitiesByName[ent.name]
+      if (d) {
+        if (d.type === 'hostile') return true
+        if (/hostile/i.test(String(d.category || ''))) return true
+      }
+    } catch (e) {}
+    return false
+  }
+
+  nearestHostile (range = 10) {
+    const me = this.bot.entity
+    if (!me || !me.position) return null
+    let best = null
+    let bestD = Infinity
+    for (const e of Object.values(this.bot.entities || {})) {
+      if (!e || e === me || !e.name || !e.position) continue
+      if (!this.isHostile(e)) continue
+      const d = this.dist(e.position, me.position)
+      if (d <= range && d < bestD) { bestD = d; best = e }
+    }
+    return best
+  }
+
+  /** 附近敌对数量（决定要不要反打：只有 1~2 个才打） */
+  hostileCount (range = 6) {
+    const me = this.bot.entity
+    if (!me || !me.position) return 0
+    let n = 0
+    for (const e of Object.values(this.bot.entities || {})) {
+      if (!e || e === me || !e.name || !e.position) continue
+      if (!this.isHostile(e)) continue
+      if (this.dist(e.position, me.position) <= range) n++
+    }
+    return n
   }
 
   // 只有"pathfinder 说在走"但"实际没挪窝"时才算卡住
@@ -489,10 +855,10 @@ class Reflex {
     const bot = this.bot
     if (!bot.entity) return
     const p = bot.entity.position
-    if (!this.lastPos) { this.lastPos = p.clone(); this.stuckSince = 0; return }
+    if (!this.lastPos) { this.lastPos = this._pos(p); this.stuckSince = 0; return }
 
     const moved = p.distanceTo(this.lastPos)
-    this.lastPos = p.clone()
+    this.lastPos = this._pos(p)
 
     // pathfinder 是不是真的在驱动移动
     const pfMoving = bot.pathfinder && typeof bot.pathfinder.isMoving === 'function'

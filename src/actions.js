@@ -182,6 +182,22 @@ class Actions {
     }, 50)
     if (this._fallTimer.unref) this._fallTimer.unref()
 
+    // 静默看门狗：150 秒没有任何 [act] 日志 = 可能又挂死在某个 await 上。
+    // Promise 没有取消，救不回来；但至少把「看起来在发呆」变成一条能查的日志。
+    this._stallTimer = setInterval(() => {
+      try {
+        const last = this._lastLogAt || 0
+        if (!last) return
+        const quiet = Date.now() - last
+        if (quiet < 150000) return
+        if (Date.now() - (this._lastStallAt || 0) < 150000) return
+        this._lastStallAt = Date.now()
+        const p = this.bot && this.bot.entity && this.bot.entity.position
+        this.log(`[stall] ${Math.round(quiet / 1000)} 秒没有任何动作日志（疑似挂死）@ ${p ? Math.round(p.x) + ',' + Math.round(p.y) + ',' + Math.round(p.z) : '?'}`)
+      } catch (e) {}
+    }, 15000)
+    if (this._stallTimer.unref) this._stallTimer.unref()
+
     // 死亡时补一句：死前 15 秒内有过坠落就把那次的落差/动作打出来。
     // 不改 main.js 的 [death] 归因，只多一行证据。
     try {
@@ -197,6 +213,7 @@ class Actions {
   stopWatchdog () {
     if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null }
     if (this._fallTimer) { clearInterval(this._fallTimer); this._fallTimer = null }
+    if (this._stallTimer) { clearInterval(this._stallTimer); this._stallTimer = null }
   }
 
   /**
@@ -569,13 +586,51 @@ class Actions {
       x: Math.round(p.x),
       y: Math.round(p.y),
       z: Math.round(p.z),
-      act: this.current || (this._lastLog && Date.now() - (this._lastLogAt || 0) < 20000 ? this._lastLog : '(空闲)'),
+      act: (this._lastLog && Date.now() - (this._lastLogAt || 0) < 20000)
+        ? this._lastLog
+        : (this.current || '(空闲)'),
       health: Math.round(bot.health),
       water: inWater
     }
     this.lastFall = info
     this._recentFalls = (this._recentFalls || []).concat([info]).slice(-10)
     this.log(`[fall] 落差 ${info.drop} 格：y ${info.fromY}→${info.toY} @ ${info.x},${info.z}｜动作=${info.act}｜血=${info.health}${inWater ? '｜落水' : ''}`)
+  }
+
+  /**
+   * 带超时的挖掘。
+   *
+   * 【为什么必须要有 · 2026-11-14 实测】
+   * mineflayer 的 `bot.dig()` 在服务端不回包 / 方块中途消失 / 方块被保护时
+   * **永远不会 resolve**。实测改后 15 分钟窗口里：
+   *
+   *   [01:25:10] [act] [surface] 这一步四个方向都挖不成台阶，挪一格再看
+   *   （然后 6 分 09 秒没有任何 [act] 日志，只有每 30 秒一条心跳「22秒没动」）
+   *   [01:31:19] [lock] 中断信号 <- 任务硬超时（持有：task×1 420s）
+   *
+   * 就是 digUpOne 里那行裸 `await bot.dig()` 挂死，把整个 420 秒任务窗口吃光。
+   * 这不是「发呆」，是**挂死** —— 所以 idleThinkSeconds 调了也没用。
+   */
+  async digWithTimeout (block, ms = 9000) {
+    if (!block) return false
+    let timer = null
+    const timeout = new Promise(resolve => { timer = setTimeout(() => resolve('timeout'), ms) })
+    let result = 'err'
+    try {
+      result = await Promise.race([
+        Promise.resolve(this.bot.dig(block, true)).then(() => 'ok').catch(() => 'err'),
+        timeout
+      ])
+    } catch (e) {
+      result = 'err'
+    }
+    clearTimeout(timer)
+    if (result === 'ok') return true
+    try { this.bot.stopDigging() } catch (e) {}
+    if (result === 'timeout') {
+      this.log(`[dig] 挖 ${block.name || '方块'} 超时 ${Math.round(ms / 1000)}s，放弃换路`)
+    }
+    return false
   }
 
   item (name) {
@@ -1274,7 +1329,7 @@ class Actions {
           if (/bedrock/.test(blk.name)) continue
           try {
             await this.bestToolFor(blk)
-            await bot.dig(blk, true)
+            await this.digWithTimeout(blk, 9000)
             await sleep(200)
           } catch (e) {}
         }
@@ -2104,9 +2159,46 @@ class Actions {
         (goodTrees.length ? `（最近 ${goodTrees[0].d.toFixed(0)} 格、高差 ${Math.abs(goodTrees[0].pos.y - this.pos().y).toFixed(0)}）` : ''))
     }
     if (!goodTrees.length) {
-      // 彻底没树：不浪费时间砍树，直接给明确失败原因
-      this.log('[tool] 96 格内没有能砍到的树，砍树这条路走不通')
-      throw new Error('弄不到镐子：96 格内没有能走到的树，也没法空手挖石头（需要镐）')
+      // ===== 【出生点没树】别立刻判死：真人会往外走 =====
+      //
+      // 原来这里直接 throw。出生点附近的林子被砍光（或者本来就稀疏）时，
+      // 「先弄把木镐」会在几秒内失败，主循环接着想别的目标 —— 而那些目标
+      // 第一步不是要木头就是要石头，于是全部卡住，人就站着不动。
+      //
+      // 现在：在剩余预算里往 3 个方向各走 40 格，每走一段就重新扫 48/96。
+      // 走到新林子就继续做镐；走完还是没有，才带着「走了多少格」失败。
+      // 这段不保证成功，但保证**人会动**，而不是在出生点反复重试同一件事。
+      this.log('[tool] 96 格内没有能砍到的树，往外走找（最多 3 段）')
+      let moved = 0
+      const legs = 3
+      for (let i = 0; i < legs && left() > 30000; i++) {
+        const p = this.pos()
+        const a = (i * 2.399) + Math.random() * 0.8
+        const tx = p.x + Math.cos(a) * 40
+        const tz = p.z + Math.sin(a) * 40
+        const walkMs = Math.max(8000, Math.min(30000, left() - 20000))
+        this.log(`[tool] 往外走第 ${i + 1}/${legs} 段 -> ${Math.round(tx)},${Math.round(tz)}（剩 ${Math.round(left() / 1000)}s）`)
+        try {
+          await this.goto(tx, p.y, tz, 3, walkMs)
+        } catch (e) {
+          this.log('[tool] 走不动：' + humanError(e))
+        }
+        try {
+          const np = this.pos()
+          moved += Math.hypot(np.x - p.x, np.z - p.z)
+        } catch (e) {}
+        try { await this.ensureChunks(3000) } catch (e) {}
+        goodTrees = _goodTrees(48)
+        if (!goodTrees.length) goodTrees = _goodTrees(96)
+        if (goodTrees.length) {
+          this.log(`[tool] 走到第 ${i + 1} 段后找到 ${goodTrees.length} 棵能砍的树`)
+          break
+        }
+      }
+      if (!goodTrees.length) {
+        this.log(`[tool] 往外走了 ${Math.round(moved)} 格，96 格内还是没有能砍到的树`)
+        throw new Error(`弄不到镐子：往外走了 ${Math.round(moved)} 格也没找到能砍的树`)
+      }
     }
 
     let woodRound = 0
@@ -3071,6 +3163,44 @@ class Actions {
       const trunkXZ = `${base.x},${base.z}`
       let dug = 0
 
+      /**
+       * 清出 (fx,fz) 的脚+头两格。
+       * @returns 'cleared' 挖开了 / 'open' 本来就通 / 'hard' 硬方块没工具 / 'blocked' 危险或树干列
+       */
+      const clearCell = async (fx, fz, footY) => {
+        if (`${fx},${fz}` === trunkXZ) return 'blocked'
+        let cleared = false
+        for (const yy of [footY, footY + 1]) {
+          const b = this.bot.blockAt(new Vec3(fx, yy, fz))
+          if (!b) continue
+          if (!this.solidBlock(b)) continue
+          if (/bedrock|lava|water/.test(b.name)) return 'blocked'
+          if (!softName(b.name)) {
+            const t = await this.bestToolFor(b).catch(() => ({ ok: false }))
+            if (!t || !t.ok) return 'hard'
+          }
+          try {
+            if (await this.digAt(b)) { dug++; cleared = true }
+          } catch (e) {}
+        }
+        return cleared ? 'cleared' : 'open'
+      }
+
+      // 真的挪一步进去（挖出来的通道要有人走）
+      // 【摔死修复 + 方向修复】manualStep 用正确的 yaw（atan2(-dx,-dz)），
+      // 老代码是 atan2(-stepX, +stepZ)，物理上正好反方向。
+      const stepInto = async (sx, sz) => {
+        const yBeforeMove = this.pos().y
+        await this.manualStep(sx, sz, 420, { maxDrop: 1 })
+        await sleep(160)
+        if (this.pos().y < yBeforeMove - 1.2) {
+          this.log('[chop]   挖通道时掉下去了，停手')
+          return false
+        }
+        try { await this.pickupNearby(4) } catch (e) {}
+        return true
+      }
+
       for (let step = 0; step < maxBlocks; step++) {
         if (Date.now() > DEADLINE) break
         const me = this.pos()
@@ -3085,54 +3215,61 @@ class Actions {
         else stepZ = Math.sign(dz)
         if (stepX === 0 && stepZ === 0) break
 
+        const footY = Math.floor(me.y)
         const fx = Math.floor(me.x) + stepX
         const fz = Math.floor(me.z) + stepZ
-        // 不挖树干那一列
-        if (`${fx},${fz}` === trunkXZ) break
+        const prim = await clearCell(fx, fz, footY)
 
-        const footY = Math.floor(me.y)
-        let cleared = false
-
-        // 清脚+头两格；脚下那格也检查（要能站住）
-        for (const [yy, tag] of [[footY, 'foot'], [footY + 1, 'head']]) {
-          const v = new Vec3(fx, yy, fz)
-          const b = this.bot.blockAt(v)
-          if (!b) continue
-          if (!this.solidBlock(b)) continue
-          if (/bedrock|lava|water/.test(b.name)) return dug
-          // 硬方块（石头类）没工具挖不动，别开在这里
-          if (!softName(b.name)) {
-            const t = await this.bestToolFor(b).catch(() => ({ ok: false }))
-            if (!t || !t.ok) return dug
-          }
-          try {
-            if (await this.digAt(b)) { dug++; cleared = true }
-          } catch (e) {}
+        // 'open' 也走：pathfinder 走不过去不等于脚前是墙（可能就是没路），
+        // 手动迈一步是安全的（stepInto 会检查有没有掉下去）。
+        if (prim === 'cleared' || prim === 'open') {
+          if (!(await stepInto(stepX, stepZ))) break
+          continue
         }
-        // 【实测 · 2026-11-13 17:08】原来不管有没有挖到都往前走一步，
-        // 结果 `挖了 0 格（3584ms），距树 6.1 -> 9.4 格` —— 反而退远了 3.3 格。
-        // 前方本来就通时"往前走"没意义（人早就该走过去了，是 pathfinder
-        // 走不过去才需要挖），而脚下有落差时会直接掉下去。
+
+        // ===== 正前方挖不动 -> 绕着走 =====
         //
-        // 现在：只有真的挖开了方块才往里挪；一格都没挖开就说明这个方向
-        // 挖不动（石头/没工具），直接返回让上层换策略。
-        if (!cleared) {
-          this.log(`[chop]   朝树方向这一格挖不动（${stepX},${stepZ}），停手`)
+        // 【死锁 · 2026-11-14 01:37】树在石头后面：
+        //   朝树方向那一格是石头 -> 没镐挖不动 -> 原地 break -> 到不了树
+        //   -> 没木头 -> 做不出镐 -> 下次还站在同一块石头前。
+        // 真人是绕到树的另一侧，不是站在石头前放弃。
+        // 这里先试左右两侧（与挡路方向垂直），从侧面绕过去再继续朝树推进。
+        if (prim === 'hard') {
+          this.log(`[chop]   正前方（${stepX},${stepZ}）是硬方块，绕路`)
+        } else if (prim === 'blocked') {
+          this.log(`[chop]   正前方（${stepX},${stepZ}）过不去，绕路`)
+        } else {
+          this.log(`[chop]   正前方（${stepX},${stepZ}）没挖开，绕路`)
+        }
+
+        let detoured = false
+        const sides = [[stepZ, -stepX], [-stepZ, stepX]]
+        for (const [sx, sz] of sides) {
+          if (sx === 0 && sz === 0) continue
+          const r = await clearCell(Math.floor(me.x) + sx, Math.floor(me.z) + sz, footY)
+          if (r !== 'cleared' && r !== 'open') continue
+          if (await stepInto(sx, sz)) { detoured = true; break }
+        }
+        if (!detoured) {
+          this.log(`[chop]   左右都绕不过去（${stepX},${stepZ}），停手`)
           break
         }
-        // 真的挪一步进去（挖出来的通道要有人走）
-        const yBeforeMove = this.pos().y
-        // 【摔死修复 + 方向修复】manualStep 用正确的 yaw（atan2(-dx,-dz)），
-        // 老代码是 atan2(-stepX, +stepZ)，物理上正好反方向 ——
-        // 日志里「距树 6.1 -> 9.4 格」就是走反了。同时限落差 1 格。
-        await this.manualStep(stepX, stepZ, 420, { maxDrop: 1 })
-        await sleep(160)
-        // 掉下去就停（说明挖穿了地板）
-        if (this.pos().y < yBeforeMove - 1.2) {
-          this.log('[chop]   挖通道时掉下去了，停手')
-          break
+        // 绕了一步，下一轮重新朝树的方向算
+      }
+
+      // ===== 连续 N 次一棵都挖不动 -> 这片地形处理不了 =====
+      //
+      // 一次挖不动可能是这一棵的位置不好；连着 3 次都挖不动（被石头/悬崖挡住），
+      // 说明整片林子都够不着。打标记，让 goals 把 explore 顶上来（往外走）。
+      if (dug > 0) {
+        this._chopBlockedCount = 0
+        this._forceExploreUntil = 0
+      } else {
+        this._chopBlockedCount = (this._chopBlockedCount || 0) + 1
+        if (this._chopBlockedCount >= 3) {
+          this._forceExploreUntil = Date.now() + 5 * 60 * 1000
+          this.log(`[chop] 连续 ${this._chopBlockedCount} 次被地形挡住（挖不动），先出去找别的地方`)
         }
-        try { await this.pickupNearby(4) } catch (e) {}
       }
       return dug
     }
@@ -3288,7 +3425,7 @@ class Actions {
           try { this.bot.setControlState(k, false) } catch (e) {}
         }
         try {
-          await this.bot.dig(b, true)
+          await this.digWithTimeout(b, 9000)
           await sleep(130)
           try { await this.pickupNearby(4) } catch (e) {}
           return true
@@ -3531,6 +3668,9 @@ class Actions {
         const tDig3a = Date.now()
         let dug3a = 0
         try { dug3a = await digTowardTrunk(base, 6) } catch (e) {}
+        if (this._forceExploreUntil && Date.now() < this._forceExploreUntil) {
+          throw new Error('连续 3 次被石头挡住，这片林子够不着，先出去找别的地方')
+        }
         const dAfter3a = base.distanceTo(this.pos())
         this.log(`[chop] 3a 挖了 ${dug3a} 格（${Date.now() - tDig3a}ms），` +
           `距树 ${d3.toFixed(1)} -> ${dAfter3a.toFixed(1)} 格`)
@@ -3990,6 +4130,9 @@ class Actions {
             let dug = 0
             const tDig2 = Date.now()
             try { dug = await digTowardTrunk(base, 8) } catch (e) {}
+            if (this._forceExploreUntil && Date.now() < this._forceExploreUntil) {
+              throw new Error('连续 3 次被石头挡住，这片林子够不着，先出去找别的地方')
+            }
             d = base.distanceTo(this.pos())
             this.log(`[chop] 挖了 ${dug} 格（${Date.now() - tDig2}ms），现在距树 ${d.toFixed(1)} 格`)
           }
@@ -4018,6 +4161,8 @@ class Actions {
         if (chopped > 0) {
           choppedThisRound = chopped
           trees++
+          this._chopBlockedCount = 0
+          this._forceExploreUntil = 0
           this.log(`[chop] 砍下 ${chopped} 块原木（${cand.name} @${base.x},${base.y},${base.z}）`)
           // 立刻捡，别等（掉落物 5 分钟后消失，但走远就捡不到了）
           try { await this.pickupNearby(8) } catch (e) {}
@@ -5227,7 +5372,7 @@ class Actions {
       if (/bedrock|lava|water/.test(b.name)) return false
       try {
         await this.bestToolFor(b)
-        await bot.dig(b, true)
+        await this.digWithTimeout(b, 9000)
         await sleep(130)
       } catch (e) {
         // 挖一半被打断很常见，看最终结果说话
@@ -5270,14 +5415,25 @@ class Actions {
      * 手动 jump+forward 在矮通道里起不来，只当兜底。
      */
     const stepUpTo = async (x, y, z) => {
+      const y0 = this.pos().y
+      let fell = false
       try {
         bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z))
         for (let i = 0; i < 12; i++) {
           await sleep(180)
           if (this.pos().y >= y - 0.15) break
+          // 【摔死修复 · 实测 01:22:51 基线】"上台阶"这一小段寻路会突然往下掉：
+          // 5 秒里 y 从 70.1 掉到 65.0，正是这一窗口里追出来的摔伤。
+          // 目标就在隔壁一格，掉超过 2.5 格绝对不是正常绕路 —— 立刻停。
+          if (this.pos().y < y0 - 2.5) {
+            fell = true
+            this.log(`[surface] 上台阶途中往下掉了 ${(y0 - this.pos().y).toFixed(1)} 格，停手`)
+            break
+          }
         }
       } catch (e) {}
       try { bot.pathfinder.setGoal(null) } catch (e) {}
+      if (fell) return false
       if (this.pos().y >= y - 0.15) return true
 
       {
@@ -5687,8 +5843,23 @@ class Actions {
           const supV = p.offset(dx, -1, dz)
           const blocked = (v) => /bedrock|lava|water/.test(nameAt(v))
           if (blocked(bodyV) || blocked(headV)) continue
-          if (isSolid(stepV)) cands.push({ dx, dz, score: 10 })
-          else if (isSolid(supV)) cands.push({ dx, dz, score: 5 })
+          // 【摔死修复 · 实测 01:22:51】上台阶那一步踩上去之后如果继续往前，
+          // 前面是 5 格深的坑，就会直接出溜下去（基线窗口里就是这么摔的）。
+          // 换方向之前先看"台阶再往前一格"的地面：落差 >3 或者探不到底就降权。
+          let cliff = false
+          try {
+            const bx = Math.floor(p.x) + dx * 2
+            const bz = Math.floor(p.z) + dz * 2
+            const beyond = this.bot.blockAt(new Vec3(bx, F, bz))
+            if (!beyond || beyond.boundingBox !== 'block') {
+              const d = this.dropBelow(bx, F, bz, 6)
+              cliff = (d < 0 || d > SAFE_DROP)
+            }
+          } catch (e) {}
+          const penalty = cliff ? 4 : 0
+          if (isSolid(stepV)) cands.push({ dx, dz, score: 10 - penalty })
+          else if (isSolid(supV)) cands.push({ dx, dz, score: 5 - penalty })
+          if (cliff) this.log(`[surface] 方向 (${dx},${dz}) 前面是深坑，降权`)
         }
 
         if (!cands.length) {
@@ -5906,7 +6077,9 @@ class Actions {
         await this.bestToolFor(b)        // 有镐就换上，没镐也继续
         bot.setControlState('forward', false)
         await sleep(60)
-        await bot.dig(b, true)
+        // 【挂死修复】这里原来是裸 await bot.dig()：服务端不回包就永久挂住，
+        // 实测卡了 6 分 09 秒，直到 420 秒任务硬超时。
+        if (!await this.digWithTimeout(b, 9000)) return false
         any++
       } catch (e) {}
       await sleep(120)
@@ -5949,7 +6122,7 @@ class Actions {
           if (!nb || nb.boundingBox !== 'block') continue
           if (!SOFT.test(nb.name)) continue
           try {
-            await bot.dig(nb, true)
+            await this.digWithTimeout(nb, 9000)
             await sleep(200)
             try { await this.pickupNearby(4) } catch (e) {}
             await sleep(150)
@@ -6058,7 +6231,7 @@ class Actions {
         if (b && b.boundingBox === 'block' && !/bedrock|lava|water/.test(b.name)) {
           try {
             await this.bestToolFor(b)
-            await bot.dig(b, true)
+            await this.digWithTimeout(b, 9000)
             await sleep(110)
           } catch (e) {}
         }

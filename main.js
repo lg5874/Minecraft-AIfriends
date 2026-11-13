@@ -122,6 +122,10 @@ class Bot {
     // 重连前把上一局的动作线全部作废：一条没走到 finally 的线会把新一局锁死
     // （主循环看到 busy 就 return，人站着不动还查不出原因）。锁只在内存里，清掉不丢数据。
     if (this.lock) this.lock.forceReleaseAll('重新连接')
+    // 新的一局：把上一局的"断线收尾"状态复位（kicked/error 可能没走到 end，
+    // 那种情况下 _tornDown 还立着，不复位的话下一局永远收不了尾）。
+    this._tornDown = false
+    this._interrupted = false
     this.log(`连接 ${c.host}:${c.port} 作为 ${c.username}`)
 
     const bot = mineflayer.createBot({
@@ -140,8 +144,20 @@ class Bot {
     bot.once('spawn', () => this.onSpawn())
     bot.on('respawn', () => this.onRespawn())
     bot.on('end', (r) => this.onEnd(r))
-    bot.on('kicked', (r) => this.log('被踢: ' + JSON.stringify(r)))
-    bot.on('error', (e) => this.log('错误: ' + (e && e.message)))
+    // 【断线三条路径都要收尾】原来 kicked / error 只打一行日志，什么都不清。
+    // spam 踢走的是 `kicked` —— 那条路径上以前一个字的状态都不清理。
+    // 实测历史日志里的 `错误:` 全是连接级致命（EPIPE / ECONNRESET / ECONNREFUSED），
+    // 没有一种是"会话内良性错误"，所以 error 也直接收尾是安全的。
+    // _teardown 自己幂等，kicked -> end 连着来也只做一次。
+    bot.on('kicked', (r) => {
+      const why = 'kicked:' + (typeof r === 'string' ? r : JSON.stringify(r))
+      this.log('被踢: ' + (typeof r === 'string' ? r : JSON.stringify(r)))
+      try { this._teardown(why) } catch (e) { this.log('[teardown] ' + e.message) }
+    })
+    bot.on('error', (e) => {
+      this.log('错误: ' + (e && e.message))
+      try { this._teardown('error:' + (e && e.message)) } catch (e2) { this.log('[teardown] ' + e2.message) }
+    })
     bot.on('death', () => this.onDeath())
 
     bot.on('chat', (username, message) => {
@@ -366,6 +382,14 @@ class Bot {
     moves.canOpenDoors = true
     moves.liquidCost = 20       // 别太怕水（怕水走不了路），也别主动跳
     moves.maxDropDown = 3       // 最多跳 3 格（8 格会摔死）
+    // 【maxDropDown 唯一漏掉的场景】引擎默认 infiniteLiquidDropdownDistance=true，
+    // 而 movements.js:487 是 `if (!this.infiniteLiquidDropdownDistance && 落差 > maxDropDown) return`
+    // —— 也就是**落点是水时，上面那个 3 完全不生效**，可以从任意高度跳进水里。
+    // 实测（move-owner）：改后 15 分钟内 4 次坠落，最大一次 11.9 格（y 62→50），
+    // 落水没掉血，但人被冲下去 12 格，紧接着 `[survive] 在水里/憋气，先浮上去`；
+    // 早期探针里的 `[death] 快淹死了` 就是这条路的终点。
+    // 关掉之后"3 格安全线"对实地和水面同时成立，代价是过河/下矿可能绕一点路。
+    moves.infiniteLiquidDropdownDistance = false
 
     bot.pathfinder.setMovements(moves)
     this._moves = moves
@@ -565,6 +589,18 @@ class Bot {
       speak: (situation, opts) => this.talk.speak(situation, opts),
       isBotName: (n) => {
         try { return this.spont && this.spont._looksLikeBot ? this.spont._looksLikeBot(n) : false } catch (e) { return false }
+      },
+      busy: () => this.busy,
+      progress: () => {
+        // 手上这件活干到几成（0~1）。没这个口子，invite 就永远当"不忙"，
+        // "等我把这块弄完就来"那条分支永远不触发。
+        // goals.status() 在没目标时返回 { has:false }，没有 progress 字段 ->
+        // Number(undefined) = NaN -> _progress() 自己判 isFinite 后返回 0，
+        // 也就是"没在忙大事"一律答应。这条兜底是有意的，别改成 throwing。
+        try {
+          const st = this.goals && this.goals.status ? this.goals.status() : null
+          return st ? (Number(st.progress) || 0) : 0
+        } catch (e) { return 0 }
       }
     })
     this.invite.attach(bot)
@@ -664,6 +700,111 @@ class Bot {
 
   // ==================== 下线 / 重连 ====================
 
+  /**
+   * 断线统一收尾。`onEnd` / `kicked` / `error` 三条路径共用。
+   *
+   * 【为什么非要有这个】
+   * 断线前的一堆状态全都**引用了外部现实**（哪个人、哪个动作线、哪句话说到一半），
+   * 重连之后那个现实已经不存在了。不清的话：
+   *   · 锁还挂着 → 主循环看到 busy 就 return → **永远开不了新任务**（最重的一条）
+   *   · `will.current` / `pendingTask` 还挂着 → 重连后继续干一件已经没意义的事
+   *   · 闸门时间戳还在 → 重连后第一句正常的话被拦（sayWindow 是 20 秒，比 15 秒重连长）
+   *   · 待办队列里还排着断线前的人和事 → 重连后蹦出一句「那个 XJJ 打我」——真人不会这么说
+   *
+   * 【分四类，按"引用了什么"分，不是按字段清单】
+   *   ① 限速/时间   → 清零
+   *   ② 待办/承诺   → 清空
+   *   ③ 占用/锁     → 强制释放 + 记日志
+   *   ④ 目标/进度   → **只标记 interrupted，绝不记 fail**
+   *
+   * ④ 是硬约束：断线不是"他没做成事"。记了 fail，goals 会以为这个阶段不行、
+   * 技能库会"越失败越窄"，一次网络抖动就被当成能力问题。
+   * 实现方式是 `this._interrupted` —— `reportTaskResult` 看到它就直接返回，
+   * 不碰 goals 的 attempts/fails。
+   */
+  _teardown (reason) {
+    // 三条路径会互相触发（kicked -> end，error -> end），只做一次。
+    if (this._tornDown) return false
+    this._tornDown = true
+    const why = String(reason || '断线')
+
+    // ④ 先立标记：在飞的任务接下来无论走成功/失败/异常哪条路，都不算数
+    this._interrupted = true
+
+    // ---- ③ 占用 / 锁（最容易漏、后果最重）----
+    try {
+      const held = (this.lock && this.lock.holders) ? this.lock.holders().map(h => (h && h.reason) || h) : []
+      if (held.length) this.log(`[teardown] 释放锁：${held.join(' / ')}（${why}）`)
+      if (this.lock) this.lock.forceReleaseAll(why)
+    } catch (e) { this.log('[teardown] 清锁出错: ' + e.message) }
+    try {
+      if (this.actions) { this.actions.cancel = false; this.actions.stop() }
+    } catch (e) {}
+    if (this._taskTimer) { clearTimeout(this._taskTimer); this._taskTimer = null }
+    this._taskProgress = null
+    this._taskStartAt = null
+    this._taskStartPos = null
+    this._taskStartInv = null
+    this._taskStartWorld = null
+    this._taskStartHealth = null
+    this._taskStartFood = null
+    this._taskStartHeld = null
+
+    // ---- ② 待办 / 承诺 ----
+    if (this.will) this.will.current = null
+    this.pendingTask = null
+    try { if (this.spont) this.spont.pendingEvents = [] } catch (e) {}
+    try {
+      // invite 的 attach() 重连时**会**清这两个，但「断线到重连」这十几秒里它们还挂着；
+      // 而且 stop() 在没跟人时直接 return、清不到。所以这里先清。
+      if (this.invite) {
+        this.invite._pendingFollow = null
+        this.invite._pendingRecover = null
+      }
+    } catch (e) {}
+    try { if (this.invite) this.invite.stop(why, { quiet: true }) } catch (e) {}
+    try { if (this.talk && this.talk.cancelPendingAck) this.talk.cancelPendingAck(why) } catch (e) {}
+
+    // ---- ① 限速 / 时间 ----
+    try {
+      const T = this.talk
+      if (T) {
+        T.lastSayAt = 0
+        T.lastSpokeAt = 0
+        T.sayWindow = []
+        if (T.repliedMsgIds && T.repliedMsgIds.clear) T.repliedMsgIds.clear()
+      }
+      // 进程级闸门在 talk.js 的模块作用域里，但它是导出的（module.exports.GLOBAL_SAY）。
+      // 不清它的话，同进程多实例会把上一局的说话记录算到这一局头上。
+      const GS = Talk.GLOBAL_SAY
+      if (GS) { GS.lastAt = 0; GS.window.length = 0 }
+    } catch (e) { this.log('[teardown] 清闸门出错: ' + e.message) }
+    this._foodCooldownUntil = 0
+    this._lowHpAt = 0
+    this._lastHeadHomeAt = 0
+    this._lastGoalObserveAt = 0
+    this._lastLateNightAt = 0
+    this._nightAlerted = false
+    this._lastWrapUpAt = 0
+    this._lastDangerAt = 0
+    this._lastDangerKey = ''
+    this._lastSelfChangeAt = 0
+    this._lastInnerTick = 0
+    this._friendHurtAt = 0
+    this._restingLoggedAt = 0
+    this._painLogAt = 0
+    this._lastHealth = null
+    this._lastDamage = null
+    this._deathMsgs = []
+    this._lastProof = null
+
+    // ---- ④ 目标/进度：只确认，不动 ----
+    // 这里**故意不碰** goals 的 attempts/fails/stage，也不调 reportTaskResult。
+    // 断线不是失败，标记已经由 `this._interrupted` 立好了。
+    this.log(`[teardown] 断线收尾完成（${why}）：锁已释放、待办已清、闸门已归零`)
+    return true
+  }
+
   onEnd (reason) {
     this.log('断开: ' + reason)
     // 这一趟到此为止：先结算，再拆上下文。
@@ -678,6 +819,10 @@ class Bot {
     if (this.home) { try { this.home.detach() } catch (e) {} this.home = null }
     if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null }
     try { this.mem.goOffline() } catch (e) {}
+
+    // 【断线收尾】必须在 session.end / home.detach / mem.goOffline 之后：
+    // 前面那几步还要读背包和坐标，收尾会把这些上下文拆掉。
+    try { this._teardown('end:' + reason) } catch (e) { this.log('[teardown] ' + e.message) }
 
     if (!this.running) return
     const d = (this.cfg.behavior.reconnectDelaySeconds || 15) * 1000
@@ -1331,6 +1476,13 @@ class Bot {
    */
   reportTaskResult (ok, text, outText, meta = {}) {
     if (!this.goals) return null
+    // 【断线不记失败】`_teardown` 已经把这一局标成 interrupted。
+    // 断线不是"他没做成事"：记了 fail，goals 会以为这个阶段不行、技能库会越失败越窄，
+    // 一次网络抖动就被当成能力问题。所以这里直接返回，不碰 attempts/fails。
+    if (this._interrupted) {
+      this.log(`[goals] 这趟被断线打断，不记成败：「${String(text || '').slice(0, 20)}」`)
+      return null
+    }
     try {
       // 用 statusWithUnderground 而不是 actions.status()：
       // 后者没有 underground 字段，surface 阶段在 onTaskResult 里只能按 y 猜，
@@ -1872,7 +2024,8 @@ class Bot {
         // 告诉长期目标"这趟没成" —— 同一个阶段失败太多次它会自己换路
         this.reportTaskResult(false, want.text, why, { progress: 0 })
         const others = Object.keys(this.bot.players || {}).filter(n => n !== this.bot.username)
-        if (this.spont) {
+        // 断线打断时别攒抱怨 —— 同上，重连后不该提断线前的事
+        if (this.spont && !this._interrupted) {
           const err = String(result.error || outText || '')
           const kind = /找不到|没找到|没树|没有/.test(err) ? 'nothingFound'
             : /合成|craft|材料/.test(err) ? 'craftFail'
@@ -1887,7 +2040,16 @@ class Bot {
       this.will.finish()
       // 异常也算一次失败：不回报的话，长期目标那边会以为"还没试过"，
       // 同一阶段会因为异常无限重试。
+      // 但断线打断的异常不算 —— 那一局已经作废，见 _teardown / reportTaskResult。
       this.reportTaskResult(false, want.text, e.message, { progress: 0 })
+      // 断线打断时也别攒「跑不动/找不到」的抱怨：那是网络问题，
+      // 说出去就变成重连后突然提断线前的事（真人不会这么讲）。
+      if (this.spont && !this._interrupted) {
+        const err = String(e.message || '')
+        const kind = /卡住|走不动/.test(err) ? 'stuck' : 'nothingFound'
+        const ev = spontaneous.onComplain(kind, err.slice(0, 30))
+        if (ev) this.spont.push(ev)
+      }
     } finally {
       if (stallCheck) clearInterval(stallCheck)
       this._taskProgress = null

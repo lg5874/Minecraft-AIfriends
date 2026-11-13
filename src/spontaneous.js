@@ -274,7 +274,10 @@ class Spontaneity {
 
     // 【损失出口】已经在队列里排着的账（`账龄|活`），防止同一笔排两次
     this._queuedLossKeys = new Set()
-    // 排了几回还没说成（0 条账最多试 3 回，之后当说过，别再翻旧账）
+    // 排了几回还没说成（0 条账最多试几回，之后当说过，别再翻旧账）
+    // 【实机 01:46】3 回被模型连拒三次就用完了（模型会「不想说」，跟概率无关），
+    // 一笔真账就这么憋回去了 —— 放宽到 5 回，同时把机会从 0.7 提到 0.85。
+    this.lossTriesMax = 5
     this._lossTries = new Map()
 
     // 【被注视 · 独立维度】不是为了"说不说话"，是为了"做什么"。
@@ -759,7 +762,7 @@ class Spontaneity {
       const ev = {
         trigger: 'loss',
         priority: 'complain',
-        chance: 0.7,
+        chance: 0.85,
         maxLen: 18,
         busyExempt: true,
         lossRef: { key, loss },
@@ -804,7 +807,7 @@ class Spontaneity {
     if (outcome === 'said') { giveUp(); return }
     const n = (this._lossTries.get(key) || 0) + 1
     this._lossTries.set(key, n)
-    if (n >= 3) {
+    if (n >= this.lossTriesMax) {
       this._log(`[spont] 这笔账排了 ${n} 回没说出来，先放下`)
       giveUp()
     }
