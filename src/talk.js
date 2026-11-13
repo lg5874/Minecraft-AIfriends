@@ -397,6 +397,7 @@ ${this.fatigueHint()}`
 
     const msgs = [
       { role: 'system', content: persona.systemPrompt(this.mem, world, [], {
+        cfg: this.ctx.cfg,
         secrets: this.mem.secrets, taste: this.ctx.taste, mood: this.ctx.mood
       }) },
       { role: 'system', content: `刚才你很忙，${item.who} 跟你说了话，你回了句"等会儿"或者没顾上。
@@ -570,6 +571,7 @@ ${item.who} 刚才说的是：${item.msg}
 
     const msgs = [
       { role: 'system', content: persona.systemPrompt(this.mem, stateLine, recalled, {
+        cfg: this.ctx.cfg,
         secrets: this.mem.secrets, viewer: username,
         taste: this.ctx.taste, mood: this.ctx.mood
       }) },

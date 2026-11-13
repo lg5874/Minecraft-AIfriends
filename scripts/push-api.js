@@ -10,7 +10,7 @@ const path = require('path')
 const TOKEN = process.argv[2]
 if (!TOKEN) { console.error('需要 token'); process.exit(1) }
 const OWNER = 'lg5874'
-const REPO = 'minecraft-AIfriend'
+const REPO = 'Minecraft-AIfriends'
 const BRANCH = 'main'
 const ROOT = '/root/workspace/minecraft-AIfriend'
 

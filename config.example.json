@@ -6,6 +6,11 @@
     "version": "1.21.11",
     "auth": "offline"
   },
+  "persona": {
+    "_说明": "每个 AI 是一个独立的人。改这里就能换角色，不用动代码。",
+    "identity": "你叫徐俊杰，21 岁，男。安徽肥东人，高中在肥东县第一中学，现在在华中科技大学读大四。皮肤有点黑，戴眼镜。",
+    "callName": "徐俊杰"
+  },
   "llm": {
     "baseUrl": "https://api.example.com/v1",
     "apiKey": "PUT_YOUR_KEY_HERE",

@@ -2566,10 +2566,19 @@ class Actions {
             if (await this.digAt(b)) { dug++; cleared = true }
           } catch (e) {}
         }
+        // 【实测 · 2026-11-13 17:08】原来不管有没有挖到都往前走一步，
+        // 结果 `挖了 0 格（3584ms），距树 6.1 -> 9.4 格` —— 反而退远了 3.3 格。
+        // 前方本来就通时"往前走"没意义（人早就该走过去了，是 pathfinder
+        // 走不过去才需要挖），而脚下有落差时会直接掉下去。
+        //
+        // 现在：只有真的挖开了方块才往里挪；一格都没挖开就说明这个方向
+        // 挖不动（石头/没工具），直接返回让上层换策略。
         if (!cleared) {
-          // 前方本来就通，直接往前走
+          this.log(`[chop]   朝树方向这一格挖不动（${stepX},${stepZ}），停手`)
+          break
         }
-        // 真的挪一步进去（不挪的话"挖出来的路"没人走）
+        // 真的挪一步进去（挖出来的通道要有人走）
+        const yBeforeMove = this.pos().y
         try {
           const yaw = Math.atan2(-stepX, stepZ)
           await this.bot.look(yaw, 0, true)
@@ -2579,6 +2588,11 @@ class Actions {
           await sleep(160)
         } catch (e) {
           try { this.bot.setControlState('forward', false) } catch (e2) {}
+        }
+        // 掉下去就停（说明挖穿了地板）
+        if (this.pos().y < yBeforeMove - 1.2) {
+          this.log('[chop]   挖通道时掉下去了，停手')
+          break
         }
         try { await this.pickupNearby(4) } catch (e) {}
       }
@@ -2972,6 +2986,28 @@ class Actions {
 
       this.log(`[chop] 第二步结束（含额外 trySpots）：距树 ${base.distanceTo(this.pos()).toFixed(1)}，` +
         `走了 ${Math.round((Date.now() - tStep2) / 1000)}s`)
+
+      // ===== 3a. 候选格都走不到，但人已经很近：直接挖过去 =====
+      //
+      // 【实测 · 2026-11-13 17:03】典型场景：候选格距树干只有 1.4~2.0 格
+      // （远在 4.2 内），但人卡在 5.6 格 —— 中间隔着树叶/灌木/一格高差。
+      // 这时 trySpots 三个候选全部 0 进展（pathfinder 找不到路），
+      // 后面 pillar 又没料，整棵树就废了。
+      //
+      // 真人做法就是"把挡路的挖开走进去"。digTowardTrunk 早就写好了，
+      // 但原来只在最后兜底时才调，白烧了 17 秒 trySpots。
+      // 现在提前到 trySpots 刚失败的时候。
+      d3 = base.distanceTo(this.pos())
+      if (d3 > 4.2 && d3 <= 9) {
+        this.log(`[chop] 候选格走不到（差 ${d3.toFixed(1)} 格），直接挖过去`)
+        const tDig3a = Date.now()
+        let dug3a = 0
+        try { dug3a = await digTowardTrunk(base, 6) } catch (e) {}
+        const dAfter3a = base.distanceTo(this.pos())
+        this.log(`[chop] 3a 挖了 ${dug3a} 格（${Date.now() - tDig3a}ms），` +
+          `距树 ${d3.toFixed(1)} -> ${dAfter3a.toFixed(1)} 格`)
+        if (dAfter3a <= 4.2) return true
+      }
 
       // ===== 3b. 高度不够：先判断"挖台阶"还是"垫方块" =====
       //
@@ -3414,17 +3450,20 @@ class Actions {
           //
           // 关键：**挖完必须重算候选格再走**，
           // 否则挖开的路还是走老的那批错误格子，等于白挖。
+          // 【实测 · 2026-11-13 17:03】原来挖完还会**再调一次 goNearTree**，
+          // 等于把刚才烧掉的那 17 秒（trySpots 3 个候选）完整重跑一遍：
+          //   [chop] 挖了 1 格后距离 5.6 格
+          //   [chop] 走不到这棵（差 5.6 格），换下一棵
+          // 挖出来的通道应该直接用掉，而不是"重算候选格再走"。
+          //
+          // 现在：挖完就看距离，够得着就砍，不够就换树（不再重跑 goNearTree）。
           if (d <= 9) {
             this.log(`[chop] 差 ${d.toFixed(1)} 格，挖开挡路的方块过去`)
             let dug = 0
+            const tDig2 = Date.now()
             try { dug = await digTowardTrunk(base, 8) } catch (e) {}
-            if (dug > 0) {
-              await this.ensureChunks(1500)
-              // 挖出新空间后，候选格会变 —— 重新算、重新走
-              await goNearTree(base, 10000)
-              d = base.distanceTo(this.pos())
-              this.log(`[chop] 挖了 ${dug} 格后距离 ${d.toFixed(1)} 格`)
-            }
+            d = base.distanceTo(this.pos())
+            this.log(`[chop] 挖了 ${dug} 格（${Date.now() - tDig2}ms），现在距树 ${d.toFixed(1)} 格`)
           }
           if (d > 4.2) {
             this.log(`[chop] 走不到这棵（差 ${d.toFixed(1)} 格），换下一棵`)
