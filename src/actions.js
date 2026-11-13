@@ -1456,7 +1456,46 @@ class Actions {
    * @param {{budgetMs?:number}} opts budgetMs = 调用方能给的预算（默认按棵数估）
    */
   async chopTree (count = 1, opts = {}) {
+    // 冷却：上一次 chopTree 因为"附近没树"失败后，短时间内别再从头扫一遍。
+    //
+    // 【实测 · 2026-11-13 11:19】日志里连续 4 次 `48/64/80/96 格内没扫到树`
+    // + `走了 0.0 格`，每次都是完整的"扫四圈 -> 走不动"流程，
+    // 240 秒的 `砍树` 任务预算就被这四次重复扫描烧光了。
+    // 调用方（ensureWood / ensurePickaxe）不知道上一次已经确认过"这片没树"，
+    // 它们只会一遍遍重试。这里用一个短冷却挡住。
+    const now = Date.now()
+    if (this._chopNoTreeUntil && now < this._chopNoTreeUntil) {
+      const wait = Math.round((this._chopNoTreeUntil - now) / 1000)
+      this.log(`[chop] 刚确认过这片没树（还要等 ${wait}s），跳过`)
+      return 0
+    }
     await this.ensureChunks()
+
+    // ===== 在地下找不到树，先上去 =====
+    //
+    // 【实测 · 2026-11-13 11:30】出生点在 y=55 的地下，
+    // 日志连续 4 次 `48/64/80/96 格内没扫到树`，把 240 秒预算烧光，
+    // 整轮 e2e 0%（8 个任务全断在"没有原木"）。
+    //
+    // 树在地表。在 y=55 扫 96 格当然一棵都没有 —— 这是几何问题，不是运气问题。
+    // mine() 早就有这条判断（`/_log$/ && isUnderground()` -> 先回地面），
+    // chopTree 没有，补上。
+    if (this.isUnderground() === true) {
+      this.log('[chop] 在地下（y=' + Math.round(this.pos().y) + '），树在地表，先上去')
+      try {
+        await this.getToSurface(60)
+      } catch (e) {
+        this.log('[chop] 回地面失败: ' + e.message)
+      }
+      await this.ensureChunks(3000)
+      // 上来了就继续；没上来就直接失败，别在地下白扫
+      if (this.isUnderground() === true) {
+        this.log('[chop] 还在 y=' + Math.round(this.pos().y) + ' 的地下，砍不了树')
+        return 0
+      }
+      this.log('[chop] 回到地面 y=' + Math.round(this.pos().y))
+    }
+
     const logs = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log',
       'mangrove_log', 'cherry_log', 'pale_oak_log']
     let trees = 0
@@ -2021,6 +2060,45 @@ class Actions {
       // 成功率高得多）。之前直接对树干做 GoalBlock，A* 找不到落脚点，
       // 33 格外的树每棵白耗 5 秒。
       if (base.distanceTo(p0) > 8) {
+        // 【实测 · 2026-11-13 11:07】树在 86 格外时，一次性 GoalXZ 会
+        // 「卡死（只挪了 1.0 格）」—— pathfinder 对 80+ 格的长距离
+        // 目标算不出路就原地不动。分段走：每次目标 30 格，走 3~4 段。
+        let segRounds = 0
+        while (base.distanceTo(this.pos()) > 35 && segRounds < 4 &&
+               Date.now() - t0 < DEADLINE) {
+          segRounds++
+          const me = this.pos()
+          const dd = base.distanceTo(me)
+          const k = Math.min(30, dd - 20) / dd
+          const segX = me.x + (base.x - me.x) * k
+          const segZ = me.z + (base.z - me.z) * k
+          const before = this.pos().clone()
+          try {
+            this.bot.pathfinder.setGoal(new goals.GoalXZ(
+              Math.floor(segX), Math.floor(segZ)))
+          } catch (e) {}
+          const sSeg = Date.now()
+          let lastSeg = this.pos().clone()
+          let stillSeg = 0
+          try {
+            while (Date.now() - sSeg < 12000) {
+              this.check()
+              const q = this.pos()
+              if (q.distanceTo(lastSeg) < 0.12) stillSeg += 200
+              else stillSeg = 0
+              lastSeg = q.clone()
+              if (stillSeg > 4000) break
+              await sleep(200)
+            }
+          } finally {
+            try { this.bot.pathfinder.setGoal(null) } catch (e) {}
+          }
+          const movedSeg = this.pos().distanceTo(before)
+          this.log(`[chop] 分段靠近 ${segRounds}/4：走了 ${movedSeg.toFixed(1)} 格，` +
+            `距树 ${base.distanceTo(this.pos()).toFixed(1)} 格`)
+          if (movedSeg < 3) break      // 走不动了，别再分段
+        }
+
         const s = Date.now()
         let still = 0
         let last = this.pos().clone()
@@ -2261,7 +2339,11 @@ class Actions {
           const d = base.distanceTo(p)
           const dy = Math.abs(base.y - p.y)
           // 优先：水平近 + 高度差小（高度差大的树要爬坡，成功率低）
-          out.push({ base, name: l, d, dy, score: d + dy * 6 })
+          // 另外给"超过 40 格"的树加重罚分 —— 实测 86 格外的树
+          // GoalXZ 直接卡死（只挪 0~1 格），goNearTree 全程白跑。
+          // 宁可选 40 格内远一点但能走到的，也别挑 90 格外的。
+          const farPenalty = d > 60 ? (d - 60) * 3 : (d > 40 ? (d - 40) * 1.5 : 0)
+          out.push({ base, name: l, d, dy, score: d + dy * 6 + farPenalty })
         }
       }
       out.sort((a, b) => a.score - b.score)
@@ -2369,10 +2451,35 @@ class Actions {
           continue
         }
 
-        // 96 格都没有：走远找（40 格/轮）。走完之后把半径收回 48 重新开始涨。
+        // 96 格都没有：先确认自己在不在洞里。
+        //
+        // 【实测 · 2026-11-13 11:16】出生在 y=55 的深层地下，96 格内全是石头，
+        // 日志是这样的：
+        //   48/64/80/96 格内没扫到树
+        //   第 1 轮换方向：走了 0.0 格 -> 68,55,-8     ← 一步都没走
+        //   第 1 轮换方向：走了 0.0 格 -> 68,55,-8     ← 又一次
+        // 后面四次调用全部重复这个循环，240 秒就这么烧完了。
+        // 在洞里 walkAway 是没用的（pathfinder 出不去），必须先把人弄到地面。
+        if (this.isUnderground()) {
+          this.log('[chop] 在洞里找不到树，先想办法出去')
+          try { await this.getToSurface() } catch (e) {}
+          await this.ensureChunks(3000)
+          // 出来之后把半径收回 48 重扫
+          scanRadius = 48
+          list = candidates(scanRadius)
+          if (list.length) {
+            this.log(`[chop] 出洞后找到 ${list.length} 棵树`)
+            break
+          }
+          // 还没出来/还是没树：这一轮到此为止，交给下面的换方向
+        }
+
+        // 走远找（40 格/轮）。走完之后把半径收回 48 重新开始涨。
         const moved = await walkAway([])
         if (moved < 8) {
           this.complain('nothingFound', '走了一圈没树')
+          // 记住"这片没树"，60 秒内别让调用方再从头扫一遍
+          this._chopNoTreeUntil = Date.now() + 60000
           throw new Error(`附近 96 格内没有可达的树（已换方向 ${awayRounds} 轮、` +
             `耗时 ${Math.round((Date.now() - t0) / 1000)}s）`)
         }
@@ -2472,6 +2579,12 @@ class Actions {
       const elapsed = Math.round((Date.now() - t0) / 1000)
       this.log(`[chop] 只砍到 ${trees}/${count} 棵（${elapsed}s，换方向 ${awayRounds} 轮，` +
         `预算 ${Math.round(DEADLINE_MS / 1000)}s）`)
+      // 一棵都没砍到并且换方向也走不动：设冷却，别让调用方立刻重来
+      if (trees === 0 && awayRounds >= 1) {
+        this._chopNoTreeUntil = Date.now() + 45000
+      }
+    } else {
+      this._chopNoTreeUntil = 0     // 成功过就清掉冷却
     }
     return trees
   }
@@ -2767,7 +2880,14 @@ class Actions {
     if (__needsPlank && this.plankTotal() === 0 && this.woodCount() === 0) {
       this.log(`[craft] 做 ${name} 要先有木头（木板 0、原木 0），先去弄一根`)
       try {
-        await this.ensureWood(1)
+        // **必须给预算**。不给 budgetMs 时 ensureWood 内部 deadline=0、left()=Infinity，
+        // 两轮 chopTree 各自能跑满自己的 DEADLINE（实测 e2e --only 做木镐
+        // 在这里卡了 170 秒还没出来，任务直接超时）。
+        //
+        // 给 55 秒：e2e 给"做木镐"的总预算只有 150 秒，而找出树+走近实测要 60 秒，
+        // 剩下还得留时间做木板/木棍/合成。90 秒会把后面的步骤全部挤掉
+        // （实测 159s 超时，日志停在"分段靠近 3/4"）。
+        await this.ensureWood(1, { budgetMs: 55000 })
       } catch (e) {
         this.log('[craft] 弄木头失败: ' + e.message)
       }
@@ -3140,10 +3260,42 @@ class Actions {
     const usable = this.bot.recipesFor(id, null, Math.max(1, count - this.countOf(name)), table || null)
     // 关键：优先用补料时选的那个配方，别让 usable[0] 换成别的变体
     // （补的是 oak_planks，结果用了需要 birch_planks 的配方 -> missing ingredient）
+    //
+    // 【实测的根因 · 2026-11-13 11:06】这里原来用 `r.result.id === pick.r.result.id`
+    // 来认"同一个配方"。但 minecraft 里同一件物品的多份配方 **result.id 完全相同**：
+    //   实测 stick 有 13 份配方（cherry/bamboo/mangrove/warped/...），
+    //   `new Set(rs.map(r => r.result.id)).size === 1` -> 全部等于 946。
+    // 于是 `usable.find(...)` 永远命中 available 列表的第一份（cherry_planks），
+    // 拿它去合成手里明明是 oak 木板 —— 服务端返回 missing ingredient，
+    // mineflayer 再重试也是一样的错，最后报 `合成 stick 后背包没变化（0/2）`。
+    // 木镐因此做不出来（3 木板 + 2 木棍，木棍这一环永远挂）。
+    //
+    // 正确做法：比 **原料集合**（delta 里 count<0 的那些 id），不是比 result.id。
+    // 木棍的 cherry 配方和 oak 配方 result.id 一样，但原料 id 不一样。
+    const deltaKey = (r) => {
+      try {
+        const neg = r.delta.filter(d => d.count < 0).map(d => `${d.id}x${-d.count}`).sort()
+        return neg.join('|')
+      } catch (e) { return '' }
+    }
     let recipe = pick.r
     if (usable && usable.length) {
-      const same = usable.find(r => r.result.id === pick.r.result.id)
-      recipe = same || usable[0]
+      const wantKey = deltaKey(pick.r)
+      const same = usable.find(r => deltaKey(r) === wantKey)
+      if (same) {
+        recipe = same
+      } else {
+        // 找不到原料完全一致的：退一步找"原料我能凑齐"的那份
+        const affordable = usable.filter(r => {
+          try {
+            return r.delta.every(d => d.count >= 0 || this.countOf((mcData.items[d.id] || {}).name || '') >= -d.count)
+          } catch (e) { return false }
+        })
+        recipe = affordable[0] || usable[0]
+        if (affordable.length && deltaKey(recipe) !== wantKey) {
+          this.log(`[craft] ${name}：原料对不上，改用「${deltaKey(recipe)}」（原计划「${wantKey}」）`)
+        }
+      }
     }
     const okCraft = await this.safeCraft(recipe, times, table || null)
     if (!okCraft) throw new Error('合成 ' + name + ' 失败')
@@ -3189,11 +3341,23 @@ class Actions {
         }
 
         // 重新取配方（背包可能刚变）
+        //
+        // 【同上一处的 bug】不能直接取 rs[0] —— 同一件物品的多份配方
+        // result.id 完全一样（stick 有 13 份，全是 946），rs[0] 可能是用
+        // 我手上没有的那种木板。必须按**原料集合**找同一个配方。
         try {
           const id = recipe.result && recipe.result.id
           if (id) {
             const rs = this.bot.recipesFor(id, null, Math.max(1, times), table || null)
-            if (rs && rs.length) { recipe = rs[0]; continue }
+            const keyOf = (r) => {
+              try { return r.delta.filter(d => d.count < 0).map(d => `${d.id}x${-d.count}`).sort().join('|') } catch (e) { return '' }
+            }
+            if (rs && rs.length) {
+              const want = keyOf(recipe)
+              const match = rs.find(r => keyOf(r) === want)
+                || rs.find(r => { try { return r.delta.every(d => d.count >= 0 || this.countOf((mcData.items[d.id] || {}).name || '') >= -d.count) } catch (e) { return false } })
+              if (match) { recipe = match; continue }
+            }
             // 取不到配方 = 材料真的不够，再试也是空转，直接失败
             throw new Error('材料不够，配方已不可用: ' + msg)
           }
@@ -5028,9 +5192,17 @@ class Actions {
           break
         }
 
+        // 保险：配方必须真的是"用这种原木做这种木板"。
+        // 同一物品的多份配方 result.id 是一样的（见 craftSmart 里的说明），
+        // 直接 rs[0] 有可能拿到用别的原木的那份。
+        const logId = this.itemId(l)
+        const fit = rs.find(r => {
+          try { return r.delta.some(d => d.id === logId && d.count < 0) } catch (e) { return false }
+        }) || rs[0]
+
         const before = this.countOf(p)
         try {
-          await this.safeCraft(rs[0], 1, null)
+          await this.safeCraft(fit, 1, null)
         } catch (e) {
           this.log(`[planks] ${p} 合成失败: ${e.message}`)
           break

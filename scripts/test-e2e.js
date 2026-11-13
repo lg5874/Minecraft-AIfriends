@@ -566,22 +566,29 @@ const TASKS = [
       if (!chosen) chosen = dirs[0]
 
       let tunneled = 0
-      for (let step = 0; step < 3; step++) {
+      for (let step = 0; step < 4; step++) {
         const p = a.pos()
-        // 挖脚和头两格
+        // 挖脚和头两格（allowBare：夹具只为造环境，不要掉落物）
         for (const dy of [0, 1]) {
           const b = bot.blockAt(p.offset(chosen.dx, dy, chosen.dz))
           if (!b || b.name === 'air' || b.name === 'cave_air') continue
-          try { await a.digAt(b) } catch (e) {}
+          try { await a.digAt(b, { allowBare: true }) } catch (e) {}
         }
-        // 往前走一步
-        try {
-          await bot.look(chosen.yaw, 0, true)
-          bot.setControlState('forward', true)
-          await sleep(650)
-          bot.setControlState('forward', false)
-        } catch (e) {}
-        await sleep(400)
+        // 走进新挖的格子。
+        // 原来的写法只 setControlState('forward')，朝向可能没对准，
+        // 结果人原地打转 —— 掘进 3 格后还在原地，头顶照样通天，
+        // 于是报「y=66 仍被判为露天」。改成目标坐标寻路，稳得多。
+        const tx = Math.floor(p.x) + chosen.dx
+        const tz = Math.floor(p.z) + chosen.dz
+        const ty = Math.floor(p.y)
+        try { await a.goto(tx, ty, tz, 0, 6000) } catch (e) {}
+        // 确认真的进去了
+        for (let k = 0; k < 10; k++) {
+          const q = a.pos()
+          if (Math.floor(q.x) === tx && Math.floor(q.z) === tz) break
+          await sleep(150)
+        }
+        await sleep(250)
         tunneled++
         // 已经够深就停
         if (step >= 1 && a.isUnderground()) break
