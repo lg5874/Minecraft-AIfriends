@@ -1122,13 +1122,34 @@ class Actions {
     // 调用方那个 300 秒任务预算被整个烧穿，端到端永远显示"挖石头 301s 超时"。
     //
     // 现在：只有在"剩余预算至少够一轮最坏砍树（45 秒）"时才允许开这一轮。
-    if (left() > 45000 && this.woodCount() === 0) {
+    // 【实测的 bug · 2026-11-13 10:31 e2e】
+    //   `弄不到镐子（木板 14、木棍 4、原木 1，试了 0 轮砍树，剩 190s）`
+    // 木板 14 张、木棍 4 根都够做木镐了，却直接抛错 ——
+    // 因为这里写的是 `left() > 45000 && this.woodCount() === 0`：
+    // **只有"一根原木都没有"时才进来**。原木剩 1 个时条件为假，
+    // 整段被跳过，然后一路走到最后的 throw。
+    //
+    // 现在：只要"料够"或者"还有预算砍树"就进来试一次。
+    const canCraftNow = plankTotal() >= 3 && this.countOf('stick') >= 2
+    if (canCraftNow) {
+      // 料已经齐了，不用砍树，直接做
+      this.log(`[tool] 料齐了（木板 ${plankTotal()}、木棍 ${this.countOf('stick')}），直接做木镐`)
+      try {
+        await this.craftSmart('wooden_pickaxe', 1)
+        have = pickUp()
+        if (have) { await this.bot.equip(have, 'hand'); this.log('[tool] 做成了木镐'); return have.name }
+      } catch (e) {
+        this.log('[tool] 直接做木镐失败: ' + e.message)
+      }
+    }
+
+    // 料不够：还有预算就再砍一轮树补料
+    if (left() > 45000 && !canCraftNow) {
       this.log(`[tool] 再补一轮原木（剩 ${Math.round(left() / 1000)}s）`)
       try {
-        // 注意：ensureWood 不接受预算参数，它内部固定最多两轮 chopTree。
-        // 所以这里不能"传个预算就安心"——只能靠上面的 left() > 45000 把关，
-        // 保证开这一轮时至少有跑完一轮最坏砍树的预算。
-        await this.ensureWood(LOGS_NEEDED, { budgetMs: Math.min(left() - 10000, 200000) })
+        if (this.woodCount() === 0) {
+          await this.ensureWood(LOGS_NEEDED, { budgetMs: Math.min(left() - 10000, 200000) })
+        }
         await this.anyPlanks(PLANKS_NEEDED)
         await this.craftSmart('stick', 2)
         await this.craftSmart('wooden_pickaxe', 1)
@@ -1137,7 +1158,7 @@ class Actions {
       } catch (e) {
         this.log('[tool] 补料后还是失败: ' + e.message)
       }
-    } else if (this.woodCount() === 0) {
+    } else if (!canCraftNow) {
       this.log(`[tool] 剩 ${Math.round(left() / 1000)}s，不够再砍一轮树，直接放弃`)
     }
 
@@ -2664,7 +2685,23 @@ class Actions {
     if (!cands.length) throw new Error('没有 ' + name + ' 的配方')
 
     // 2. 木板统一成"手上能做的种类"，避免去凑樱桃木板这种
-    const myPlank = this.myPlankKind()
+    //
+    // 【实测的 bug · 2026-11-13 10:38】`myPlankKind()` 在没有存货、没有原木时
+    // 会**按"附近有哪种树"猜**一个品种返回。于是出现了：
+    //   背包空、附近有樱花树 -> myPlankKind() = 'cherry_planks'
+    //   -> 下面 prefer 过滤把 oak/birch/... 的配方全滤掉，只剩 cherry 那一份
+    //   -> 补料补不到 cherry_planks（没砍到樱花木）
+    //   -> `补料 2 遍后仍缺：cherry_planks 要 3 有 0`，做木镐 153 秒失败
+    // 而实际上此时只要用 oak 就行（`附近有树但不确定种类 -> 默认 oak_planks` 那条兜底
+    // 在"找到了 cherry_log"时永远走不到）。
+    //
+    // 修法：**只有手上真的握着这个品种的木板/原木时**才用它来收窄配方。
+    // 纯猜测（countOf 都是 0）时不要过滤，让评分去挑最容易做的那份。
+    const guessedPlank = this.myPlankKind()
+    const myPlank = guessedPlank && (this.countOf(guessedPlank) > 0 ||
+      this.countOf(String(guessedPlank).replace(/_planks$/, '_log')) > 0)
+      ? guessedPlank
+      : null
     if (myPlank) {
       const prefer = cands.filter(r => {
         const names = r.delta.filter(d => d.count < 0)
@@ -2691,20 +2728,72 @@ class Actions {
     if (reachable.length) cands = reachable
 
     // 3. 挑一个"手头材料最足、需要额外弄的最少"的配方
+    //
+    // 【实测的 bug · 2026-11-13 10:38】只按 missing/inHand 打分时，
+    // "手上什么都没有"会让 12 份木镐配方全部打平（都是缺 3 木板 + 2 木棍），
+    // 排序后拿到第一份 —— 恰好是 cherry_planks。
+    // 于是去补 cherry 木板，砍到的却是橡木，`补料 2 遍后仍缺：cherry_planks 要 3 有 0`。
+    //
+    // 现在加一个"这个品种我到底能不能弄到"的分级：
+    //   3 = 手上就有这种木板
+    //   2 = 手上有对应的原木（直接能做成木板）
+    //   1 = 附近真的有这种树（findBlock 点得到）
+    //   0 = 完全没线索
+    // 打分先按缺失量，再按品种可得性。
+    /**
+     * 这个品种的木板，我现在到底有多容易弄到？
+     *
+     * 【实测的教训 · 2026-11-13 10:44】只按"附近有没有这种树"给分是不够的：
+     *   森林里 oak/birch/cherry 树**同时存在**，findBlock 全部返回真值，
+     *   12 份配方又都缺同样多的料，于是又打平 -> 排序后还是拿到 cherry，
+     *   然后去补 cherry_log、补不到、白烧 176 秒。
+     *
+     * 关键是"**手上已有的原木/木板**"权重必须远高于"附近有这种树"：
+     *   6 = 手上就有这种木板
+     *   5 = 手上有对应的原木（1 个原木就能做成 4 张）
+     *   3 = 附近真的有这种树
+     *   0 = 没线索
+     * 而且 6/5 这两档在排序里应该排在 missing 之前 ——
+     * 手上有的品种永远比"更省 1 张料"更值得选。
+     */
+    const plankKindScore = (plankName) => {
+      try {
+        if (this.countOf(plankName) > 0) return 6
+        const logName = String(plankName)
+          .replace(/_planks$/, '_log')
+          .replace(/^bamboo_log$/, 'bamboo')
+          .replace(/^crimson_log$/, 'crimson_stem')
+          .replace(/^warped_log$/, 'warped_stem')
+        if (this.countOf(logName) > 0) return 5
+        if (plankName === 'bamboo_planks' || /^(crimson|warped)_planks$/.test(plankName)) return 0
+        if (this.findBlock(logName, 48)) return 3
+      } catch (e) {}
+      return 0
+    }
+
     const scored = cands.map(r => {
       const needs = {}
       for (const d of r.delta) if (d.count < 0) needs[d.id] = (needs[d.id] || 0) - d.count
       let missing = 0
       let inHand = 0
+      let kind = 0
       for (const [iid, n] of Object.entries(needs)) {
         const it = mcData.items[parseInt(iid, 10)]
         if (!it) continue
         const have = this.countOf(it.name)
         if (have >= n) inHand += n
         else missing += (n - have)
+        if (/_planks$/.test(it.name)) kind = Math.max(kind, plankKindScore(it.name))
       }
-      return { r, needs, missing, inHand }
-    }).sort((a, b) => (a.missing - b.missing) || (b.inHand - a.inHand))
+      return { r, needs, missing, inHand, kind }
+    }).sort((a, b) => {
+      // 第一优先：手上/手里原木就能做的品种（6/5 档），永远优于纯"附近有树"
+      const aOwn = a.kind >= 5 ? 1 : 0
+      const bOwn = b.kind >= 5 ? 1 : 0
+      if (aOwn !== bOwn) return bOwn - aOwn
+      // 其次才比缺失量、品种线索、手上存量
+      return (a.missing - b.missing) || (b.kind - a.kind) || (b.inHand - a.inHand)
+    })
 
     const pick = scored[0]
 
@@ -2802,11 +2891,25 @@ class Actions {
           this.log(`[craft] 补 ${item.name} 抛错: ${e.message}（现在 ${this.countOf(item.name)}/${n}）`)
         }
 
-        // b. 合不出来：直接从世界里拿
+        // b. 合不出来：直接从世界里拿。
+        //
+        // 【实测 · 2026-11-13 10:35】`[mine] 到时间上限（50s），已挖到 2 个`
+        // 之后 gather 认为成功（旧实现只看 >0），补料循环就放行了，
+        // 最后拿着 2 个圆石去合成石镐 -> missing ingredient。
+        // gather 现在会如实返回 false；这里再给它一次机会
+        // （mine 有单次时长上限，再跑一次通常能凑够剩下的 1 个）。
         if (!got) {
-          try {
-            got = await this.gather(item.name, n - this.countOf(item.name))
-          } catch (e) { got = false }
+          for (let attempt = 0; attempt < 2 && !got; attempt++) {
+            const lack = n - this.countOf(item.name)
+            if (lack <= 0) { got = true; break }
+            try {
+              got = await this.gather(item.name, lack)
+            } catch (e) { got = false }
+            if (!got) {
+              this.log(`[craft] 采 ${item.name} 第 ${attempt + 1} 次没凑够（还差 ${lack}），再试一次`)
+              await sleep(300)
+            }
+          }
         }
 
         // c. 石头类材料：先保证有镐子，再挖一次。
@@ -4234,7 +4337,11 @@ class Actions {
             const up = this.bot.blockAt(p.offset(dx, dy + 1, dz))
             if (!base || !at || !up) continue
             if (!solid(base.name)) continue
-            const atFree = at.name === 'air' || at.name === 'cave_air' || at.boundingBox === 'empty'
+            // 有些 bbox=empty 的方块服务端仍拒绝往上放东西（实测 leaf_litter）。
+            // 只认真正的 air / cave_air，以及少数确实能替换的（草、雪片）。
+            const REPLACEABLE = /^(short_grass|tall_grass|fern|large_fern|dead_bush|snow|vine|seagrass|kelp)$/
+            const atFree = at.name === 'air' || at.name === 'cave_air' ||
+              (at.boundingBox === 'empty' && REPLACEABLE.test(at.name))
             const upOk = up.boundingBox !== 'block'
             if (!atFree || !upOk) continue
 
@@ -4312,7 +4419,11 @@ class Actions {
             const up = this.bot.blockAt(p.offset(dx, dy + 1, dz))
             if (!base || !at || !up) continue
             if (!solid(base.name)) continue
-            const atFree = at.name === 'air' || at.name === 'cave_air' || at.boundingBox === 'empty'
+            // 有些 bbox=empty 的方块服务端仍拒绝往上放东西（实测 leaf_litter）。
+            // 只认真正的 air / cave_air，以及少数确实能替换的（草、雪片）。
+            const REPLACEABLE = /^(short_grass|tall_grass|fern|large_fern|dead_bush|snow|vine|seagrass|kelp)$/
+            const atFree = at.name === 'air' || at.name === 'cave_air' ||
+              (at.boundingBox === 'empty' && REPLACEABLE.test(at.name))
             const upOk = up.boundingBox !== 'block'
             if (!atFree || !upOk) continue
 
@@ -4843,16 +4954,33 @@ class Actions {
     try {
       if (/_log$/.test(src[0]) || src[0] === 'stone') {
         if (src[0] === 'stone') {
+          const before = this.countOf(itemName) +
+            (itemName === 'cobblestone' ? this.countOf('cobbled_deepslate') : 0)
           const got = await this.mine('stone', count + 2)
-          return got > 0
+          const after = this.countOf(itemName) +
+            (itemName === 'cobblestone' ? this.countOf('cobbled_deepslate') : 0)
+          // 【实测 · 2026-11-13 10:35】不能只看"有没有挖到"。
+          // 日志：`[mine] 到时间上限（50s），已挖到 2 个`
+          //       -> gather 返回 true（got=2>0）
+          //       -> 补料循环以为圆石够了
+          //       -> craftSmart 拿着 2 个圆石去合成石镐 -> missing ingredient
+          //       -> 报 `补料 1 遍后仍缺：cobblestone 要 3 有 0`
+          // 必须按"够不够 count 个"返回。
+          if (after >= count) return true
+          this.log(`[gather] ${itemName} 要 ${count}，只拿到 ${after}（本次 +${after - before}）`)
+          return false
         }
         await this.chopTree(Math.max(1, Math.ceil(count / 3)))
-        return true
+        return this.countOf(itemName) >= count
       }
       if (itemName === 'torch') return false
       if (/_ore$/.test(src[0])) {
-        const got = await this.mine(src[0], count)
-        return got > 0
+        const before = this.countOf(itemName)
+        await this.mine(src[0], count)
+        const after = this.countOf(itemName)
+        if (after >= count) return true
+        this.log(`[gather] ${itemName} 要 ${count}，只拿到 ${after}（本次 +${after - before}）`)
+        return false
       }
       return false
     } catch (e) { return false }
