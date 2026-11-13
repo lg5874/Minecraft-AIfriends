@@ -42,22 +42,26 @@ const main = async () => {
   const localSha = execSync('git rev-parse HEAD', { cwd: ROOT, encoding: 'utf8' }).trim()
   console.log('本地 HEAD:', localSha.slice(0, 7))
 
-  // 3. 找出远端没有的提交
-  let commits
+  // 3/4. 找变化的文件
+  // 如果本地没有远端那个 commit（API 推送产生的历史），就退化成
+  // "用远端 tree 作 base，把当前 HEAD 的全部文件都推一遍"
+  let changed
+  let forceAll = false
   try {
-    commits = execSync(`git rev-list ${remoteSha}..${localSha}`, { cwd: ROOT, encoding: 'utf8' })
-      .trim().split('\n').filter(Boolean).reverse()
+    execSync(`git cat-file -e ${remoteSha}`, { cwd: ROOT, stdio: 'ignore' })
+    changed = execSync(`git diff --name-status ${remoteSha} ${localSha}`, { cwd: ROOT, encoding: 'utf8' })
+      .trim().split('\n').filter(Boolean)
+    const commits = execSync(`git rev-list ${remoteSha}..${localSha}`, { cwd: ROOT, encoding: 'utf8' })
+      .trim().split('\n').filter(Boolean)
+    console.log('要推', commits.length, '个提交')
   } catch (e) {
-    console.error('无法计算差异:', e.message)
-    process.exit(1)
+    console.log('本地没有远端 commit，改用全量模式')
+    forceAll = true
+    changed = execSync(`git ls-tree -r --name-only ${localSha}`, { cwd: ROOT, encoding: 'utf8' })
+      .trim().split('\n').filter(Boolean).map(f => 'M\t' + f)
   }
-  if (!commits.length) { console.log('没有要推的提交'); return }
-  console.log('要推', commits.length, '个提交')
-
-  // 4. 收集所有变化的文件（相对远端）
-  const changed = execSync(`git diff --name-status ${remoteSha} ${localSha}`, { cwd: ROOT, encoding: 'utf8' })
-    .trim().split('\n').filter(Boolean)
-  console.log('变化文件:', changed.length, '个')
+  if (!changed.length) { console.log('没有要推的文件'); return }
+  console.log('变化文件:', changed.length, '个', forceAll ? '(全量)' : '')
 
   // 5. 先建 blob
   const treeItems = []
@@ -69,7 +73,8 @@ const main = async () => {
       continue
     }
     const abs = path.join(ROOT, file)
-    if (!fs.existsSync(abs)) continue
+    // 跳过目录
+    try { if (!fs.statSync(abs).isFile()) continue } catch (e) { continue }
     const content = fs.readFileSync(abs)
     const blob = await api('POST', `/repos/${OWNER}/${REPO}/git/blobs`, {
       content: content.toString('base64'),

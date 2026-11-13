@@ -133,6 +133,7 @@ const TASKS = [
     async run (a, bot, ctx) {
       const cnt = () => a.countOf('cobblestone') + a.countOf('cobbled_deepslate')
       const before = cnt()
+      const t0 = Date.now()
       const hadPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
 
       // 路径 A：原子动作 mine()。这是"他自己写代码"会调的入口。
@@ -142,19 +143,38 @@ const TASKS = [
         retA = await a.mine('stone', 3, 24)
       } catch (e) { errA = e.message }
       await sleep(1000)
+      const tA = Date.now()
       const afterA = cnt()
 
       // 路径 B：现成的脚手架 digStone()（会自己往下挖到石头层）。
       // ROADMAP 阶段 1 要回答的就是"原子动作够不够" —— 所以两条路都测，
       // 数据才有对比价值：A 成 B 不成 / A 不成 B 成，结论完全不同。
+      //
+      // 关键：digStone() 没有自己的时限，内部会连着 ensurePickaxe -> chopTree。
+      // 实测它一把能烧 225 秒，把本任务的 300 秒预算吃掉，
+      // 结果「挖石头」永远显示 301s 超时 —— 测的变成了 digStone，不是 mine。
+      // 所以回退路径必须有自己的时间盒，超时就记"超时"，让 mine 的耗时独立可比。
       let retB = null
       let errB = null
+      let pathBTimeout = false
       if (afterA <= before) {
-        ctx.notes.push('挖石头：mine() 没产出，自动回退测 digStone() 做对比')
+        ctx.notes.push('挖石头：mine() 没产出，自动回退测 digStone()（限 90s 做对比）')
+        const BUDGET_B = 90000
         try {
-          retB = await a.digStone(3)
-        } catch (e) { errB = e.message }
-        await sleep(1000)
+          retB = await Promise.race([
+            a.digStone(3),
+            new Promise((_, rej) => setTimeout(() => {
+              pathBTimeout = true
+              rej(new Error('__B_timeout__'))
+            }, BUDGET_B))
+          ])
+        } catch (e) {
+          if (pathBTimeout) errB = `digStone 超过 ${BUDGET_B / 1000}s`
+          else errB = e.message
+        }
+        try { a.stop() } catch (e) {}
+        try { bot.clearControlStates() } catch (e) {}
+        await sleep(800)
       }
       const after = cnt()
 
@@ -166,7 +186,7 @@ const TASKS = [
       return {
         ok,
         kind: ok ? null : (errA || errB ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
-        detail: `圆石 ${before} -> ${after}｜${pathA}（返回 ${JSON.stringify(retA)}` +
+        detail: `圆石 ${before} -> ${after}｜mine 段 ${Math.round((tA - t0) / 1000)}s｜${pathA}（返回 ${JSON.stringify(retA)}` +
           `${errA ? '，异常: ' + errA.slice(0, 40) : ''}）｜${pathB}` +
           `${errB ? '，异常: ' + errB.slice(0, 40) : ''}` +
           `｜${hadPick ? '开局已有镐' : '开局没镐（要先自己造）'}`
