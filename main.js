@@ -2622,6 +2622,36 @@ class Bot {
         try { return this.actions.isUnderground() } catch (e) { return null }
       })()
     })
+    // 【travel 阶段要真的走够】2026-11-14
+    //
+    // 实测（盲执行人抓到的那条）：
+    //   >>> 开始：先往远处走走，看看那边有没有树
+    //   [ledger] 背包+0 减0 方块6 位移3.6 ｜ 结论:成
+    //   [proof] 硬判据通过：位移 3.6 格
+    // 目标是「往外走 80 格」，走了 3.6 格就判完成 ——
+    // 因为阶段 evidence 盖的是 'world'（方块变了就算数），而 travel 该看的是「走了多远」。
+    //
+    // 玩家视角：「说要去找树，43 秒就『做完』了，光走路都不止这点时间。」
+    //
+    // 所以：travel 阶段额外要求 stageProgress().ratio >= 0.8。
+    // 只加这一条，不改 judge 的维度体系（那影响面太大）。
+    try {
+      if (res && res.ok && stage && stage.kind === 'travel' && this.goals && this.goals.status) {
+        // 【别再用 stageProgress】它是 goals 模块导出的**函数**，不是实例方法。
+        // 第一版写成 `this.goals.stageProgress()` —— 那会抛 TypeError，
+        // 而外面包着 try/catch，于是**这个守卫一次都没真正执行过**。
+        // 这是今晚第七个「没连上」，只是这次的受害者是我自己。
+        const st2 = this.goals.status()
+        const ratio = st2 && Number.isFinite(st2.progress) ? st2.progress : null
+        if (ratio !== null && ratio < 0.8) {
+          this.log(`[proof] travel 没走够（${st2.progressText || Math.round(ratio * 100) + '%'}），不算完成`)
+          res.ok = false
+          res.why = `只走了 ${st2.progressText || Math.round(ratio * 100) + '%'}，没到地方`
+          res.evidence = ''
+        }
+      }
+    } catch (e) {}
+
     this._lastProof = res
     // 账本对照：日志里声称的产量 vs 真实背包增量。
     // 哨兵审计里"声称 +0 件、实际捡起 28 件"就是这么来的：

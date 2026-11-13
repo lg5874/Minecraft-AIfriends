@@ -154,11 +154,55 @@ const INSTRUCTION_WHOLE = (() => {
 })()
 
 /** 这句话是不是把提示词里的指令当正文说出来了 */
+/**
+ * 残缺句子：以标点开头（2026-11-14，修复后时间线里抓到的）。
+ *
+ * 【现场】
+ *   [04:33:42] [say] ，都是同一个路数。
+ * 模型把上下文里的半句话接了上来，第一个字就是逗号。
+ * 玩家看到的是一个以逗号开头的公屏消息 —— 一眼就知道这不是人在打字。
+ */
+const LEADING_PUNCT = /^[，。、；：！？,.;:!?…—\-）)】」》>]/
+
+/**
+ * 引用对话历史：把自己的/对方的前一句话念出来（2026-11-14）。
+ *
+ * 【现场】
+ *   [04:32:02] [say] 刚才你还说了"四点了 该睡了"和"谁啊这
+ * 触发是 complain:robbed，但模型把 chat history 当素材复述了。
+ * 真人不会说「刚才你还说了"X"」—— 那是在读聊天记录，不是在聊天。
+ */
+const QUOTE_HISTORY = /(刚才|刚刚|之前|前面)[^，。]{0,8}说[了过]?[^，。]{0,6}["“”『』「」‘’']/
+
+/**
+ * 提示词里的方括号选项格式（2026-11-14）。
+ *
+ * 【现场 · 05:15:43】
+ *   [say] 或 [不理]
+ * 提示词里写着「回答，或者 [不理]」这种选项格式，模型把 `[不理]` 念了出来。
+ * 玩家在公屏上看到一个方括号标签 —— 一眼就是机器。
+ *
+ * 判据：整句里出现 `[中文]` 这种方括号包中文的模式。
+ * 不拦 `[ ]` 空括号或英文（正常聊天里偶尔会有）。
+ */
+const BRACKET_LABEL = /\[[\u4e00-\u9fa5]{1,6}\]/
+
+function isBrokenUtterance (text) {
+  const t = String(text || '').trim()
+  if (!t) return true
+  if (LEADING_PUNCT.test(t)) return true
+  if (BRACKET_LABEL.test(t)) return true
+  if (QUOTE_HISTORY.test(t)) return true
+  // 只有一个字（「嗯」「哦」「不」）—— 昨晚 UNHUMAN-SCAN 第 1 条的另一种形态
+  if (t.replace(/[\s，。、；：！？,.!?]/g, '').length <= 1) return true
+  return false
+}
+
 function isInstructionLeak (text) {
   const t = String(text || '').trim()
   if (!t) return false
   return INSTRUCTION_PREFIX.test(t) || INSTRUCTION_TAIL.test(t) || INSTRUCTION_WHOLE(t) ||
-    META_RECAP.test(t) || META_SELF_CMD.test(t)
+    META_RECAP.test(t) || META_SELF_CMD.test(t) || isBrokenUtterance(t)
 }
 
 /**
@@ -1608,7 +1652,19 @@ Talk.prototype.findRecentDuplicate = function (text) {
   const mine = norm(text)
   if (mine.length < 2) return null   // 「嗯」「？」这种短应答不算复读
 
-  const recent = (this.recentSaid || []).slice(-5)
+  // 【窗口从 5 条扩到 30 分钟】2026-11-14
+  //
+  // 盲执行人（对话线）的原话：
+  //   「[70:25]「谁啊这是 这大半夜的」—— 和 [00:00] 一字不差。实锤。」
+  //
+  // 原来只看最近 5 条。而他那两句中间隔了 70 分钟、几十句 —— 5 条抓不到。
+  // 真人不会 70 分钟后把同一句招呼原样再说一遍。
+  //
+  // 改成：30 分钟内说过的、字面（归一化后）相同的，都算复读。
+  // 30 分钟是个宽松窗口 —— 一小时以后再说同一句，人也会（"又天亮了"）。
+  const WINDOW = 30 * 60 * 1000
+  const now = Date.now()
+  const recent = (this.recentSaid || []).filter(x => now - (x.at || 0) < WINDOW)
   for (let i = recent.length - 1; i >= 0; i--) {
     if (norm(recent[i].text) === mine) return recent[i]
   }

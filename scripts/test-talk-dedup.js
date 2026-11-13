@@ -286,7 +286,7 @@ async function testRegression () {
 
   // 不同的人说同一句话，都要回（查重是按 人+话 的 key）
   {
-    const { talk, sent, dir } = mkTalk({ lines: ['在', '嗯'] })
+    const { talk, sent, dir } = mkTalk({ lines: ['在呢 你说', '嗯 我听着'] })
     await talk.reply('老王', '你在吗')
     await talk.reply('小李', '你在吗')
     ok(sent.length === 2, '不同的人说同一句，都回', `(发了 ${sent.length} 条)`)
@@ -296,7 +296,7 @@ async function testRegression () {
 
   // 同一个人说不同的话，都要回
   {
-    const { talk, sent, dir } = mkTalk({ lines: ['在', '挖矿呢'] })
+    const { talk, sent, dir } = mkTalk({ lines: ['在呢 咋了', '挖矿呢 有事说'] })
     await talk.reply('老王', '你在吗')
     await talk.reply('老王', '干嘛呢')
     ok(sent.length === 2, '同一人不同的话，都回', `(发了 ${sent.length} 条)`)

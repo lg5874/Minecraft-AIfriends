@@ -486,9 +486,22 @@ class Reflex {
     if (lvl !== this.lastThreatLog || now - this.lastThreatLogAt > 60000) {
       this.lastThreatLog = lvl
       this.lastThreatLogAt = now
+      // 【日志要说实话】2026-11-14
+      //
+      // lvl 2 的实际分支是：
+      //   if (underAttack || threat) flee(from)
+      //   else eatNow()                       <- 绝大多数时候走这条
+      // 而日志原来一律写「跑」。实测看到：
+      //   [reflex] 血 10（2 档）—— 跑
+      //   [reflex] 血 10（2 档）—— 跑      （每分钟一次，位置一动不动）
+      // 因为他根本没跑，他在试 `eatNow()`，而背包里没吃的 —— 失败是静默的。
+      //
+      // 这会让明早的人（包括我自己）误判成「reflex 说要跑但跑不动 → pathfinder 坏了」，
+      // 而真相是「他在找吃的，但没有」。
+      const fighting = !!(opts.underAttack || threat)
       const what = lvl === 4 ? '跑 + 吃东西 + 不接新任务'
-        : lvl === 3 ? '跑 + 吃东西'
-          : lvl === 2 ? '跑' : '拉开距离'
+        : lvl === 3 ? (fighting ? '跑 + 吃东西' : '找吃的（没威胁）')
+          : lvl === 2 ? (fighting ? '跑' : '找吃的') : '拉开距离'
       this.ctx.log(`[reflex] 血 ${Math.round(hp)}（${lvl} 档）—— ${what}`)
     }
     return lvl
