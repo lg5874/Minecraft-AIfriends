@@ -3655,6 +3655,7 @@ class Actions {
     if (!this.isUnderground()) return true
 
     const startY = this.pos().y
+    this._surfaceDead = 0     // 每次进入重置死循环计数
     this.log('[surface] 在地下（y=' + Math.round(startY) + '），往上开一条路')
 
     const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]]
@@ -4228,8 +4229,25 @@ class Actions {
               this.log(`[surface] 无路可走，就地往上掏了一格（y=${Math.round(this.pos().y)}）`)
               bad.clear()          // 换了一层，之前拉黑的方向作废
             } else {
-              this.log('[surface] 就地掏也上不去，这一层没戏了')
+              // ===== 死循环退出 =====
+              //
+              // 【实测 · 2026-11-13 12:05】y=55 深层地下，日志四秒内刷 30+ 次
+              // 「就地掏也上不去，这一层没戏了」+「四个方向都挖不成台阶」，
+              // 一直到任务超时（上千行重复）。整轮 e2e 0%。
+              //
+              // 根因：这里只打日志然后 continue，没有任何退出条件。
+              // 加计数器：连续 6 次「掏也上不去」就认输。
+              this._surfaceDead = (this._surfaceDead || 0) + 1
+              this.log(`[surface] 就地掏也上不去（第 ${this._surfaceDead}/6 次）`)
+              if (this._surfaceDead >= 6) {
+                this.log(`[surface] 连续 6 次上不去，这层确实没路，放弃（y=${Math.round(this.pos().y)}）`)
+                this._surfaceDead = 0
+                return false
+              }
             }
+          } else {
+            // 挪动了就重置计数（换了一层，重新算）
+            this._surfaceDead = 0
           }
           await sleep(200)
           continue

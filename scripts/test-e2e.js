@@ -258,7 +258,37 @@ const TASKS = [
       }
 
       const before = a.countOf('wooden_pickaxe')
-      const wood = a.woodCount()
+      let wood = a.woodCount()
+
+      // ===== 先保证有木头，否则测的是 chopTree 不是 craftSmart =====
+      //
+      // 【实测 · 2026-11-13 12:10】action-fixer 连续跑 6 轮 --only 做木镐，
+      // 每轮出生点 48~96 格内都没有可达的树，全卡在"弄木头"这一步，
+      // 压根走不到 craftSmart 的核心逻辑。
+      //
+      // 这个用例本来是测"合成链"，被 chopTree 的找树成功率淹没了。
+      // 所以：先自己备木头（最多 90 秒），备不到就标成环境跳过，
+      // 不要让它冒充"合成链失败"。
+      if (wood < 3) {
+        ctx.notes.push(`做木镐前只有 ${wood} 个原木，先备料`)
+        const t0 = Date.now()
+        while (a.woodCount() < 3 && Date.now() - t0 < 90000) {
+          try { await a.chopTree(1) } catch (e) { break }
+          if (a.woodCount() >= 3) break
+          try { await a.wander(35) } catch (e) {}
+          try { await a.ensureChunks(2500) } catch (e) {}
+        }
+        wood = a.woodCount()
+        ctx.notes.push(`备料用了 ${Math.round((Date.now() - t0) / 1000)}s，现有原木 ${wood}`)
+      }
+      if (wood < 3) {
+        return {
+          ok: false,
+          skip: true,
+          detail: `备不到木头（只有 ${wood} 个原木），测不了合成链 —— 这是找树的问题，不是 craftSmart`
+        }
+      }
+
       let err = null
       try {
         await a.craftSmart('wooden_pickaxe', 1)
