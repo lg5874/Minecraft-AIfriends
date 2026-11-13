@@ -5414,15 +5414,27 @@ class Actions {
 
     // 挖掉一格。返回 true 表示这一格现在是空的（本来就空也算成功）
     const digOne = async (v) => {
+      // 【诊断】2026-11-14 —— 只输出"它看到了什么"，不改判断
+      //
+      // 实测 [03:59:34] 四个方向全是 `挖不开，换方向`，而他背包里有 wooden_pickaxe
+      // 用完 30 次。所以要么是判据不认，要么是挖了服务端不认。
+      // 参谋：这是「地下 → 地面」的唯一通道，iron/diamond/getup 三个目标都靠它。
+      const why = (r) => {
+        try {
+          const name = b ? b.name : '读不到'
+          this.log(`[surface] 这一格不成：${name} @${Math.round(v.x)},${Math.round(v.y)},${Math.round(v.z)} 原因=${r}`)
+        } catch (e) {}
+        return false
+      }
       const b = bot.blockAt(v)
-      if (!b) return false
+      if (!b) return why('blockAt 读不到')
       if (b.boundingBox !== 'block') return true
-      if (/bedrock|lava|water/.test(b.name)) return false
+      if (/bedrock|lava|water/.test(b.name)) return why('基岩/岩浆/水')
       // 【卡死修复 · 2026-11-14 02:35】没镐子时 stone 挖不动（空手 7.5s 起，
       // 服务端还常常不回包）。原来每个方向都试满 15 秒，四个方向 = 1 分钟白烧，
       // 人还越挖越低（45->42）。没镐就只碰软方块，硬方块直接判这个方向不行。
       if (!this.hasPickaxe() && /stone|deepslate|andesite|granite|diorite|cobble|ore|obsidian|brick|terracotta|calcite|tuff|basalt|blackstone|copper|iron|gold|coal|diamond|emerald|redstone|lapis|quartz/.test(b.name)) {
-        return false
+        return why('没镐 + 硬方块')
       }
       try {
         await this.bestToolFor(b)
@@ -5433,7 +5445,7 @@ class Actions {
       }
       // 关键：挖完要捡。不捡的话"挖了半天背包还是空的"，
       // 后面想垫台阶/搭柱子就没有料了。
-      if (!isFree(v)) return false
+      if (!isFree(v)) return why('挖了但那一格还是实心（服务端丢挖掘包？）')
       await grabDrops(3)
       return true
     }

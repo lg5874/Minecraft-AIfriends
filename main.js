@@ -1747,8 +1747,47 @@ class Bot {
     // 2. 天亮重置
     const tod = bot.time && bot.time.timeOfDay
     if (tod !== undefined && (tod < 12000 || tod > 23500)) {
+      const wasNight = this._wasNight
       this.sheltered = false
       this._nightAlerted = false     // 新的一夜可以再警觉一次
+      this._wasNight = false
+
+      // 【天亮要出洞】2026-11-14
+      //
+      // 这是用户最大的那句抱怨「我每次见到他他都在地下」的直接机制：
+      //   天黑 -> reflex.shelter() 往下挖 2 格 + 封顶 -> 躲进去
+      //   天亮 -> **这里只清了两个标记，没有任何"爬出来"的动作**
+      //   下一次有人需要地面 -> 才碰巧触发 getToSurface
+      // 于是他可以在地下的洞里待很久。
+      //
+      // 实测：`[03:57:38] [night] 天黑了，挖个洞躲一下` 之后 y 从 58 掉到 54。
+      //
+      // 真人天亮了会自己钻出来。这里补上这条出口：
+      //   · 只在"刚从天黑变天亮"那一刻触发（wasNight）
+      //   · 只在没忙的时候（不打断手上的活）
+      //   · 在地下才做（y 低于地表基准）
+      //   · try 包住，挖不上去也不影响主循环
+      if (!this.busy && this.actions) {
+        const y = bot.entity && bot.entity.position ? bot.entity.position.y : null
+        const SURFACE_Y = 58
+        // 【不只认"刚天亮"】2026-11-14
+        //
+        // 原来写的是 `wasNight &&` —— 但 bot 是白天启动的，`_wasNight` 一开始是
+        // undefined，所以第一次天亮不会触发。而"第一次"恰好是明早用户进来的那一刻。
+        //
+        // 现在改成：白天 + 在地下 + 没忙 + 10 分钟内没试过 -> 就出来。
+        // 不管他是"昨晚躲进来的"还是"启动时就在下面"。
+        const sinceTry = Date.now() - (this._lastSurfaceTryAt || 0)
+        if (y != null && y < SURFACE_Y && sinceTry > 10 * 60 * 1000) {
+          this._lastSurfaceTryAt = Date.now()
+          this.log(`[day] 天亮了还在下面（y=${Math.round(y)}），爬出去`)
+          try { await this.actions.getToSurface() } catch (e) {
+            this.log('[day] 出洞失败：' + (e && e.message))
+          }
+        }
+      }
+    } else if (tod !== undefined) {
+      this._wasNight = true
     }
 
     // 3. 天黑 + 血少 -> 躲
