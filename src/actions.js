@@ -2810,6 +2810,19 @@ class Actions {
     this.check()
     if (this.countOf(name) >= count) return true
 
+    // 【实测 · 2026-11-13 11:41】顶层调用时背包可能还没同步。
+    // e2e 刚砍完树（原木 0 -> 5），紧接着 `做木镐` 第一行就打出
+    //   `[craft] 做 wooden_pickaxe 要先有木头（木板 0、原木 0），先去弄一根`
+    // —— 明明包里有 5 个原木，countOf 却读到 0。
+    // 掉落物拾取后服务端回包有延迟，本地 inventory 还没更新。
+    // 顶层（depth === 0）先同步一次再决策，避免误判"没木头"。
+    if (depth === 0 && this.woodCount() === 0 && this.plankTotal() === 0) {
+      try {
+        await this.syncInventory()
+        await sleep(300)
+      } catch (e) {}
+    }
+
     const id = this.itemId(name)
     const need = count - this.countOf(name)
 
@@ -2887,7 +2900,18 @@ class Actions {
         // 给 55 秒：e2e 给"做木镐"的总预算只有 150 秒，而找出树+走近实测要 60 秒，
         // 剩下还得留时间做木板/木棍/合成。90 秒会把后面的步骤全部挤掉
         // （实测 159s 超时，日志停在"分段靠近 3/4"）。
-        await this.ensureWood(1, { budgetMs: 55000 })
+        //
+        // 再加一层硬超时：实测 `chopTree` 并不完全遵守调用方预算
+        // （日志 `[chop] 预算 150s（调用方给 60s）`），会一路跑到自己的 DEADLINE，
+        // 于是 e2e --only 做木镐 连续两轮都 168 秒超时、卡在找树阶段。
+        // ensureWood 属于 chopTree 那一摊（gap-fixer 在改），我不动它，
+        // 但在这个调用点用 Promise.race 兜住 —— 到点就放弃，把时间留给后面。
+        await Promise.race([
+          this.ensureWood(1, { budgetMs: 55000 }),
+          sleep(60000).then(() => {
+            this.log('[craft] 弄木头超时 60s，放弃这条路')
+          })
+        ])
       } catch (e) {
         this.log('[craft] 弄木头失败: ' + e.message)
       }
@@ -3338,6 +3362,20 @@ class Actions {
         // 材料不够：先同步背包再看配方还在不在
         if (/missing ingredient|not enough/i.test(msg)) {
           await this.syncInventory()
+        }
+
+        // 【实测 · 2026-11-13 11:52】服务端偶尔不回 updateSlot 包：
+        //   `oak_planks 合成失败: 材料不够，配方已不可用:
+        //    Error: Event updateSlot:0 did not fire within timeout of 20000ms`
+        // 这条报错的名字里带 "材料不够"，但**根因是网络/服务端卡顿**，
+        // 不是真的缺料。它一次就烧掉 20 秒，四次重试 80 秒。
+        // 这类只重试一次，并且等更久让服务端缓过来。
+        const isSlotTimeout = /updateSlot.*did not fire|did not answer/i.test(msg)
+        if (isSlotTimeout) {
+          this.log(`[craft] 服务端回包超时（第${i + 1}次），等 1.5s 再试`)
+          await sleep(1500)
+          if (i >= 1) break        // 连续两次超时就别耗了
+          continue
         }
 
         // 重新取配方（背包可能刚变）
@@ -4454,7 +4492,9 @@ class Actions {
     if (blockName) {
       filler = this.item(blockName)
     } else {
-      for (const n of ['dirt', 'cobblestone', 'andesite', 'stone', 'gravel', 'granite', 'diorite', 'cobbled_deepslate']) {
+      // 软方块优先（空手就能挖到），硬方块兜底
+      for (const n of ['dirt', 'sand', 'gravel', 'clay', 'grass_block', 'coarse_dirt',
+        'cobblestone', 'andesite', 'stone', 'granite', 'diorite', 'cobbled_deepslate']) {
         const it = this.item(n)
         if (it && it.count > 0) { filler = it; break }
       }
@@ -4512,17 +4552,28 @@ class Actions {
         }
       }
 
-      // ===== 3. 跳 =====
+      // ===== 3. 跳，并轮询到"跳够了"再放 =====
+      //
+      // 【实测 · 2026-11-13 11:38】原来固定 sleep(140) 后放，
+      // 日志 `[chop] 垫方块 17909ms：上升 -0.5 格` —— 17909 毫秒一次都没搭上。
+      // 原因：固定延时对不上跳跃曲线。跳起要 ~300ms 到顶点，
+      // 140ms 时脚还在目标方块体积里，服务端拒绝放置。
+      //
+      // 改成轮询：起跳后每 40ms 看一次，等到真的升高 1.02 格才放。
+      const F0 = Math.floor(p0.y)
       try {
         bot.setControlState('jump', true)
-        await sleep(140)
+        for (let t = 0; t < 20; t++) {
+          await sleep(40)
+          if (this.pos().y - F0 >= 1.02) break
+        }
       } catch (e) { break }
 
       // ===== 4. 空中低头，往"脚下实心方块的顶面"放 =====
       let placed = false
       try {
         await bot.look(bot.entity.yaw, Math.PI / 2, true)
-        await sleep(70)
+        await sleep(50)
         await bot.equip(filler, 'hand')
         const ground = bot.blockAt(bot.entity.position.offset(0, groundY, 0))
         if (ground && ground.boundingBox === 'block') {
@@ -5071,12 +5122,16 @@ class Actions {
       // 现在：剩余不够 60 秒就明确不再开这一轮，且 roundBudget 不超过剩余。
       if (deadline) {
         const remain = left()
-        if (remain < 60000) {
-          this.log(`[wood] 只剩 ${Math.round(remain / 1000)}s，不够再砍一轮（最少 60s）`)
+        // 【实测 · 2026-11-13 11:39】原来门槛写死 60 秒，
+        // 调用方给 55 秒时直接 `[wood] 只剩 55s，不够再砍一轮（最少 60s）` 就退出，
+        // 于是 craftSmart 9 秒失败 —— 明明还有 55 秒可用。
+        // 门槛降到 30 秒：够走到近处的一棵树并砍一两块。
+        if (remain < 30000) {
+          this.log(`[wood] 只剩 ${Math.round(remain / 1000)}s，不够再砍一轮（最少 30s）`)
           break
         }
         const share = Math.floor(remain / (2 - round))
-        const roundBudget = Math.max(60000, Math.min(share, remain - 5000))
+        const roundBudget = Math.max(30000, Math.min(share, remain - 5000))
         try {
           const got = await this.chopTree(wantTrees, { budgetMs: roundBudget })
           if (!got) {
@@ -5208,10 +5263,19 @@ class Actions {
           break
         }
         await sleep(60)
-        const gained = this.countOf(p) - before
+        let gained = this.countOf(p) - before
         if (gained <= 0) {
-          // 报成功但背包没变：别再空转
-          this.log(`[planks] ${p} 报成功但背包没变，停手`)
+          // 【实测 · 2026-11-13 11:52】服务端回包慢时，这里会读到 0：
+          //   `[planks] oak_planks 报成功但背包没变，停手`
+          //   `[planks] 只做出 2/12 木板（原木剩 4 个）`   ← 原木还有 4 个！
+          // 明明合成成功了，只是 inventory 还没更新。
+          // 先同步背包再看一次，别急着停手。
+          try { await this.syncInventory() } catch (e) {}
+          await sleep(400)
+          gained = this.countOf(p) - before
+        }
+        if (gained <= 0) {
+          this.log(`[planks] ${p} 报成功但背包没变（同步后仍是 0），停手`)
           break
         }
         made += gained
