@@ -5392,6 +5392,12 @@ class Actions {
       if (!b) return false
       if (b.boundingBox !== 'block') return true
       if (/bedrock|lava|water/.test(b.name)) return false
+      // 【卡死修复 · 2026-11-14 02:35】没镐子时 stone 挖不动（空手 7.5s 起，
+      // 服务端还常常不回包）。原来每个方向都试满 15 秒，四个方向 = 1 分钟白烧，
+      // 人还越挖越低（45->42）。没镐就只碰软方块，硬方块直接判这个方向不行。
+      if (!this.hasPickaxe() && /stone|deepslate|andesite|granite|diorite|cobble|ore|obsidian|brick|terracotta|calcite|tuff|basalt|blackstone|copper|iron|gold|coal|diamond|emerald|redstone|lapis|quartz/.test(b.name)) {
+        return false
+      }
       try {
         await this.bestToolFor(b)
         await this.digWithTimeout(b, 15000)
@@ -5783,6 +5789,10 @@ class Actions {
     // 收紧到 45 秒：4~5 步没有实质上升就说明这地形走不通了。
     const NO_RISE_MS = 45000
     const HARD_MS = 180000          // 整个函数最多 3 分钟
+    // 【卡死修复】没镐 + 石洞 = 物理上上不去。20 秒内没开出路就认输，
+    // 把时间还给上层（血 3 找吃的时，180 秒不出结果 = 用户看到"卡死"）。
+    const NO_PICK_CAP_MS = 20000
+    const fnStart = Date.now()
     let lastRiseAt = Date.now()
     const fnStartAt = Date.now()
     let stuckSteps = 0
@@ -5819,6 +5829,10 @@ class Actions {
             `判定走不通：上升 ${climbed} 格 / ${fillerCount()} 块料 / ` +
             `头顶 ${nameAt(this.pos().offset(0, 2, 0))} / ` +
             `镐=${bot.inventory.items().some(i => /_pickaxe$/.test(i.name)) ? '有' : '无'}`)
+          break
+        }
+        if (!this.hasPickaxe() && Date.now() - fnStart > NO_PICK_CAP_MS) {
+          this.log(`[surface] 没镐子、${Math.round((Date.now() - fnStart) / 1000)} 秒没开出路，认输（别在地下耗死）`)
           break
         }
         if (Date.now() - fnStartAt > HARD_MS) {
@@ -6095,6 +6109,11 @@ class Actions {
       const b = bot.blockAt(p.offset(0, dy, 0))
       if (!b || b.boundingBox !== 'block') continue
       if (/bedrock|lava|water/.test(b.name)) return false
+      // 【卡死修复】没镐 + 石头 = 挖不动，别再花 15 秒证明一次
+      if (!this.hasPickaxe() && /stone|deepslate|andesite|granite|diorite|cobble|ore|obsidian|brick|terracotta|calcite|tuff|basalt|blackstone|copper|iron|gold|coal|diamond|emerald|redstone|lapis|quartz/.test(b.name)) {
+        this.log(`[surface] 没镐，挖不动 ${b.name}，换路`)
+        return false
+      }
       try {
         await this.bestToolFor(b)        // 有镐就换上，没镐也继续
         bot.setControlState('forward', false)
@@ -7518,7 +7537,7 @@ class Actions {
       try {
         const ok = await Promise.race([
           this.getToSurface(),
-          sleep(Math.min(60000, left() - 20000)).then(() => false)
+          sleep(Math.min(25000, left() - 15000)).then(() => false)
         ])
         if (ok) {
           this.log('[food] 回到地面了')
@@ -8086,6 +8105,11 @@ class Actions {
     if (!f || !f.foodPoints) return null
     if (/poisonous_potato|pufferfish|spider_eye|suspicious_stew/.test(name)) return null
     return f
+  }
+
+  /** 手上有没有镐子。空手挖 stone 是 7.5 秒起步、还常常挖不掉 —— 判据要提前用。 */
+  hasPickaxe () {
+    try { return this.bot.inventory.items().some(i => /_pickaxe$/.test(i.name)) } catch (e) { return false }
   }
 
   hasFood () {

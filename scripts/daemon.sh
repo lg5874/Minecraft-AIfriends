@@ -51,12 +51,15 @@ case "${1:-status}" in
     else
       echo "没有守护在跑"
     fi
-    pkill -f "node main.js" 2>/dev/null && echo "bot 已停"
+    pkill -f "^node main\.js$" 2>/dev/null; pkill -f "node main\.js$" 2>/dev/null; echo "bot 已停"
     ;;
 
   restart)
     # 只杀 bot，守护会自动拉起 —— 用来"换个起点"（比如让他回家再重开）
-    pkill -f "node main.js" 2>/dev/null && echo "bot 重启中（守护会 5 秒后拉起）"
+    # 【关键】只杀真正的 bot（命令行以 node main.js 开头/结尾），
+    # 不能写成 pkill -f "node main.js" —— 那会匹配到守护自己的
+    # bash -c 命令行（里面含这个字符串），一 restart 就把守护也杀了。
+    pkill -f "node main\.js$" 2>/dev/null && echo "bot 重启中（守护会 5 秒后拉起）"
     ;;
 
   status)

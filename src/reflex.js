@@ -278,6 +278,24 @@ class Reflex {
     if (typeChanged || lowerBand || sinceLog > 60000) {
       this._sosLogAt = now
       try { this.ctx.log(`[sos] 血 ${Math.round(hp)}，紧急保命（${k || '未知'}）`) } catch (e) {}
+
+      // 【喊救命】跟日志同一档节流（换类型 / 掉档 / 一分钟一次），不会刷屏。
+      //
+      // 为什么要有：明天用户第一眼很可能就是"他血 3 卡在洞里"。
+      // 真人这时候会喊"我快不行了，有吃的吗" —— 那是**双向**的开场，
+      // 用户有事可做；而一个一声不吭的伤者，用户只会觉得"这号坏了"。
+      try {
+        if (this.ctx && typeof this.ctx.say === 'function' && hp > 0) {
+          const pool = k === 'drown'
+            ? ['我快淹死了', '水里上不去', '我沉底了']
+            : (k === 'lava' || k === 'on_fire' || k === 'in_fire')
+              ? ['着火了', '烫死我了', '我身上着火了']
+              : (hp <= 6
+                  ? ['血不多了', '快撑不住了', '有人吗 我快不行了', '我快挺不住了 有吃的吗']
+                  : ['血有点低', '我得缓一下'])
+          this.ctx.say(pool[Math.floor(Math.random() * pool.length)])
+        }
+      } catch (e) {}
     }
 
     // 1. 溺水：往上浮

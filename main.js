@@ -558,7 +558,12 @@ class Bot {
         if (this._taskProgress && Date.now() - this._taskProgress.at > 60000) return false
         return true
       },
-      onEvent: (kind, data) => this.onReflexEvent(kind, data)
+      onEvent: (kind, data) => this.onReflexEvent(kind, data),
+      // 【求救要能说出口】reflex 原来只动作不说话 —— ctx.say 从来没传过，
+      // 所以血 3 卡在洞里的 20 分钟里他一句没吭（实测 /tmp/soak2.log）。
+      // 明天用户第一眼最需要听到的就是"我快不行了，有吃的吗"。
+      // talk 还没建好时静默跳过（构造顺序上 reflex 早于 talk）。
+      say: (t) => { try { if (this.talk) this.talk.say(t) } catch (e) {} }
     })
     this.reflex.start()
 
@@ -1700,6 +1705,20 @@ class Bot {
         this._lastDangerAt = now
         this.log('[survive] ' + danger)
       }
+      // 【自救时也要能说话】2026-11-14
+      //
+      // 原来这里直接 doSurvive + return，而 spont.tick 在 1777 行（这一行后面）——
+      // 也就是说：**只要进入生存模式，他一句吐槽/社交都说不出来。**
+      //
+      // 实测：血 3 卡在洞里的那段时间，20 分钟只说了 1 句（还是上线那句），
+      // 而 onDeath 明明 push 了 complain:died 事件、队列里也攒着，
+      // tick 从来没被调用过。
+      //
+      // 明天他很可能长期处于生存状态（血低/饿），这条不修就等于"他一直不说话"。
+      // complain/social 本来就是 busyExempt 的，tick 内部会自己判该不该说。
+      if (this.spont && this.talk) {
+        try { await this.spont.tick(this.talk) } catch (e) {}
+      }
       await this.doSurvive(danger)
       return
     }
@@ -1719,6 +1738,18 @@ class Bot {
         const near = this.reflex.nearestHostile(12)
         if (near) { this.reflex.flee(near); await sleep(3000) }
         await this.reflex.shelter()
+      }
+      // 【同一个形状的第二个连接】2026-11-14
+      //
+      // 天黑 + 血<=14 躲起来时，这里原来直接 sleep+return，
+      // 而 spont.tick 在 1777 行（后面）—— 也就是说：
+      // **天一黑、他又血少，他就不能说话了。**
+      //
+      // 普通模式有怪，明天他天黑大概率会躲；这条不修 = 晚上他是个哑巴。
+      // 跟上面危险分支同一个修法：complain/social 是 busyExempt 的，
+      // tick 内部自己判该不该说，外面只要别忘了调它。
+      if (this.spont && this.talk) {
+        try { await this.spont.tick(this.talk) } catch (e) {}
       }
       await sleep(8000)
       return
@@ -1845,15 +1876,25 @@ class Bot {
         this.log('[comply] 歇着，顺手做：' + want.text)
       } else {
         // 其它一律压到休息结束
-        if (this.pendingTask) {
-          this.log('[rest] 正在歇着，「' + this.pendingTask.text + '」等缓过来再说')
+        //
+        // 【别刷屏】这段每秒跑一次，原来每次都打一行 —— 实测 `[rest] 正在歇着，…`
+        // 每 5 秒一条，10 分钟 120 条，日志全被它淹了（真正的问题反而看不见）。
+        // 改成 60 秒一次，而且只在"被什么压住了"这件事变了的时候才说。
+        const heldKey = (this.pendingTask ? this.pendingTask.text : '') + '|' +
+          (this.will && this.will.current ? this.will.current.text : '')
+        if (heldKey !== this._restHeldKey || Date.now() - (this._restHeldAt || 0) > 60000) {
+          this._restHeldKey = heldKey
+          this._restHeldAt = Date.now()
+          if (this.pendingTask) {
+            this.log('[rest] 正在歇着，「' + this.pendingTask.text + '」等缓过来再说')
+          }
+          if (this.will && this.will.current) {
+            this.log('[rest] 歇着，把手上「' + (this.will.current.text || '') + '」先放下')
+          }
         }
         // impulse 不问了（歇着没冲动）
-        if (this.will && this.will.current) {
-          this.log('[rest] 歇着，把手上「' + (this.will.current.text || '') + '」先放下')
-          this.will.current = null
-        }
-        await sleep(1000)
+        if (this.will && this.will.current) this.will.current = null
+        await sleep(3000)
         return
       }
     }
