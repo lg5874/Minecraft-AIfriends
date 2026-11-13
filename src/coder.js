@@ -65,6 +65,8 @@ class Coder {
         this.lastCode = sk.code
         return { ok: true, code: sk.code, output: out.output, reused: sk.name }
       }
+      // 复用失败也要记任务级统计，否则 stats.reuseFail 永远是 0，复用率虚高
+      this.skills.markTask({ reused: true, ok: false })
       skillFailed = out.error || String(out.output || '未知原因')
       this.ctx.log(`[skill] ${sk.name} 跑挂了：${skillFailed}`)
     }

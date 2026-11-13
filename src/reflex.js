@@ -22,6 +22,13 @@ class Reflex {
     this.stuckSince = 0
     this.fleeUntil = 0
     this.timer = null
+
+    // 救命线：血到这个数以下，不管在忙什么都要先保命。
+    // 实测事故：血 6 -> 5 -> 3 -> 2 用了 2 秒就死，而 busy 门禁把他
+    // 挡在「任务里」不让跑。这条阈值以下的处理绕开 busy。
+    this.SOS_HP = 6
+    this.sosUntil = 0
+    this.sosKind = ''
   }
 
   start () {
@@ -38,11 +45,100 @@ class Reflex {
   }
 
   // 被打：记录，并判断要不要还手
-  onHurt (attacker) {
+  /**
+   * 紧急保命。血 <= SOS_HP 时无条件执行，**不看 busy**。
+   *
+   * 三件事按优先级：
+   *   1. 环境伤害（溺水/岩浆）-> 先离开原地，往向上方向游/跳
+   *   2. 有怪 -> 跑
+   *   3. 什么都没有 -> 吃东西回血
+   */
+  sos (kind, opts = {}) {
+    const bot = this.bot
     const now = Date.now()
+    // 节流：1.2 秒内不重复执行（tick 800ms 一轮，避免动作打架）。
+    //
+    // 两种例外必须立刻放行：
+    //   1) urgent=true —— 溺水/岩浆这类"下一秒就死"的，不等节流
+    //   2) 伤害类型变了 —— 先摔后淹，处理方式完全不同
+    const urgent = !!opts.urgent || kind === 'drown' || kind === 'lava' ||
+      kind === 'on_fire' || kind === 'in_fire'
+    const typeChanged = !!(this.sosKind && kind && this.sosKind !== kind)
+    // 血还在往下掉 -> 上一轮没救住，必须重新判断（否则会眼睁睁看着死）
+    const hp = this.bot.health
+    const dropping = typeof hp === 'number' && typeof this.sosHp === 'number' && hp < this.sosHp
+    if (!urgent && !typeChanged && !dropping && now - (this.sosAt || 0) < 1200) return
+    this.sosAt = now
+    this.sosKind = kind || ''
+    this.sosHp = typeof hp === 'number' ? hp : null
+
+    try { this.ctx.log(`[sos] 血 ${Math.round(bot.health)}，紧急保命（${kind || '未知'}）`) } catch (e) {}
+
+    // 1. 溺水：往上浮
+    if (kind === 'drown') {
+      try {
+        bot.setControlState('jump', true)
+        setTimeout(() => { try { bot.setControlState('jump', false) } catch (e) {} }, 3000)
+      } catch (e) {}
+      return
+    }
+
+    // 2. 岩浆/着火：找水或者往上跑
+    if (kind === 'lava' || kind === 'on_fire' || kind === 'in_fire') {
+      try {
+        const near = this.nearestHostile(10)
+        if (near) this.flee(near)
+      } catch (e) {}
+      return
+    }
+
+    // 3. 有怪就跑，跑不了就吃
+    let near = null
+    try { near = this.nearestHostile(12) } catch (e) {}
+    if (near) {
+      try { this.flee(near) } catch (e) {}
+      return
+    }
+
+    // 4. 没怪：吃东西回血
+    try { this.eatNow() } catch (e) {}
+  }
+
+  /** 立刻吃一口，不看饥饿值（保命用） */
+  eatNow () {
+    const bot = this.bot
+    if (this.eating) return
+    const food = bot.inventory.items().find(i =>
+      /bread|cooked_|apple|carrot|potato|beef|porkchop|mutton|chicken|melon|baked|stew|kelp|berries/.test(i.name))
+    if (!food) return
+    this.eating = true
+    bot.equip(food, 'hand').then(() => bot.consume()).catch(() => {})
+      .finally(() => { this.eating = false })
+  }
+
+  /**
+   * 挨了一下。
+   *
+   * @param {object|null} attacker 来源实体；环境伤害（摔/淹/饿/岩浆）传 null
+   * @param {number} [health]     当前血量（不传就读 bot.health）
+   * @param {string} [kind]       环境伤害类型：fall/drown/lava/starve...
+   *
+   * 踩过的坑：老版本 attacker 为 null 时直接 return，只打一行「[hurt] 来源不明」。
+   * 于是溺水、摔落、岩浆这些**真能弄死他**的伤害，反射层完全不管 ——
+   * 线上那次从血 6 掉到 2 死掉，就是因为伤害来自环境、没有 attacker。
+   * 现在环境伤害也要走救命逻辑。
+   */
+  onHurt (attacker, health, kind) {
+    const now = Date.now()
+    const hp = typeof health === 'number' ? health : this.bot.health
+
     if (!attacker) {
-      // 不知道谁打的（怪、摔落、环境），不记恩怨
-      this.ctx.log('[hurt] 来源不明')
+      // 环境伤害：不记恩怨，但**必须救命**
+      this.ctx.log(`[hurt] 环境伤害 ${kind || '未知'}，血 ${Math.round(hp)}`)
+      if (hp <= this.SOS_HP) {
+        // 环境伤害（溺水/岩浆）等不起节流窗口，直接 urgent
+        this.sos(kind, { urgent: true })
+      }
       return
     }
     if (attacker.username && attacker.username !== this.bot.username) {
@@ -137,16 +233,31 @@ class Reflex {
       }
     } catch (e) {}
 
+    // ===== 救命线：血 ≤ SOS_HP，不管忙不忙都先保命 =====
+    //
+    // 实测事故：血 6 -> 5 -> 3 -> 2 只用了 2 秒，而当时他在任务里（busy），
+    // 老的 busy 分支只在「有怪」时才跑，环境伤害（淹/摔/岩浆）根本没人管，
+    // 于是照常跑任务直到死。
+    // 现在这条在最前面，绕开 busy，而且环境伤害也算。
+    const hp = bot.health
+    if (typeof hp === 'number' && hp > 0 && hp <= this.SOS_HP) {
+      const near = this.nearestHostile(12)
+      if (near) {
+        this.sos(this.sosKind || 'hostile')
+        this.syncStuckBaseline()
+        return
+      }
+      // 没怪也救命：可能正在溺水/岩浆/摔落，或纯粹血少了
+      this.sos(this.sosKind || 'lowhp')
+      this.syncStuckBaseline()
+      return
+    }
+
     // ===== 任务执行中：只保留救命的事 =====
     // 血还够就一律让路。抢 bot 比"少躲一次夜"危险得多。
     if (this.isBusy()) {
-      // 血真的少了 + 身边确实有怪 -> 还是得跑
-      if (bot.health <= 6) {
-        const near = this.nearestHostile(10)
-        if (near) this.flee(near)
-      }
       // 被怪贴脸也要还手（attack 不抢 pathfinder / dig）
-      if (this.ctx.aggressive !== false && bot.health > 6) {
+      if (this.ctx.aggressive !== false && bot.health > this.SOS_HP) {
         const near = this.nearestHostile(2.5)   // 半径收窄：只有真贴脸才打
         if (near) this.retaliate(near)
       }

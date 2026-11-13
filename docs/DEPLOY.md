@@ -347,7 +347,7 @@ supervise:
 ### 9.1 单元自检
 
 ```bash
-cd /root/workspace/mcplugin
+cd /root/workspace/mcplugin   # 下面几条命令都在这个目录跑
 ./build.sh
 
 PKG=$(ls -t /root/workspace/minecraft-AIfriend/dist/*.tar.gz | head -1)
@@ -362,6 +362,7 @@ java -cp build/classes com.xjj.runner.SelfTest /tmp/xjj-selftest "$PKG"
 ### 9.2 全流程部署验证
 
 ```bash
+cd /root/workspace/mcplugin
 PKG=$(ls -t /root/workspace/minecraft-AIfriend/dist/*.tar.gz | head -1)
 java -cp build/classes com.xjj.runner.DeployCheck /tmp/clean-server "$PKG" --npm
 ```
@@ -373,6 +374,7 @@ java -cp build/classes com.xjj.runner.DeployCheck /tmp/clean-server "$PKG" --npm
 ### 9.3 边界验证
 
 ```bash
+cd /root/workspace/mcplugin
 java -cp build/classes com.xjj.runner.EdgeCheck /tmp/xjj-edge
 ```
 
@@ -423,10 +425,15 @@ Paper 的 `Nag author ... System.out` 告警也已清掉（全程走 `getLogger(
 
 ```bash
 cd /tmp && rm -rf pkgtest && mkdir pkgtest && cd pkgtest
-tar -xzf /root/workspace/minecraft-AIfriend/dist/*.tar.gz
+PKG=$(ls -t /root/workspace/minecraft-AIfriend/dist/*.tar.gz | head -1)
+tar -xzf "$PKG"
 ls                    # main.js src package.json PACKAGE.json data/
 node --check main.js  # 语法
 ```
+
+> 一定要 `"$PKG"` 加引号、只取最新一个。直接写 `tar -xzf dist/*.tar.gz`
+> 在 dist 里有多个包时会把后面几个当成"包内成员名"，报
+> `Not found in archive`。
 
 ---
 
@@ -444,6 +451,93 @@ node scripts/package.js
 
 ---
 
+## 10.5 磁盘要留多少空间（重要）
+
+装完之后 `plugins/XJJBot/` 会占：
+
+| 项 | 大小 | 说明 |
+|---|---|---|
+| `runtime/`（node） | **187 MB** | 系统已有 node ≥18 的话是 0 |
+| `bot/node_modules/` | **143 MB** | 剪过基岩数据后；不剪是 537 MB |
+| `bot/`（代码+数据） | ~1 MB | |
+| `npm-cache/` | 几十 MB | 可以删，下次 install 会重建 |
+| **合计** | **约 340 MB** | 系统有 node 时约 150 MB |
+
+**面板机常见配额是 1–2 GB，这个量级没问题，但要心里有数。**
+
+### 为什么要剪 minecraft-data
+
+`minecraft-data` 这个 npm 包把所有 MC 版本的数据全塞进来，装完 500 MB：
+
+- `bedrock/` — **395 MB**，58 个基岩版数据集
+- `pc/` — 104 MB，73 个 Java 版版本
+
+这是 **Java 版服务器**，基岩数据一个字节都用不上。插件装完依赖会自动把
+`bedrock/` 下的版本目录删掉，**省 392 MB**，`minecraft-data` 从 494 MB 降到 102 MB。
+
+```
+[XJJ] 磁盘瘦身: 删了 58 个基岩版数据集，minecraft-data 494MB -> 102MB，省 392MB
+```
+
+**为什么不动 `pc/`**（这个坑踩了三次）：
+
+1. 删 `pc/common/` → `supportsFeature.js` 加载时 require 不到 `features.json`，直接崩
+2. 删 `bedrock/common/` → 同样崩（即使不用基岩数据，模块加载时也会 require）
+3. 删 `pc` 的旧版本 → `data.js` 里 **1.21.11 的 `windows` 字段直接指向
+   `pc/1.16.1/windows.json`**（上游就这么写的），删了 1.16.1 立刻 `MODULE_NOT_FOUND`
+
+所以只删 `bedrock` 下长得像版本号的目录（数字开头），`common` / `latest` 一律保留，
+`pc` 整个不动。实测删完 `minecraft-data('1.21.11')` 正常返回 1166 方块 / 1505 物品。
+
+想关掉瘦身（比如你还要跑基岩版 bot）：
+
+```yaml
+disk:
+  trimMinecraftData: false
+```
+
+删错了也不怕：重跑 `/xj deploy` 或手动 `npm install` 就恢复。
+
+---
+
+## 10.6 Windows 宿主怎么办
+
+**这个插件只支持 Linux。**
+
+代码里有明确拦截，不会静默失败：
+
+```
+这个插件只支持 Linux 宿主，当前是 Windows Server 2022/amd64。
+  原因：自动下载的是 node-v22.11.0-linux-* 二进制，Windows 上跑不了。
+  选择：
+   1) 把服务器换到 Linux（面板一般都给 Linux 容器，推荐）
+   2) 在服务器上手动装 Node.js >= 18，插件会直接用系统那个
+   3) Windows 想试的话：装好 Node 后把 config.yml 里 node.preferSystem 设为 true
+```
+
+具体哪几处不兼容：
+
+| 位置 | Windows 上的表现 |
+|---|---|
+| node 下载 | URL 拼的是 `node-v22.11.0-linux-x64.tar.gz`，Windows 跑不了 |
+| 孤儿回收 | 依赖 `/proc/PID/cmdline`，Windows 没有 → 跳过（不会崩，但不清 pidfile） |
+| 优雅停止 | `destroy()` 在 Windows 是 TerminateProcess，不发 SIGTERM → 变成硬杀 |
+| npm-cli 路径 | `lib/node_modules/npm/bin` 是 Linux 布局，靠 `npmBin` 兜底 |
+
+**Windows 上唯一能跑的方式**：服务器上已经装了 Node.js ≥18，且
+`config.yml` 里 `node.preferSystem: true`。这样插件不下载、直接用系统的 node，
+孤儿回收和优雅停止会退化，但 bot 能跑起来。
+
+**判断方法**：看启动日志第一行
+
+```
+[XJJ] 宿主: Linux/amd64 | node: 22.11.0 linux-x64 | 系统 node 优先=true
+```
+
+`宿主:` 后面是 `Linux` 就没问题；是 `Windows` / `Mac OS X` 就会打警告。
+
+---
+
 ## 11. 排障
 
 | 现象 | 原因 / 怎么办 |
@@ -458,7 +552,11 @@ node scripts/package.js
 | 服务器被强杀后 bot 变成孤儿 | 不用手动处理。插件下次启动会自动回收（见 6.1），日志里有"发现上次遗留的 bot 进程" |
 | 日志刷 `ECONNREFUSED 127.0.0.1:端口` | `config.json` 里 `bot.port` 跟服务器实际端口不一致。插件首次生成时会自动填对，手改过的话检查一下 |
 | 他一直重启停不下来 | `/xj logs 100` 看退出码。若是 `exit=1` 且日志有"找不到配置文件"，说明 `config.json` 被删了 |
-| 磁盘满了 | `/xj prune`；或把 `log.maxMB` / `keepFiles` 调小 |
+| 磁盘满了 | `/xj prune` 清日志；`rm -rf plugins/XJJBot/npm-cache` 清缓存（几十 MB）；还满就看下面 |
+| npm install 报 `ENOSPC` / `no space left` | 空间不够。插件要 ~340MB（系统有 node 时 ~150MB）。先清 `npm-cache`；面板配额太小就找商家加盘 |
+| `minecraft-data` 没被剪（还是 500MB） | 看日志有没有"磁盘瘦身"。没有就是 `disk.trimMinecraftData: false`，改成 true 后 `/xj restart` |
+| 权限不足 `AccessDeniedException` | 插件要能写 `plugins/XJJBot/` 整个目录。面板机默认就对；自己搭的服务器别用只读挂载 |
+| 文件不可执行 `Permission denied`（node） | 插件会 `setExecutable`，正常情况下不会有。真遇到：`chmod +x plugins/XJJBot/runtime/*/bin/node` |
 
 **卡死时的三板斧**：
 
@@ -484,6 +582,8 @@ tail -200 plugins/XJJBot/logs/bot/bot.log     # 他的视角
 - [ ] 进游戏能看到他
 - [ ] 手机上的旧 bot 已经关掉（不然 `duplicate_login`）
 - [ ] 服务器被强杀过的话不用管，插件下次启动会自动回收孤儿（`bot.pid` 就是干这个的）
+- [ ] 面板磁盘至少留 **400 MB**（见 10.5）
+- [ ] 宿主是 **Linux**（Windows 见 10.6，要手动装 Node）
 
 ---
 

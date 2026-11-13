@@ -84,10 +84,14 @@ function search (entries, q, limit = 8, now = 0) {
 
     const rel = relevance(e, queryChars, queryWords, names)
     const nearBonus = proximity(e, near, places)
-    const recallBonus = Math.min(e.recallCount || 0, 10) * 0.05
+    // 「经常想起」的加成只在**这条跟当前情境沾边**时才算。
+    // 否则一条回忆过几次的记忆会永远霸屏：走到哪都被顶到最前面，
+    // 哪怕它跟现在干的事毫无关系（真实症状：站在 9000 格外还会"想起矿洞口"）。
+    const related = rel > 0 || nearBonus > 0 || (names.length && (e.who || []).some(w => names.includes(w)))
+    const recallBonus = related ? Math.min(e.recallCount || 0, 10) * 0.05 : 0
 
     // 完全没相关、也不是身边的人和事 -> 跳过
-    if (rel <= 0 && recallBonus <= 0 && nearBonus <= 0) {
+    if (!related && recallBonus <= 0) {
       // 例外：说不出话（只给了坐标）时，让地点知识有机会冒出来
       if (!(noQuery && e.kind === 'place')) continue
     }

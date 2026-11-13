@@ -21,6 +21,10 @@ const TOOL_TIERS = { wooden: 1, stone: 2, iron: 3, golden: 3, diamond: 4, nether
 
 // 技能库上限。超过就按"成绩差的先走"淘汰，避免无限膨胀。
 const MAX_SKILLS = 50
+
+// 意图规则的版本号。改了 intentOf 的规则就 +1，
+// 老技能会在下次 load 时自动重算意图（否则新旧数据对不上，合并不了）。
+const INTENT_RULE_VERSION = 2
 const TOOL_KINDS = ['pickaxe', 'axe', 'sword', 'shovel', 'hoe']
 
 function parseToolName (item) {
@@ -155,7 +159,7 @@ function intentOf (desc, code) {
   // 动词要先分清："做一把石镐" 里的"挖"是手段，"合成"才是目的。
   // 所以合成类动词分高，挖掘类动词分低，两者都有时按目的归。
   // "做成储存区"不是合成，别把这种话算成 craft
-  const craftVerb = has(/做一把|做把|做一柄|做一台|做一个|做几|合成一把|合一把|补做|打造|合出|补一把|补上|补齐|备用|换掉|制作|合成|做成|做/) &&
+  const craftVerb = has(/做一把|做把|做一柄|做一台|做一个|做几|合成一把|合一把|补做|打造|合出|补一把|补上|补齐|备用|换掉|制作|合成|做成|做|弄把|弄个|弄一|搞把|搞个|造把|造个/) &&
     !has(/做成(储存|收纳|储物|仓库|区域|储藏)/)
   const digVerb = has(/挖|凿|敲|采矿|矿道|阶梯/)
 
@@ -204,10 +208,24 @@ function intentOf (desc, code) {
   // ---- 战斗 ----
   if (has(/打|僵尸|苦力怕|怪/)) add('fight', 7)
   // ---- 探索 ----
-  if (has(/看看|周围|爬|探索|岩壁|顶上|背面|透光|扫|看头顶/)) add('explore', 6)
+  if (has(/看看|周围|爬|探索|岩壁|顶上|背面|透光|扫|看头顶|看一遍/)) add('explore', 6)
+  // ---- 安全 ----------------------------------------------------
+  // "躲起来养血""别乱跑" 这类高频任务，之前全掉进 misc，
+  // 导致同一件事每次都新增一条（misc/conf0 不参与合并）
+  if (has(/躲|安全|别乱跑|养血|待着|避|逃离|脱险/)) add('safety:hide', 7)
+  // ---- 垫脚/捡物 ------------------------------------------------
+  if (has(/垫脚|捡够|捡些|拾取|捡起来|收集地上/)) add('gather:pickup', 7)
+  // ---- 出门准备 --------------------------------------------------
+  // 只认真正的"备齐再走"，不认"沿途用火把做标记"这种计划碎片
+  if (has(/带上|备好|出门前/) ||
+      (has(/火把/) && has(/再出门|带够|准备好/))) add('prepare:gear', 6)
 
-  // 代码里一次 craft 都没调，说明这活儿压根不是合成 —— 撤掉 craft 候选
-  if (code && !/actions\.(?:craft|craftSmart|safeCraft)\s*\(/.test(String(code))) {
+  // 代码里一次 craft 都没调，说明这活儿压根不是合成 —— 撤掉 craft 候选。
+  // 例外：描述本身就是要做工具（"先弄把铁镐"），这时代码可能是去挖矿凑材，
+  // 目的仍是 craft，不能撤。
+  const descIsCraft = /(?:弄|搞|造|做|备|再来|补)(?:一?把|一?个|一?台)?[^，。]{0,4}(镐|斧|剑|锹|锄|熔炉|工作台|箱子)/.test(t)
+  if (code && !descIsCraft &&
+      !/actions\.(?:craft|craftSmart|safeCraft)\s*\(/.test(String(code))) {
     for (let i = cand.length - 1; i >= 0; i--) {
       if (/^craft:/.test(cand[i][0])) cand.splice(i, 1)
     }
@@ -322,10 +340,18 @@ class SkillLibrary {
   }
 
   migrate (s) {
-    if (!s.intent) {
+    // 意图要随规则更新重算：只在缺失时算的话，改了分类规则老数据永远不更新，
+    // 结果是同一个任务新旧两条意图不一致、永远合并不了（真实踩过）。
+    // 用 INTENT_RULE_VERSION 控制：规则改了就把这个数字 +1。
+    const stale = s.intentRuleVersion !== INTENT_RULE_VERSION || !s.intent
+    if (stale) {
       const it = intentOf(s.desc, s.code)
-      s.intent = it.key
-      s.intentConf = it.conf
+      // 只信"可靠的"新结果；新结果是 misc/low conf 时保留旧的，别把已有分类搞坏
+      if (!s.intent || it.conf >= 5) {
+        s.intent = it.key
+        s.intentConf = it.conf
+      }
+      s.intentRuleVersion = INTENT_RULE_VERSION
     }
     if (!s.analysis) s.analysis = analyzeCode(s.code)
     if (!s.codeHash) s.codeHash = codeHash(s.code)
@@ -382,14 +408,30 @@ class SkillLibrary {
       const proven = totalRuns(hit) > 0 && oldRate >= 0.5
       const replace = !proven && totalRuns(hit) > 0 && oldRate < 0.5
       if (replace) {
+        // 换代码前把这一版的历史归到 retired 里，别凭空抹掉。
+        // 抹掉等于把"这个意图反复失败"的事实洗白，坏技能就会无限复活。
+        hit.retired = hit.retired || []
+        hit.retired.push({
+          codeHash: hit.codeHash,
+          ok: hit.ok || 0,
+          fail: hit.fail || 0,
+          at: Date.now()
+        })
+        if (hit.retired.length > 5) hit.retired = hit.retired.slice(-5)
+
         hit.code = code
         hit.codeHash = hash
         hit.codeSig = sig
         hit.analysis = analysis
-        // 换了代码，旧成绩就不算数了，重新开始记
+        // 累计历史不清零：改用 ok/fail 记"这一版"的成绩，
+        // lifetimeOk/lifetimeFail 记总账，防止换个代码就把账洗了。
+        hit.lifetimeOk = (hit.lifetimeOk || 0) + (hit.ok || 0)
+        hit.lifetimeFail = (hit.lifetimeFail || 0) + (hit.fail || 0)
         hit.ok = 0
         hit.fail = 0
         hit.replaced = (hit.replaced || 0) + 1
+        // 换版次数过多说明这个意图的代码一直不稳，标出来
+        if (hit.replaced >= 3) hit.unstable = true
       }
       hit.desc = hit.desc || desc
       hit.tags = Array.from(new Set([...(hit.tags || []), ...tags]))
@@ -635,22 +677,37 @@ class SkillLibrary {
         const runs = totalRuns(s)
         const rate = successRate(s)
         const tested = runs > 0
-        const conf = s._score + (tested ? (rate - 0.5) * 8 : 0)
-        return { s, conf, tested, rate, runs }
+        // 换过代码的技能要连着上一版的账一起算，否则换个写法就把失败洗白了
+        const lifeOk = (s.lifetimeOk || 0) + (s.ok || 0)
+        const lifeFail = (s.lifetimeFail || 0) + (s.fail || 0)
+        const lifeRuns = lifeOk + lifeFail
+        const lifeRate = (lifeOk + 1) / (lifeRuns + 2)
+        const conf = s._score + (tested ? (rate - 0.5) * 8 : 0) - (s.replaced || 0) * 0.5
+        return { s, conf, tested, rate, runs, lifeRate, lifeRuns }
       })
+      // 三次拦：本版成功率、累计成功率、换版次数
       .filter(x => !x.tested || x.rate >= minRate)
+      .filter(x => x.lifeRuns < 2 || x.lifeRate >= minRate)
+      .filter(x => !(x.s.replaced >= 3 && x.lifeRate < 0.5))
       .sort((a, b) => b.conf - a.conf)
 
     if (!ranked.length) return null
     const best = ranked[0]
+    let why
+    if (!best.tested) why = '新技能，还没试过'
+    else {
+      why = '用过 ' + best.runs + ' 次，成功率 ' + Math.round(best.rate * 100) + '%'
+      if (best.lifeRuns > best.runs) {
+        why += '（累计 ' + best.lifeRuns + ' 次 ' + Math.round(best.lifeRate * 100) + '%）'
+      }
+      if (best.s.replaced) why += ' [换版 ' + best.s.replaced + ' 次]'
+    }
     return {
       skill: best.s,
       confidence: Math.round(best.conf * 100) / 100,
       rate: best.rate,
       tested: best.tested,
-      reason: best.tested
-        ? '用过 ' + best.runs + ' 次，成功率 ' + Math.round(best.rate * 100) + '%'
-        : '新技能，还没试过'
+      reason: why
     }
   }
 

@@ -206,6 +206,73 @@ async function offlineTests () {
     for (const x of [h, h2, h3]) fs.rmSync(x.dir, { recursive: true, force: true })
   }
 
+
+  console.log('\n[A8] 该不该回家（垂直距离也算）')
+  {
+    const mk = (at) => {
+      const h = new Home(null, { dataDir: path.join(os.tmpdir(), 'mcai-home-t' + Date.now()), log: () => {} })
+      h.setHome({ x: 66, y: 64, z: -92 }, '测试', { rank: 9, anchor: 'chest' })
+      h.bot = { entity: { position: { x: at[0], y: at[1], z: at[2] } }, game: { dimension: 'overworld' } }
+      return h
+    }
+
+    // 实测那一幕：他在 y=18，家 y=64，水平只差 82 格
+    {
+      const h = mk([61.5, 18, -9.7])
+      ok(Math.round(h.hDistanceFromHome()) === 82, '水平距离 82 格', `(${Math.round(h.hDistanceFromHome())})`)
+      ok(Math.round(h.vDistanceFromHome()) === 46, '垂直距离 46 格', `(${Math.round(h.vDistanceFromHome())})`)
+      ok(h.isFarFromHome(96, null, false) === false, '旧算法（纯水平）判成"不远" ← 这就是 bug')
+      ok(h.isFarFromHome(96) === true, '新算法（垂直加权）判成"远"')
+      const r = h.shouldHeadHome()
+      ok(r.should === true, 'shouldHeadHome 说该回家', `(${r.why})`)
+      ok(r.urgency >= 0.5, 'urgency 够高，能打断手头的活', `(${r.urgency})`)
+      const sum = h.summary()
+      ok(/差 46 格/.test(sum), 'summary 说清了高差')
+      ok(/该往回走了/.test(sum), 'summary 直接说该回家')
+      fs.rmSync(h.dir, { recursive: true, force: true })
+    }
+
+    // 在自己家：不该走
+    {
+      const h = mk([66, 64, -92])
+      ok(h.shouldHeadHome().should === false, '在家时不吵着回家')
+      ok(/家就在脚下/.test(h.summary()), 'summary 说在家')
+      fs.rmSync(h.dir, { recursive: true, force: true })
+    }
+
+    // 地表同层挖 60 格：不该回（代价 60 < 100）
+    {
+      const h = mk([126, 64, -92])
+      const r = h.shouldHeadHome()
+      ok(r.should === false, '同层 60 格不打断干活', `(代价 ${Math.round(r.cost)})`)
+      fs.rmSync(h.dir, { recursive: true, force: true })
+    }
+
+    // 背包快满：就算不远也该回
+    {
+      const h = mk([106, 64, -92])
+      const r = h.shouldHeadHome({ emptySlots: 1 })
+      ok(r.should === true, '背包快满就回家卸货', `(${r.why})`)
+      fs.rmSync(h.dir, { recursive: true, force: true })
+    }
+
+    // 镐子没了：该回家拿
+    {
+      const h = mk([106, 64, -92])
+      const r = h.shouldHeadHome({ hasPickaxe: false })
+      ok(r.should === true, '镐子没了就回家', `(${r.why})`)
+      fs.rmSync(h.dir, { recursive: true, force: true })
+    }
+
+    // 没家：不该乱走
+    {
+      const h = new Home(null, { dataDir: path.join(os.tmpdir(), 'mcai-home-t' + Date.now()), log: () => {} })
+      h.bot = { entity: { position: { x: 0, y: 64, z: 0 } }, game: {} }
+      ok(h.shouldHeadHome().should === false, '没家时不乱走')
+      fs.rmSync(h.dir, { recursive: true, force: true })
+    }
+  }
+
   console.log('\n[A7] 回家失败时会不会退到"认路"')
   {
     // 用一个假 bot：位置能读能写，寻路结果由 _walkTo 的桩决定

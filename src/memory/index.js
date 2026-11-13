@@ -184,7 +184,13 @@ class Memory {
       const blurred = decay.blur(this.entries)
       const archived = decay.archive(this.entries)
       if (blurred.length) {
-        for (const b of blurred) console.log('[mem] 记不清了：' + b.text)
+        // 模糊化的文案由 decay.js 给，但"记不清也得记得是谁"这条要求
+        // 在这里补一刀 —— decay.js 是设计层，不去改它。
+        for (const b of blurred) {
+          b.text = fuzzyText(b)
+          console.log('[mem] 记不清了：' + b.text)
+        }
+        this.save()
       }
       if (archived.length) this.save()
     }
@@ -256,21 +262,43 @@ class Memory {
     const who = (v.who && v.who.length) ? v.who : normWho(o.who)
     const where = v.where || o.where || null
 
+    // 称呼告示里的名字要洗干净：
+    //   talk.js 写的是「XJJVER6 让我叫他 小徐就行」，callMe 原文没洗
+    //   -> 「XJJVER6 让我叫他 小徐」
+    const text2 = finalText.replace(/(让我叫他|让我喊他|让我叫他做)\s*(\S+)$/, (all, lead, nm) => {
+      return lead + ' ' + cleanCallMe(nm)
+    })
+
     // 先去重：同一类、同一批人、内容高度重合的，合并而不是新增
-    const dup = this.findDuplicate(finalText, kind, who, now)
+    const dup = this.findDuplicate(text2, kind, who, now)
     if (dup) {
-      dup.repeat = (dup.repeat || 1) + 1
-      dup.emotion = Math.min(1, dup.emotion + 0.08)
-      dup.importance = Math.min(1, dup.importance + 0.06)
-      dup.strength = Math.min(1, dup.strength + 0.15)
-      dup.lastAt = now
-      if (dup.emotion >= 0.7 || dup.importance >= 0.8) dup.protected = true
-      this.save()
-      return dup
+      return this.mergeRepeat(dup, now)
+    }
+
+    // 同一次死亡会走两条路：
+    //   1. 系统给的死法「死了：XJJ was slain by Zombie」-> 「被僵尸弄死了」
+    //   2. 他自己那句吐槽「草，被僵尸挠死了」
+    // 文字相似度不够（0.6），去重抓不住，于是记成两条 —— 一次死变成两条记忆。
+    // 按**内容**判（不能按 kind：吐槽那句会被归成 event），死因对得上就并。
+    if (/死/.test(text2)) {
+      const cause = deathCause(text2)
+      if (cause) {
+        const sameDeath = this.entries.find(e => {
+          if (e.archived) return false
+          if (!/死/.test(e.text)) return false
+          if (now - (e.lastAt || e.createdAt) > 3) return false   // 3 游戏分钟内算同一次
+          return deathCause(e.text) === cause
+        })
+        if (sameDeath) {
+          // 保留信息更全的那条（一般是系统翻出来的「被僵尸弄死了」）
+          if (text2.length > sameDeath.text.length) sameDeath.text = text2
+          return this.mergeRepeat(sameDeath, now)
+        }
+      }
     }
 
     const e = entry.make({
-      text: finalText,
+      text: text2,
       kind,
       who,
       where,
@@ -280,7 +308,7 @@ class Memory {
       hops: o.hops
     }, now)
     this.entries.push(e)
-    this.session.push({ t: now, text: short(finalText) })
+    this.session.push({ t: now, text: short(text2) })
     if (this.session.length > 200) this.session.shift()
     if (!o.silent) this.save()
     return e
@@ -299,6 +327,43 @@ class Memory {
       ok: meta.ok
     })
     if (this.journal.length > 300) this.journal.shift()
+  }
+
+  /**
+   * 合并一条重复记忆。
+   *
+   * 关键：**重复 ≠ 刻骨铭心**。
+   * 「还差点石头」念了 7 遍，只能说明"我老是缺石头"，不是"这事我忘不了"。
+   * 所以：
+   *   - 强度可以回一点（想起过，记忆会清晰些）
+   *   - 情绪/重要性只小幅上升，且**有硬上限**，绝不允许刷到保护线（0.7 / 0.8）
+   *   - 重复次数只用来给一点"这事反复发生"的分量
+   *
+   * 旧实现每 repeat 一次 emotion +0.08 / importance +0.06 / strength +0.15 无上限，
+   * 8 次就把一句废话刷成 protected: true，永不衰减 —— 直接违背"会忘事是设计"。
+   */
+  mergeRepeat (dup, now) {
+    dup.repeat = (dup.repeat || 1) + 1
+    dup.lastAt = now
+
+    // 想起过一次，清晰一点，但回到 1.0 就够，不给额外奖励
+    dup.strength = Math.min(1, (dup.strength || 0) * 1 + 0.12)
+
+    // 情绪/重要性：按"原始值"往上涨，但封顶在保护线以下
+    // 0.62 / 0.72 是留了余量的上限 —— 再重复也不会自己升格成"刻骨铭心"
+    const emoCap = Math.min(0.62, (dup.emotion || 0) + 0.05)
+    const impCap = Math.min(0.72, (dup.importance || 0) + 0.04)
+    dup.emotion = Math.max(dup.emotion || 0, emoCap)
+    dup.importance = Math.max(dup.importance || 0, impCap)
+
+    // 本来就已经是刻骨铭心的（情感/重要性本来就高），重复时保持保护
+    // 但**不允许**靠重复跨过这条线
+    if ((dup.emotion >= 0.7 || dup.importance >= 0.8) && dup.protected) {
+      dup.protected = true
+    }
+
+    this.save()
+    return dup
   }
 
   /**
@@ -363,8 +428,12 @@ class Memory {
         lastHitAt: 0
       }
     }
-    this.people[name].lastSeen = this.clock.now()
-    return this.people[name]
+    const p = this.people[name]
+    p.lastSeen = this.clock.now()
+    // talk.js 的正则会把「俊杰就行」「小徐吧」整段抓进来当称呼。
+    // 这里统一洗一遍 —— 不改 talk.js，但存储侧必须是干净的。
+    if (p.callMe) p.callMe = cleanCallMe(p.callMe)
+    return p
   }
 
   note (name, text) {
@@ -473,10 +542,39 @@ class Memory {
   // ---------------- 地点 ----------------
 
   place (name, pos, note) {
-    this.places[name] = {
-      x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z),
-      note: note || '', t: this.clock.now()
+    if (!name) return null
+
+    const x = Math.round(pos.x)
+    const y = Math.round(pos.y)
+    const z = Math.round(pos.z)
+
+    // 同一个坐标不许挂 4 个名字。
+    // 真实数据里 100,59,14 挂了「水边探索起点 / 标记起点 / 水边探索终点 / 标记点0」四条，
+    // 挤满 placesDigest 的 8 行名额，还让"想起这地方"变成噪声。
+    // 处理：同坐标已存在就并过去（保留旧名，note 追加），不再新增。
+    const sameCoord = Object.keys(this.places).find(k => {
+      const p = this.places[k]
+      return p && p.x === x && p.y === y && p.z === z
+    })
+    if (sameCoord && sameCoord !== name) {
+      const keep = this.places[sameCoord]
+      if (note && !String(keep.note || '').includes(note)) {
+        keep.note = [keep.note, note].filter(Boolean).join('；')
+      }
+      keep.t = this.clock.now()
+      // 别名记下来，方便以后按新名字查
+      keep.aliases = keep.aliases || []
+      if (!keep.aliases.includes(name)) keep.aliases.push(name)
+      this.save()
+      return sameCoord
     }
+
+    this.places[name] = {
+      x, y, z,
+      note: note || '', t: this.clock.now(),
+      aliases: (this.places[name] && this.places[name].aliases) || []
+    }
+
     // 地点本身不衰减（places 单独存），但"这地方有什么"要进记忆，
     // 这样他在附近时会想起来。
     // note 得是人话 —— "评分 5.0" 这种是内部打分，不是记忆。
@@ -490,6 +588,7 @@ class Memory {
       })
     }
     this.save()
+    return name
   }
 
   /**
@@ -571,8 +670,18 @@ class Memory {
 
   /** 地点摘要 */
   placesDigest (limit = 8) {
-    const list = Object.entries(this.places).slice(-limit)
-    if (!list.length) return '（还没记地方）'
+    const all = Object.entries(this.places)
+    if (!all.length) return '（还没记地方）'
+
+    // 别随便截最后 8 个 —— 家、出生点这种要永远在最前面。
+    // 排序：有名字含义的（家/出生点/庇护所）> 最近去过的 > 其他
+    const IMPORTANT = /家|出生点|基地|庇护所|矿洞|矿脉|箱子|炉/
+    const list = all
+      .map(([k, v]) => ({ k, v, score: (IMPORTANT.test(k) ? 100 : 0) + (v.t || 0) / 1000 }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(x => [x.k, x.v])
+
     return list.map(([k, v]) =>
       `- ${k}：${v.x},${v.y},${v.z}${v.note ? '（' + v.note + '）' : ''}`
     ).join('\n')
@@ -630,6 +739,11 @@ class Memory {
    * 清理：把记忆里混着的任务流水账挑出去。
    * 幂等 —— 跑几次结果一样，可以随时手动跑。
    *
+   * **保守原则**：已经是「恩怨 / 承诺 / 地点 / 技能」的条目一律保留。
+   * 那四类不是"文本长什么样"的问题，是"这确实发生过"的事实 ——
+   * 重生脚本不该因为一句正则就把"他打过我"删掉。
+   * 只有归类为普通 event / person 的，才按准入规则重新体检。
+   *
    * @param {object} [opts] { dryRun }
    * @returns {{before:number, after:number, removed:number, rescued:number, samples:object[]}}
    */
@@ -639,23 +753,52 @@ class Memory {
     const removed = []
     let rescued = 0
 
+    const KEEP_KINDS = new Set([KINDS.GRIEVANCE, KINDS.PROMISE, KINDS.PLACE, KINDS.SKILL])
+
     for (const e of this.entries) {
+      // 恩怨/承诺/技能：事实层，不动。
+      // 那三类是"这确实发生过"，不该因为一句正则被删。
+      if (e.kind === KINDS.GRIEVANCE || e.kind === KINDS.PROMISE || e.kind === KINDS.SKILL) {
+        kept.push(e)
+        continue
+      }
+
+      // 地点：得真有"某地有某物"的内容。
+      // 「上线了 上次那边还有铁没挖完」被误判成 place 存进来了 —— 那不是地点知识。
+      if (e.kind === KINDS.PLACE) {
+        const looksLikePlace = /[:：]/.test(e.text) || /(?:有|藏着|全是|都是|能挖到)/.test(e.text)
+        if (looksLikePlace) { kept.push(e); continue }
+        // 不像地点知识，退回普通准入再体检
+      }
+
       const r = sanitizeEntry(e)
       if (!r) { removed.push(e); continue }
       if (r.text !== e.text) rescued++
       kept.push(r)
     }
 
+    // 合并清理后可能撞车的同类条目
+    const merged = []
+    for (const e of kept) {
+      const dup = merged.find(k => k.kind === e.kind && similarText(k.text, e.text))
+      if (dup) {
+        dup.repeat = (dup.repeat || 1) + (e.repeat || 1)
+        dup.lastAt = Math.max(dup.lastAt || 0, e.lastAt || 0)
+        continue
+      }
+      merged.push(e)
+    }
+
     const report = {
       before,
-      after: kept.length,
+      after: merged.length,
       removed: removed.length,
       rescued,
       samples: removed.slice(0, 10).map(e => ({ kind: e.kind, text: String(e.text).slice(0, 70) }))
     }
 
     if (!opts.dryRun) {
-      this.entries = kept
+      this.entries = merged
       for (const e of removed) {
         this.journal.push({ t: e.createdAt || 0, text: short(e.text), why: 'purge' })
       }
@@ -699,6 +842,84 @@ function normWho (w) {
   return (Array.isArray(w) ? w : [w]).filter(Boolean).slice(0, 6)
 }
 
+/**
+ * 清洗"他让我叫他 X"里的 X。
+ *
+ * talk.js 用 `(?:叫我|喊我|我叫|我是)\s*([\u4e00-\u9fa5A-Za-z0-9_]{1,12})`
+ * 抓称呼，会把后面的语气词一起吃进来：
+ *   「叫我俊杰就行」-> 俊杰就行
+ *   「叫我小徐吧」  -> 小徐吧
+ *   「我叫老王啊」  -> 老王啊
+ * 这里把尾巴上的虚词剁掉。宁可短一点，也别让他喊错人。
+ */
+function cleanCallMe (raw) {
+  let s = String(raw || '').trim()
+  if (!s) return s
+
+  // 先剁掉尾巴上的语气词/助词（可连续）
+  s = s.replace(/[就吧啊呀哦嘛哈呢了的呗啦噢喔]+$/g, '')
+
+  // 再剁掉常见的"就行/可以了/就好"这种收尾
+  s = s.replace(/(就行|就好|就可以|可以了|就行了|吧就行)$/g, '')
+
+  // 名字里不该有空格和标点
+  s = s.replace(/[\s，。！？、；：,.!?;:]/g, '')
+
+  // 长度兜底：MC 用户名最长 16，中文称呼一般 2~4
+  if (s.length > 16) s = s.slice(0, 16)
+  return s || String(raw || '').trim()
+}
+
+/**
+ * "记不清了"该怎么说。
+ *
+ * 真人忘细节，但**不会忘掉人**。
+ *   ✓ 「好像跟老王干过什么事，具体记不清了」
+ *   ✗ 「有那么件事，但是记不太清是什么了」  ← 这等于把人也忘了
+ *
+ * decay.js 的 blur() 已经写了文字，这里只做"如果丢了人/地点就补回来"。
+ * 为什么不直接改 decay.js：半衰期和保护条件是设计层，不动。
+ */
+function fuzzyText (e) {
+  const who = e.who && e.who.length ? e.who[0] : null
+  const base = String(e.text || '')
+  if (!who) return base
+  if (base.includes(who)) return base
+  // 文字里没人名了，按种类给一个"还记得是谁"的说法
+  switch (e.kind) {
+    case KINDS.GRIEVANCE: return `好像跟${who}闹过不愉快，细节想不起来了`
+    case KINDS.PERSON: return `好像跟${who}打过交道，具体什么事想不起来了`
+    case KINDS.PROMISE: return `好像答应过${who}什么事，想不起来了`
+    default: return `${base}（好像跟${who}有关）`
+  }
+}
+
+/**
+ * 从一句"死"的描述里认出死因，用来判断两条是不是同一次死亡。
+ * 认不出返回 null —— 宁可不合并，也别把两次死并成一次。
+ */
+function deathCause (text) {
+  const t = String(text || '')
+  const CAUSES = [
+    ['僵尸', /僵尸|zombie/i],
+    ['溺尸', /溺尸|drowned/i],
+    ['骷髅', /骷髅|skeleton/i],
+    ['蜘蛛', /蜘蛛|spider/i],
+    ['苦力怕', /苦力怕|爬行者|creeper/i],
+    ['末影人', /末影人|enderman/i],
+    ['女巫', /女巫|witch/i],
+    ['岩浆', /岩浆|熔岩|lava/i],
+    ['水', /淹死|水里|drown/i],
+    ['摔', /摔|fell/i],
+    ['饿', /饿死|starve/i],
+    ['炸', /炸死|爆炸|explosion/i]
+  ]
+  for (const [name, re] of CAUSES) if (re.test(t)) return name
+  // 「莫名其妙死了一回」「不知道怎么回事」——没有可辨识的死因
+  if (/莫名其妙|不知道怎么回事|没搞清/.test(t)) return 'unknown'
+  return null
+}
+
 /** 两句话是不是在说同一件事（用于合并重复） */
 function similarText (a, b) {
   const A = cnChars(a, STOP)
@@ -724,8 +945,14 @@ function sanitizeEntry (e) {
 
   // 已经在衰减的，尊重它现在的强度（别让清理变成"恢复记忆"）
   const keepStrength = typeof e.strength === 'number' ? e.strength : 1
+
+  // 称呼告示也要洗（add() 里洗过一次，清理路径也得洗）
+  const cleaned = String(v.text).replace(/(让我叫他|让我喊他)\s*(\S+)$/, (all, lead, nm) => {
+    return lead + ' ' + cleanCallMe(nm)
+  })
+
   const ne = entry.make({
-    text: v.text,
+    text: cleaned,
     kind: v.kind,
     who: (v.who && v.who.length) ? v.who : normWho(e.who),
     where: v.where || e.where || null,

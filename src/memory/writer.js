@@ -31,7 +31,10 @@ const CHITCHAT = [
   /^(嗯+[啊哦恩]?|哦+|啊+|哈+|好吧|行吧|可以|知道了|收到|ok|okay|草|6+|牛|牛逼|对|是|行|好)[。！？.!?]*$/i,
   /^(你好|hi|hello|在吗|在不在|在不在啊)[。！？.!?]*$/i,
   /^(谢谢|谢了|多谢|thx|thanks)[。！？.!?]*$/i,
-  /^(你厉害|厉害|你牛|牛啊|行行行|好好好|随便|不知道|没事|算了)[。！？.!?]*$/i
+  /^(你厉害|厉害|你牛|牛啊|行行行|好好好|随便|不知道|没事|算了)[。！？.!?]*$/i,
+  // 纯客套：谢了 / 行，缺啥喊我 / 好嘞 / 知道了 —— 有社交词但没有任何具体内容
+  /^[嗯哦啊行好对是][，,]?\s*(谢了|谢谢|多谢|缺啥喊我|有事喊我|有事叫我|你说|知道了|明白|收到|好嘞|行吧|那我去了)[。！？.!?]*$/i,
+  /^(谢了|多谢|缺啥喊我|有事喊我|有事叫我|好嘞|那我去了|我这就去|马上)[。！？.!?]*$/i
 ]
 
 // 有情绪的词。情绪是"这件事进得去脑子"的最强理由。
@@ -74,6 +77,14 @@ const PLAN_MARKS = [
   /(?:留着|备着|补充|腾出空间|省得|免得)/
 ]
 
+// 寒暄 / 邀请 / 打气：只有社交词，没有任何"谁做了什么、哪里有啥、答应了什么"
+const SMALLTALK = [
+  /^(兄弟|哥们|老哥|兄弟别|别气|别急|别慌|没事吧|加油|慢慢来)/,
+  /(一起|一块)(?:上去|下去|来|去|玩|干|搞|盖|建|挖|弄|整)/,
+  /(?:你|您)(?:想|要|会|能|要不要)(?:和|跟)/,
+  /(?:一起|一块)[^，。！？]{0,8}(?:吧|呗|啊|吗)[。！？]?$/
+]
+
 // 「廉价劳作」：挖/砍/摆弄最便宜的方块，还没别的信号 —— 这不是记忆
 const CHEAP_OBJ = '(?:石头|圆石|安山岩|花岗岩|闪长岩|泥土|沙子|砾石|草方块|草|树叶|原木|木板|木棍|树苗|雪|冰块|腐肉|蘑菇|煤炭|煤|碎石)'
 const WORK_VERB = '(?:挖|刨|砍|捡|采|敲|合|放|摆|铺|整理|丢|存|塞|做|烧)'
@@ -97,7 +108,8 @@ const SIG = {
   // 方向很重要：「我答应给你」是他的承诺；「你回头给我」是别人的事（记成人，不是他的承诺）。
   promise: /(答应|说好|约好|保证|欠你|欠我|说定了|回头给你|明天给你|下次给你|一会给你|待会给你|等会给你|等我.{0,8}给你)/,
   // 危险 / 生死
-  danger: /(苦力怕|爬行者|僵尸|骷髅|蜘蛛|末影人|女巫|溺尸|岩浆|熔岩|摔死|淹死|差点|危险|爆炸|炸飞|砍死|弄死|打死了|挂了|没命)/,
+  // 「差点」必须跟真的危险连用 —— 「还差点石头」是缺材料，不是命悬一线
+  danger: /(苦力怕|爬行者|僵尸|骷髅|蜘蛛|末影人|女巫|溺尸|岩浆|熔岩|摔死|淹死|危险|爆炸|炸飞|砍死|弄死|打死了|挂了|没命|差点(?:死|被|没命|炸|掉|摔|淹))/,
   // 教训
   lesson: /(教训|记住|别再|下次别|千万别|小心|以后不|不能碰)/,
   // 第一次 / 发现
@@ -111,7 +123,7 @@ const PLACE_WORDS = [
   '山洞', '矿洞', '洞里', '洞穴', '坑里', '地下', '深处', '峡谷', '矿脉',
   '河边', '湖边', '海边', '海上', '山上', '山顶', '山坡', '山脚', '树林', '森林',
   '沙漠', '雪原', '沼泽', '平原', '村子', '村庄', '遗迹', '要塞', '神庙',
-  '庇护所', '出生点', '家里', '基地', '那片', '那边'
+  '庇护所', '出生点', '家里', '基地'
 ]
 
 // 资源词。注意：不能只写「矿」—— 那样「矿洞」「矿脉」「矿道」全会被当成"这里有矿"。
@@ -142,17 +154,157 @@ function isSelfDeath (t) {
   return true
 }
 
-// 不是人名的词
+// 怪物 / 生物名 —— 绝不是人
+const MOB_WORD = '僵尸|溺尸|尸壳|骷髅|流浪者|蜘蛛|洞穴蜘蛛|苦力怕|爬行者|末影人|女巫|史莱姆|岩浆怪|烈焰人|恶魂|凋灵|凋灵骷髅|掠夺者|卫道士|劫掠兽|幻翼|守卫者|潜影贝|蠹虫|恼鬼|傀儡|村民|猪灵|疣猪兽|监守者'
+const MOB_NAMES = new RegExp(`^(${MOB_WORD})$`)
+
+// 代词 / 泛指 —— 绝不是具体的人
+const PRONOUN = /^(我|你|他|她|它|我们|你们|他们|她们|咱们|大家|自己|别人|有人|某人|谁|人家|对方)$/
+
+/** 不是人名的词 */
 const NAME_STOP = new Set([
   '我们', '他们', '你们', '咱们', '大家', '自己', '别人', '有人', '某人',
   '什么', '那个', '这个', '一下', '一起', '要是', '如果', '时候', '东西',
   '那边', '这边', '今天', '昨天', '明天', '现在', '刚才', '后来', '然后',
-  '我说', '他说', '你说', '这货', '那货', '老弟', '哥们'
+  '我说', '他说', '你说', '这货', '那货', '老弟', '哥们',
+  '和别人', '和人家', '跟别人', '跟人家', '别人一', '跟我说', '和我说',
+  '木头', '石头', '铁矿', '圆石', '面包', '箱子', '工作台', '蜗牛',
+  '手边', '脚边', '头顶', '地下', '河沟', '圈里', '旁边'
 ])
 
-// ============================================================
-// 3. 小工具
-// ============================================================
+/**
+ * 判断一个候选是不是像人名的样子。
+ *
+ * 规则：**只允许"干净"的词**。宁可漏，不可错 ——
+ * 记错人比不记更糟（用户明确要求：要分清谁是谁）。
+ *
+ * 做法是字符白名单的否定：中文候选里只要出现一个虚词/动词/量词/代词，
+ * 就整个否掉。这比"看起来像人名"的黑名单可靠得多 ——
+ * 「僵尸挠了」「想和别人」「李四三块」都会被否掉，「张三」「老王」会留下。
+ */
+// 虚词 / 代词 / 介词：出现在候选里就否掉。
+// 注意这里**只放绝不会出现在人名里的字** ——
+// 「三」「老」「一」不在此列，因为「张三」「老王」是真人名。
+const NAME_BAD = new Set('的了是在有就也都很不个这那什么怎么吗呢吧啊想要点弄去来做个一下能会可以把他她它们你我跟给对让'
+  .split(''))
+
+// 动作字：名字里不会有
+const NAME_BAD_VERB = new Set('帮打偷抢骗杀救送挖砍跑走看听拿丢整炸推害骂怼捅挠咬拖射弄趁已经总是才就又再刚正很太挺更最'.split(''))
+
+// 泛指前缀：「别人一」「人家一起」「大家走」这种整体是残句
+const GENERIC_PREFIX = /^(别人|人家|大家|自己|有人|某人|谁|对方|那个人|这个人|那些人|这些人)/
+
+/**
+ * 判断一个候选是不是像人名的样子。
+ *
+ * 宁可漏，不可错 —— 记错人比不记更糟（用户明确要求：要分清谁是谁）。
+ *
+ * 判据只放**强特征**：「张三」「老王」这种真人名绝不能因为某个字被误伤。
+ * 漏抽一个人名，顶多是没记在名下（还能从 who 参数补）；
+ * 抽错人，就会把他的事记到别人头上 —— 那比不记更糟。
+ */
+function looksLikeName (n) {
+  if (!n) return false
+  n = String(n).trim()
+  if (n.length < 2 || n.length > 16) return false
+  if (NAME_STOP.has(n)) return false
+  if (PRONOUN.test(n)) return false
+  if (MOB_NAMES.test(n)) return false
+  if (GENERIC_PREFIX.test(n)) return false
+  if (new RegExp(`^(${MOB_WORD})`).test(n)) return false
+  if (new RegExp(`^(${MOB_WORD}|挠|咬|砍|射|炸|打|弄|拖)$`).test(n)) return false
+
+  // 纯英文/数字用户名（MC 用户名）：只要不是全数字就收
+  if (/^[A-Za-z0-9_]+$/.test(n)) return !/^\d+$/.test(n)
+
+  for (const c of n) {
+    if (NAME_BAD.has(c)) return false
+    if (NAME_BAD_VERB.has(c)) return false
+  }
+
+  // 末尾是**纯量词**才算粘到下一句（「李四三块」的「块」）。
+  // 数字不能禁 —— 「张三」「李四」「王五」全是人名。
+  if (/[个块根条件颗次些两]$/.test(n)) return false
+
+  return true
+}
+
+/**
+ * 把一个贪心抓到的候选裁成"最像人名"的前缀。
+ *
+ * 关键认知：**中文名字里可以有数字**（张三、李四、王五都是真人名），
+ * 所以纯靠字符表永远分不清「李四三块」和「李四三」。
+ * 这里只做"见到明显短语边界就剁"的最低限度收尾，
+ * 真正可靠的名字来源是调用方传进来的 known（服务器在线玩家名）。
+ */
+function bestNamePrefix (cand, known) {
+  if (!cand) return null
+  const s = String(cand).trim()
+
+  // 1. 已知玩家名优先 —— 这是唯一不会错的办法
+  if (Array.isArray(known) && known.length) {
+    for (const k of known) {
+      if (k && s.startsWith(k)) return k
+    }
+  }
+
+  // 2. 末尾是量词（不是数字）就剁掉： 「李四块」-> 不行，得试「李四」
+  const QTY_TAIL = /[个块根条件颗次些把]$/
+  if (QTY_TAIL.test(s) && s.length > 2) {
+    for (let len = s.length - 1; len >= 2; len--) {
+      const sub = s.slice(0, len)
+      if (looksLikeName(sub)) return sub
+    }
+  }
+
+  // 3. 常规：从长到短
+  for (let len = Math.min(s.length, 4); len >= 2; len--) {
+    const sub = s.slice(0, len)
+    if (looksLikeName(sub)) return sub
+  }
+  return null
+}
+
+/**
+ * 抽人名。
+ * 优先用调用方给的 who（那是可靠的用户名），没有再猜。
+ */
+function extractPeople (text, known) {
+  const t = String(text || '')
+  const out = []
+
+  const push = (n) => {
+    if (!n) return
+    n = String(n).trim()
+    if (!looksLikeName(n)) return
+    if (!out.includes(n)) out.push(n)
+  }
+
+  // 候选词：2~4 个汉字 或 3~16 位账号名
+  const CAND = '([\\u4e00-\\u9fa5]{2,4}|[A-Za-z0-9_]{3,16})'
+
+  // 1. 「张三帮我…」「老王给我…」「李四偷我…」—— 名字后面直接跟动作
+  const re1 = new RegExp(CAND + '(?=帮我|给我|带我|打我|偷我|抢我|骗我|杀我|救了我|夸我|骂我)', 'g')
+  for (const m of t.matchAll(re1)) push(m[1])
+
+  // 2. 「跟老王…」「答应给李四…」「让王五…」「见到果哥…」
+  //    引介词后面可能垫一个介词（给/帮/对/找）。
+  //    候选先贪心取 2~4 字，从长到短试，第一个通过 looksLikeName 的就是它。
+  //    （不能靠前瞻钉死后面跟什么 —— 「李四三块铁」后面是「三」，不是虚词）
+  const lead = new RegExp(
+    '(?:答应|说好|跟|和|叫|让|谢谢|感谢|见到|遇到|认识|给了|送给|帮|对|找)' +
+    '\\s*(?:给|帮|对|跟|和|找)?\\s*([\\u4e00-\\u9fa5]{2,4}|[A-Za-z0-9_]{3,16})', 'g')
+  for (const m of t.matchAll(lead)) {
+    const n = bestNamePrefix(m[1], known)
+    if (n) push(n)
+  }
+
+  // 3. 「李四趁我不注意…」「老王又来了」—— 句首或逗号后的人名
+  const head = new RegExp('(?:^|[，。！？；\\s])([\\u4e00-\\u9fa5]{2,4})(?=趁|把|又|还|就|才|已经|老是|总是)', 'g')
+  for (const m of t.matchAll(head)) push(m[1])
+
+  return out.slice(0, 4)
+}
 
 // Minecraft 的死亡提示是英文机器话。真人记的是"被僵尸弄死了"。
 const MOB_CN = {
@@ -165,10 +317,6 @@ const MOB_CN = {
   elder_guardian: '远古守卫者', shulker: '潜影贝', silverfish: '蠹虫', vex: '恼鬼'
 }
 
-/**
- * 把机器写的死法翻成人话。
- * 「死了：XJJ was slain by Zombie」-> 「被僵尸弄死了」
- */
 function normalizeDeath (t) {
   const m = t.match(/^死了\s*[:：]\s*([\s\S]*)$/)
   if (!m) return null
@@ -202,7 +350,6 @@ function normalizeDeath (t) {
     return { text: '莫名其妙死了一回，没搞清怎么死的', emotion: 0.55, importance: 0.45, danger: true }
   }
 
-  // 认不出的死法：保留原文，但至少是"死了"这件事
   const cleaned = body.replace(/\b[A-Za-z0-9_]{3,16}\b/g, '').replace(/\s+/g, ' ').trim()
   return {
     text: cleaned ? '死了一回（' + cleaned.slice(0, 30) + '）' : '死了一回，没搞清怎么死的',
@@ -244,39 +391,10 @@ function firstPlace (text) {
   return best ? best.w : null
 }
 
-/**
- * 抽人名。宁可漏，不可错 —— 记错人比不记更糟。
- * 优先用调用方给的 who（那是可靠的），没有再猜。
- */
-function extractPeople (text) {
-  const t = String(text || '')
-  const out = []
-
-  const push = (n) => {
-    if (!n) return
-    n = String(n).trim()
-    if (n.length < 2 || n.length > 16) return
-    if (NAME_STOP.has(n)) return
-    if (/^[我你他她它]/.test(n)) return
-    if (!out.includes(n)) out.push(n)
-  }
-
-  // 「张三帮我…」「张三打我…」
-  const before = new RegExp(`([\\u4e00-\\u9fa5]{2,3}|[A-Za-z0-9_]{3,16})(?=${'帮我|给我|带我|打我|救了我|跟我|和我|一起|说|夸我'})`, 'g')
-  let m
-  while ((m = before.exec(t))) push(m[1])
-
-  // 「答应张三…」「跟李四…」「让王五…」「见到果哥」
-  const after = new RegExp(`(?:答应|跟|和|叫|让|谢谢|感谢|见到|遇到|认识|给了|送给)\\s*([\\u4e00-\\u9fa5]{2,3}|[A-Za-z0-9_]{3,16})(?=[给说帮打一起来的了，。！？\\s]|$)`, 'g')
-  while ((m = after.exec(t))) push(m[1])
-
-  return out.slice(0, 4)
-}
-
-function normalizeWho (given, text) {
+function normalizeWho (given, text, known) {
   const arr = Array.isArray(given) ? given.filter(Boolean) : (given ? [given] : [])
   if (arr.length) return arr.slice(0, 6)
-  return extractPeople(text)
+  return extractPeople(text, known)
 }
 
 /** 情绪强度 */
@@ -575,6 +693,15 @@ function admit (input = {}) {
     const g = fromLog(t, sig.where)
     if (g) return keep(g.text, g.kind, { ...g, who: sig.who, reason: 'from-task-log' })
     return drop('task log')
+  }
+
+  // ---- B1. 寒暄 / 邀请：光有社交词，没有具体内容 ----
+  // 「兄弟别气，我们一起上去盖家」「你想和别人一起玩吗」
+  // 这是场面话，不是"谁对我做了什么"。真发生了事会另有一条记忆。
+  if (SMALLTALK.some(re => re.test(t)) && !sig.promise && !sig.grievance) {
+    // 但如果是「一起」+ 明确地点/成果，那是真事，要留
+    const concrete = /(?:挖到|找到|建成|盖好|做好|给|送|捡到|拿到)/.test(t)
+    if (!concrete) return drop('smalltalk')
   }
 
   // ---- C. 计划句 / 廉价劳作：没有强信号就别记 ----

@@ -67,6 +67,17 @@ const TRAIL_GAP = 12           // 走出 12 格记一个点
 const HOME_RADIUS = 8          // 离这么近就算到家了（清 trail 用）
 const DEFAULT_NEAR = 48        // "家附近"的默认半径
 
+// 垂直一格的"回家代价"相当于水平几格。
+// 实测：水平 80 格走过去约 40 秒；垂直 40 格要挖楼梯/垫柱子，1~3 分钟还常卡住。
+const VERTICAL_COST = 3
+
+// 回家代价的阈值（单位 = 水平格数，垂直已加权）
+const SOFT_HOME_COST = 100     // 到这儿开始"有点远"，会在上下文里提一句
+const HARD_HOME_COST = 140     // 到这儿该主动往回走了
+
+// 地下多深算"该考虑回家"。地面 y≈64，他实测能挖到 y=18。
+const DEEP_UNDERGROUND = 25
+
 class Home {
   /**
    * @param {object} bot  mineflayer bot
@@ -684,20 +695,113 @@ class Home {
     return Math.hypot(p.x - this.home.x, p.z - this.home.z)
   }
 
+  /** 垂直距离（离家的高差） */
+  vDistanceFromHome (pos) {
+    if (!this.home) return Infinity
+    const p = pos || this.pos()
+    if (!p) return Infinity
+    return Math.abs(p.y - this.home.y)
+  }
+
+  /**
+   * "回趟家有多费劲" —— 水平一格算 1，垂直一格算 3。
+   *
+   * 为什么垂直要加权：水平 80 格是走过去 40 秒的事，垂直 40 格要挖
+   * 楼梯或者垫柱子爬上去，实测一次要 1~3 分钟，而且经常卡住。
+   * 旧实现只用水平距离，于是「水平 82 格 / 垂直 46 格」被判成"不远"，
+   * 他在地下 40 多格深的地方一直挖，永远不会想到回家 ——
+   * 这就是用户说的「每次见到他他都在地下」。
+   */
+  walkCostHome (pos) {
+    const h = this.hDistanceFromHome(pos)
+    const v = this.vDistanceFromHome(pos)
+    if (!Number.isFinite(h) || !Number.isFinite(v)) return Infinity
+    return h + v * VERTICAL_COST
+  }
+
   isNearHome (pos, radius = DEFAULT_NEAR) {
     return this.hDistanceFromHome(pos) <= radius
   }
 
-  isFarFromHome (threshold = 96, pos) {
-    const d = this.hDistanceFromHome(pos)
+  /**
+   * 离家远不远。
+   *
+   * @param {number} [threshold] 默认 96（"再挖下去也是荒的"的经验线）
+   * @param {object} [pos]
+   * @param {boolean} [weighted] true = 按 walkCostHome（垂直×3）算。
+   *        默认 true —— 旧的纯水平判定会把"地下 46 格深"当成近。
+   */
+  isFarFromHome (threshold = 96, pos, weighted = true) {
+    const d = weighted ? this.walkCostHome(pos) : this.hDistanceFromHome(pos)
     return Number.isFinite(d) && d > threshold
   }
 
   /** 0..1，越接近家越大。给打分用 */
   homeAffinity (pos, radius = DEFAULT_NEAR) {
-    const d = this.hDistanceFromHome(pos)
+    const d = this.walkCostHome(pos)
     if (!Number.isFinite(d)) return 0
     return 1 / (1 + d / radius)
+  }
+
+  /**
+   * 现在该不该往回走？
+   *
+   * 旧实现只有"复活后离家 >96 才回家"这一条触发路径 —— 也就是说
+   * **不死就永远不回家**。他在地下越挖越深，家在身后 90 格远、
+   * 46 格高，却没有任何理由往回走。
+   *
+   * 这里给主循环一个明确的判断：什么时候"回家"比"继续干"更划算。
+   * 不是"离家就回"（那样没法干活），而是**代价已经超过收益**时才回：
+   *
+   *   · 太远了（walkCost > 140）—— 走一趟要几分钟，再挖下去更回不去
+   *   · 在地下很深（y 差 > 25）—— 越挖越深，回家的路只会更难
+   *   · 背包快满了 —— 本来就该回去卸货
+   *   · 工具快没了 / 没吃的 —— 家里有存货
+   *
+   * @param {object} [st] actions.status() 的形状（能拿到背包/血/饿就更好）
+   * @returns {{should:boolean, why:string, urgency:number, cost:number}}
+   */
+  shouldHeadHome (st) {
+    const none = { should: false, why: '', urgency: 0, cost: null }
+    if (!this.home) return none
+    const p = this.pos()
+    if (!p) return none
+
+    const cost = this.walkCostHome(p)
+    const v = this.vDistanceFromHome(p)
+    if (!Number.isFinite(cost)) return none
+
+    // 已经在家附近：不用回（但仍然把代价带出去，方便调用方判断）
+    if (this.hDistanceFromHome(p) <= HOME_RADIUS && v <= 6) {
+      return { should: false, why: '已经在家', urgency: 0, cost }
+    }
+
+    const why = []
+    let urgency = 0
+
+    // 1) 走一趟的代价已经很大
+    if (cost > HARD_HOME_COST) { why.push(`离家太远（走回去约 ${Math.round(cost / 25)} 分钟）`); urgency = Math.max(urgency, 0.8) }
+    else if (cost > SOFT_HOME_COST) { why.push('离家有点远了'); urgency = Math.max(urgency, 0.35) }
+
+    // 2) 地下很深：越挖越深，回家的路只会更长
+    if (v > DEEP_UNDERGROUND) { why.push(`在 ${Math.round(v)} 格深的地方，再往下挖就更回不去了`); urgency = Math.max(urgency, 0.6) }
+    else if (v > DEEP_UNDERGROUND * 0.6) { why.push(`已经下到 ${Math.round(v)} 格深`); urgency = Math.max(urgency, 0.3) }
+
+    // 3) 背包/工具/吃的（有状态数据才判断）
+    if (st) {
+      const empty = typeof st.emptySlots === 'number' ? st.emptySlots : null
+      if (empty !== null && empty <= 2) { why.push('背包快满了'); urgency = Math.max(urgency, 0.7) }
+      if (st.hasPickaxe === false) { why.push('镐子没了'); urgency = Math.max(urgency, 0.75) }
+      if (typeof st.food === 'number' && st.food <= 6) { why.push('快饿死了'); urgency = Math.max(urgency, 0.65) }
+      if (typeof st.health === 'number' && st.health <= 8) { why.push('血不多了'); urgency = Math.max(urgency, 0.5) }
+    }
+
+    if (!why.length) return { should: false, why: '', urgency: 0, cost }
+
+    // 只有"远"这一条、没有别的压力时，不打断手头的活
+    if (urgency < 0.5) return { should: false, why: why.join('，'), urgency, cost }
+
+    return { should: true, why: why.join('，'), urgency, cost }
   }
 
   /**
@@ -753,6 +857,56 @@ class Home {
 
   // ==================== 给主程序 / 提示词用 ====================
 
+  /**
+   * 家附近有什么可挖的 —— 一句话，塞进提示词。
+   *
+   * 为什么要有这个：`findNearHome()` 写好了但**从来没人调用**（实测
+   * 静态扫描：actions.js 里 0 处调用，5 个 findBlocks 调用点没有一个
+   * 传 point）。也就是说挖矿永远是"以脚底下为中心找最近的"，
+   * 家附近有什么资源他根本不知道，家就只是个坐标。
+   *
+   * 这里不改变挖矿逻辑（那是 dig-owner 的地盘），只是把"家附近有 X"
+   * 摆到模型眼前，让它自己选"回去挖"还是"就地挖"。
+   *
+   * @param {string[]} [names] 关心哪些资源，默认原木+石头+铁矿
+   * @param {{radius?:number, count?:number}} [opts]
+   * @returns {string} 没有家/没有资源时返回 ''
+   */
+  homeResourceHint (names, opts = {}) {
+    if (!this.home || !this.bot) return ''
+    const want = names || ['oak_log', 'birch_log', 'spruce_log', 'stone', 'iron_ore']
+    const radius = opts.radius || 40
+    let found = []
+    try {
+      found = this.findNearHome(want, { radius, count: opts.count || 12 })
+    } catch (e) {
+      return ''
+    }
+    if (!found.length) return ''
+
+    // 按方块名归组，各报一个最近的
+    const seen = new Map()
+    for (const b of found) {
+      if (!b || !b.name) continue
+      const cur = seen.get(b.name)
+      const d = b.position.distanceTo(this.homePos())
+      if (!cur || d < cur.d) seen.set(b.name, { d, pos: b.position })
+    }
+    if (!seen.size) return ''
+
+    const WORD = {
+      oak_log: '橡木', birch_log: '白桦', spruce_log: '云杉', jungle_log: '丛林木',
+      acacia_log: '金合欢', dark_oak_log: '深色橡木', cherry_log: '樱花木',
+      stone: '石头', iron_ore: '铁矿', coal_ore: '煤', copper_ore: '铜'
+    }
+    const parts = [...seen.entries()]
+      .sort((a, b) => a[1].d - b[1].d)
+      .slice(0, 4)
+      .map(([name, v]) => `${WORD[name] || name}（${Math.round(v.d)} 格）`)
+
+    return `家附近 ${radius} 格内有：${parts.join('、')}。就地开荒之前先想想，回去挖是不是更省事。`
+  }
+
   /** 方位词：从当前位置看，家在哪边 */
   homeDirection (pos) {
     if (!this.home) return ''
@@ -768,20 +922,46 @@ class Home {
     return ns + ew
   }
 
-  /** 一句中文，能直接塞进提示词 */
+  /**
+   * 一句中文，能直接塞进提示词。
+   *
+   * 关键改动：**把"该不该回家"直接说出来**。
+   * 之前只写"家记在 66,64,-92，约 82 格" —— 82 格听起来不远，
+   * 但他其实在地下 46 格深，回去要挖上去；模型看不到这层，
+   * 就一直在下面挖。现在高差和"该往回走了"都明说。
+   */
   summary () {
     if (!this.home) return '还没有家。找个合适的地方放下箱子或床，那儿就是家。'
-    const d = this.hDistanceFromHome()
+    const h = this.hDistanceFromHome()
+    const v = this.vDistanceFromHome()
+    const cost = this.walkCostHome()
     const where = `${this.home.x},${this.home.y},${this.home.z}`
     const what = this.home.anchor ? anchorWord(this.home.anchor) : (this.home.reason || '据点')
 
-    if (!Number.isFinite(d)) return `家记在 ${where}（${what}）。`
-    if (d <= HOME_RADIUS) return `家就在脚下（${where}，${what}）。`
+    if (!Number.isFinite(h)) return `家记在 ${where}（${what}）。`
+    if (h <= HOME_RADIUS && v <= 6) return `家就在脚下（${where}，${what}）。`
 
     const dir = this.homeDirection()
-    const side = dir && dir !== '就在附近' ? `${dir}边，` : ''
-    const mins = Math.max(1, Math.round(d / 25))
-    return `家记在 ${where}（${what}），${side}约 ${Math.round(d)} 格，走回去大概 ${mins} 分钟。`
+    const side = dir && dir !== '就在附近' ? `${dir}边 ` : ''
+    const lines = [`家记在 ${where}（${what}），${side}水平 ${Math.round(h)} 格。`]
+
+    // 高差是"回不去"的真正原因，必须单独讲
+    const p = this.pos()
+    if (Number.isFinite(v) && v > 4) {
+      const up = p && p.y < this.home.y ? '要往上爬' : '在上面'
+      lines.push(`你家在 y=${this.home.y}，你现在 y=${Math.round(p ? p.y : 0)}，差 ${Math.round(v)} 格，${up}。`)
+    }
+
+    // 该不该现在往回走
+    const head = this.shouldHeadHome()
+    if (head.should) {
+      lines.push(`**该往回走了**：${head.why}。把这一趟收尾，走回去。`)
+    } else if (Number.isFinite(cost) && cost > SOFT_HOME_COST) {
+      const mins = Math.max(1, Math.round(cost / 25))
+      lines.push(`走回去大概 ${mins} 分钟。这一趟可以再干一会儿，但别走更远了。`)
+    }
+
+    return lines.join('')
   }
 
   status () {
@@ -789,6 +969,9 @@ class Home {
       hasHome: !!this.home,
       home: this.home,
       fromHome: Number.isFinite(this.hDistanceFromHome()) ? Math.round(this.hDistanceFromHome()) : null,
+      fromHome3d: Number.isFinite(this.distanceFromHome()) ? Math.round(this.distanceFromHome()) : null,
+      vertical: Number.isFinite(this.vDistanceFromHome()) ? Math.round(this.vDistanceFromHome()) : null,
+      walkCost: Number.isFinite(this.walkCostHome()) ? Math.round(this.walkCostHome()) : null,
       direction: this.homeDirection(),
       trail: this.trail.length,
       stats: this.stats,
@@ -797,4 +980,16 @@ class Home {
   }
 }
 
-module.exports = { Home, anchorRank, anchorWord, HOME_FILE: 'home.json' }
+module.exports = {
+  Home,
+  anchorRank,
+  anchorWord,
+  HOME_FILE: 'home.json',
+  // 常量给测试和主程序用
+  VERTICAL_COST,
+  SOFT_HOME_COST,
+  HARD_HOME_COST,
+  DEEP_UNDERGROUND,
+  HOME_RADIUS,
+  DEFAULT_NEAR
+}

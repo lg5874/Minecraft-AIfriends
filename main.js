@@ -154,30 +154,85 @@ class Bot {
       }
     })
 
-    // 协议层精确识别伤害来源
+    // ==================== 伤害来源识别 ====================
+    //
+    // packet_damage_event 的真实结构（1.21.11，实测抓包确认）：
+    //   { entityId, sourceTypeId, sourceCauseId, sourceDirectId, sourcePosition? }
+    //
+    // 踩过的三个坑（都是实测）：
+    //
+    //  1) sourceTypeId 是 **damage type registry id**，不是"0=环境/1=实体"。
+    //     老代码拿一张自己编的 0..19 表去映射，跟服务端 registry 完全对不上。
+    //     实测摔伤抓到 sourceTypeId=10，按老表算"fall"是巧合撞对的。
+    //     现在不再猜 registry 下标：**改用 sourceCauseId 判断有没有实体来源**。
+    //
+    //  2) sourceCauseId 是 entity id，**不是 id-1**。
+    //     老代码写 `pkt.sourceCauseId - 1`，于是永远查错一格。
+    //     实测摔伤 cause=0（没有来源实体），减一变成 -1，查出 null，
+    //     于是打印"你被不知道什么东西打了"，几十条刷屏。
+    //
+    //  3) 环境伤害（摔/淹/饿/岩浆）根本没有来源实体，不该走"被谁打了"这条文案。
+    const DAMAGE_KIND = {
+      9: 'lava', 10: 'fall', 11: 'drown', 12: 'starve', 13: 'suffocate',
+      14: 'cactus', 15: 'freeze', 16: 'lightning', 17: 'on_fire',
+      18: 'in_fire', 19: 'out_of_world', 20: 'fly_into_wall'
+    }
+    const DAMAGE_TEXT = {
+      lava: '被岩浆烫了', fall: '摔下来了', drown: '快淹死了', starve: '饿坏了',
+      suffocate: '被埋在方块里', cactus: '被仙人掌扎了', freeze: '冻伤了',
+      lightning: '被雷劈了', on_fire: '身上着火', in_fire: '被火烧了',
+      out_of_world: '掉出世界了', fly_into_wall: '撞到墙上了'
+    }
+    // 同一类伤害的节流：摔一次游戏会连推好几包，别每条都当新事件
+    let lastDmgAt = 0
+    let lastDmgKind = ''
+
     bot._client.on('damage_event', (pkt) => {
       try {
         if (!bot.entity || pkt.entityId !== bot.entity.id) return
-        const ENV = {
-          0: 'in_fire', 1: 'lightning', 2: 'on_fire', 3: 'lava', 4: 'hot_floor',
-          5: 'in_wall', 6: 'cramming', 7: 'drown', 8: 'starve', 9: 'cactus',
-          10: 'fall', 11: 'fly_into_wall', 12: 'out_of_world', 16: 'dragon_breath',
-          17: 'dry_out', 18: 'berry', 19: 'freeze'
+
+        // causeId 是 entity id 本身。0 = 没有来源实体（环境伤害）。
+        const causeId = pkt.sourceCauseId || 0
+        const ent = causeId > 0 ? bot.entities[causeId] : null
+        const kind = DAMAGE_KIND[pkt.sourceTypeId] || null
+
+        // 有实体来源 -> 就是"被谁打了"
+        if (ent) {
+          const from = ent.username || ent.name || '什么东西'
+          const isPlayer = ent.type === 'player'
+          this.lastDamageKind = isPlayer ? 'player' : 'mob'
+          this.lastDamageFrom = from
+          if (this.events) {
+            this.events.push(
+              isPlayer ? 'attack_by_player' : 'damage',
+              { from, health: bot.health },
+              `你被${from}打了，血剩 ${Math.round(bot.health)}`
+            )
+          }
+          if (this.reflex) this.reflex.onHurt(ent, bot.health)
+          return
         }
-        const t = pkt.sourceTypeId
-        if (ENV[t]) { this.lastDamageKind = ENV[t]; return }
-        const srcId = pkt.sourceCauseId ? pkt.sourceCauseId - 1 : -1
-        const ent = srcId >= 0 ? bot.entities[srcId] : null
+
+        // 没有实体来源 -> 环境伤害。别再说"被打了"。
+        // 节流：1.5 秒内同一种环境伤害只记一次（摔落会连推多包）。
+        const now = Date.now()
+        const key = kind || ('type' + pkt.sourceTypeId)
+        if (key === lastDmgKind && now - lastDmgAt < 1500) return
+        lastDmgAt = now
+        lastDmgKind = key
+        this.lastDamageKind = kind || 'unknown'
+        this.lastDamageFrom = null
+
+        const text = DAMAGE_TEXT[kind] || '受了点伤'
         if (this.events) {
-          const from = ent ? (ent.username || ent.name || '什么东西') : '不知道什么东西'
-          const isPlayer = ent && ent.type === 'player'
           this.events.push(
-            isPlayer ? 'attack_by_player' : 'damage',
-            { from, health: bot.health },
-            `你被${from}打了，血剩 ${Math.round(bot.health)}`
+            'damage_env',
+            { kind, health: bot.health },
+            `${text}，血剩 ${Math.round(bot.health)}`
           )
         }
-        if (this.reflex) this.reflex.onHurt(ent)
+        // 环境伤害也要走反射层 —— 溺水/摔落一样会死
+        if (this.reflex) this.reflex.onHurt(null, bot.health, kind)
       } catch (e) {}
     })
 
@@ -552,6 +607,67 @@ class Bot {
   }
 
   /**
+   * 主循环里每轮问一次：现在该不该先回家一趟？
+   *
+   * 跟 tryGoHomeAfterRespawn 的区别：
+   *   · 那个只在死后触发一次，不死就永远不回家
+   *   · 这个在活着干活时也判断 —— 越挖越深、背包满了、镐子没了都算理由
+   *
+   * 判断全交给 home.shouldHeadHome()（距离/高差/背包/工具综合算），
+   * main.js 只负责"真的走一趟"和防重入。
+   *
+   * @returns {boolean} 有没有真的去回家（去了就让主循环本轮到此为止）
+   */
+  tryHeadHome () {
+    if (!this.home || !this.bot || !this.bot.entity) return false
+    if (this.busy || this._homing) return false
+    // 别每 4 秒问一次就走 —— 刚放弃过一次，给它一点缓冲
+    if (Date.now() - (this._lastHeadHomeAt || 0) < 120000) return false
+
+    let head = null
+    try {
+      const st = this.actions ? this.actions.status() : null
+      head = this.home.shouldHeadHome(st)
+    } catch (e) {
+      return false
+    }
+    if (!head || !head.should) return false
+
+    this._lastHeadHomeAt = Date.now()
+    this.log(`[home] 该回家了：${head.why}（代价 ${Math.round(head.cost)}）`)
+
+    // 异步走，不挡主循环（goHome 最长 5 分钟）
+    this.walkHomeNow(head.why).catch(() => {})
+    return true
+  }
+
+  /** 真的走一趟回家。跟 tryGoHomeAfterRespawn 共用同一套防重入。 */
+  async walkHomeNow (why) {
+    if (this._homing) return false
+    this._homing = true
+    this.busy = true
+    this._busySince = Date.now()
+    this.taskDesc = '走回家'
+    try {
+      const r = await this.home.goHome({ timeoutMs: 300000 })
+      if (r && r.ok) {
+        this.log(`[home] 到家了（${r.seconds}s）：${why || ''}`)
+        if (this.events) this.events.push('found_something', { home: true }, '你走回家了')
+        return true
+      }
+      this.log(`[home] 没走回去：${(r && r.reason) || '不知道为啥'}`)
+      return false
+    } catch (e) {
+      this.log('[home] 回家出错: ' + e.message)
+      return false
+    } finally {
+      this._homing = false
+      this.busy = false
+      this.taskDesc = ''
+    }
+  }
+
+  /**
    * 复活后如果离得太远，自己走回家。
    *
    * 96 格是"再挖下去也是荒的"的经验线：
@@ -564,14 +680,20 @@ class Bot {
     if (!this.home || !this.bot || !this.bot.entity) return
     let far = false
     let dist = null
+    let cost = null
     try {
       dist = this.home.hDistanceFromHome()
+      cost = this.home.walkCostHome()
+      // 用加权代价（垂直×3）判，不是纯水平 ——
+      // 旧实现按水平算，实测「水平 82 / 垂直 46」被判成不远，永远不回家
       far = this.home.isFarFromHome(96)
     } catch (e) {
       return
     }
     if (!far) {
-      if (Number.isFinite(dist)) this.log(`[home] 复活点离家 ${Math.round(dist)} 格，不用回去`)
+      if (Number.isFinite(dist)) {
+        this.log(`[home] 复活点离家 水平${Math.round(dist)} 垂直${Math.round(this.home.vDistanceFromHome())} 代价${Math.round(cost)}，不用回去`)
+      }
       return
     }
 
@@ -595,25 +717,8 @@ class Bot {
     //     06:18:33 [home] 第 1 段没往前走（107 → 105）
     // 所以再加一个"回家专用"的归属位 _homing，它只有这里写，
     // 主循环和 reflex 都认它 —— 谁也别想趁 busy 被误清时插进来。
-    this._homing = true
-    this.busy = true
-    this._busySince = Date.now()
-    this.taskDesc = '走回家'
-    try {
-      const r = await this.home.goHome({ timeoutMs: 300000 })
-      if (r && r.ok) {
-        this.log(`[home] 到家了（${r.seconds}s）`)
-        if (this.events) this.events.push('found_something', { home: true }, '你走回家了')
-      } else {
-        this.log(`[home] 没走回去：${(r && r.reason) || '不知道为啥'}`)
-      }
-    } catch (e) {
-      this.log('[home] 回家出错: ' + e.message)
-    } finally {
-      this._homing = false
-      this.busy = false
-      this.taskDesc = ''
-    }
+    // 这一整套现在收在 walkHomeNow() 里，复活回家和主动回家共用。
+    await this.walkHomeNow(`复活点离家 ${Math.round(dist)} 格`)
   }
 
   /** 急件来了：立刻有反应 */
@@ -730,11 +835,35 @@ class Bot {
    *
    * 返回 observe 的结果，调用方想用就用（现在只是记日志）。
    */
+  /**
+   * 带 underground 字段的状态快照。
+   *
+   * 【为什么必须有这个】
+   * goals.js 的 `surface` 阶段和 `getup` 目标都靠它判"到没到地面"。
+   * 不传的话只能按 y 坐标猜，两个方向都会错：
+   *   - 山谷 y=52，头顶是天  -> 按 y 判"还在洞里"，白跑一趟 getup
+   *   - 山体洞穴 y=70，头顶石头 -> 按 y 判"出来了"，实际还困在山肚子里
+   *
+   * isUnderground() 看头顶遮挡，两个场景都准。它返回三态（true/false/null），
+   * null 表示区块没加载看不清 —— 这时候不传，让 goals 退回 y 估算。
+   */
+  statusWithUnderground () {
+    if (!this.actions) return null
+    const st = this.actions.status()
+    if (!st) return null
+    try {
+      const ug = this.actions.isUnderground()
+      // null 时不写这个字段，让 goals 知道"这次判断不了"
+      if (ug === true || ug === false) st.underground = ug
+    } catch (e) {}
+    return st
+  }
+
   observeGoals () {
     if (!this.goals) return null
     let res = null
     try {
-      const st = this.actions ? this.actions.status() : null
+      const st = this.statusWithUnderground()
       if (!st) return null
       // 30 秒一次就够 —— 进度是按背包/坐标算的，扫太勤没意义
       const now = Date.now()
@@ -766,7 +895,7 @@ class Bot {
   async ensureGoal () {
     if (!this.goals) return null
     try {
-      const st = this.actions ? this.actions.status() : null
+      const st = this.statusWithUnderground()
       return await this.goals.ensure(st)
     } catch (e) {
       this.log('[goals] ensure 出错: ' + e.message)
@@ -875,6 +1004,46 @@ class Bot {
 
     // 7. 有答应别人的事就先做（答应了要做到）
     let want = null
+
+    // 6.5 该不该先回家一趟？
+    //
+    // 【实测 · 2026-11-13 16:30】旧实现只有"复活后离家>96才回家"这一条路，
+    // 也就是说**不死就永远不回家**。实测他在地下 y=18 一直挖，家在
+    // 66,64,-92（水平 82 格、垂直 46 格），旧的水平判定算出 82 格 < 96，
+    // 判成"不远"，于是永远不回家 —— 用户说的「每次见他都在地下」就是这个。
+    //
+    // 现在每轮都问一次 home.shouldHeadHome()：距离/深度/背包/工具综合判断，
+    // 只有代价真的超过收益时才打断，不是"离家就回"。
+    if (this.home && this.home.hasHome && !this._homing) {
+      const head = this.tryHeadHome()
+      if (head) return
+    }
+
+    // 6.6 今天这一份挖够了没？待太久了没？
+    //
+    // 【为什么需要这一条】goals.js 有 shouldWrapUp()，但它不会自己打断任务。
+    // 实测：回家成功后 1 分钟他又钻回地下（16:47 到家，16:48 到 y=60）。
+    // 原因是长期目标「一直往下挖」没有"什么时候算完"。
+    //
+    // 现在挖到「今天份」（比如 8 块铁矿）或者在地下待了 25 分钟，
+    // 就主动收工，让他有个自然的收尾。
+    if (this.goals) {
+      try {
+        const wrap = this.goals.shouldWrapUp(this.statusWithUnderground())
+        if (wrap && wrap.yes) {
+          // 5 分钟冷却，别每轮都喊
+          const now = Date.now()
+          if (now - (this._lastWrapUpAt || 0) > 5 * 60000) {
+            this._lastWrapUpAt = now
+            this.log('[goals] 该收工了：' + wrap.why)
+            if (this.will && this.will.finish) this.will.finish()
+            // 下次 think() 会拿到 getup 或别的目标
+            this.will && (this.will.current = null)
+          }
+        }
+      } catch (e) {}
+    }
+
     if (this.pendingTask) {
       want = this.pendingTask
       this.pendingTask = null
@@ -949,7 +1118,13 @@ class Bot {
 
     try {
       const ctxText = this.contextForTask()
-      this.log(`[ctx] 上下文 ${ctxText.length} 字符${/剖面/.test(ctxText) ? '（含视觉地形图）' : '（⚠️ 没有视觉）'}`)
+      // 把"家"和"长期目标"有没有进上下文一并打出来。
+      // 光看 [ctx] 字符数证明不了这两个模块在工作 ——
+      // 之前就是"接进去了"但没人验证过 summary() 真的在提示词里。
+      const hasHome = /^## 家$/m.test(ctxText)
+      const hasGoal = /^## 你心里挂着的一件事$/m.test(ctxText)
+      this.log(`[ctx] 上下文 ${ctxText.length} 字符${/剖面/.test(ctxText) ? '（含视觉地形图）' : '（⚠️ 没有视觉）'}` +
+        `｜家:${hasHome ? '✓' : '✗'} 长期目标:${hasGoal ? '✓' : '✗'}`)
       const result = await Promise.race([
         this.coder.writeAndRun(want.text, ctxText),
         timeoutPromise
@@ -1219,7 +1394,9 @@ class Bot {
     // 地形剖面图比文字描述有用得多：一眼能看出前方通不通、头顶有没有石头
     let world = ''
     try {
-      world = this.actions.lookAround3D(6)
+      // range 按场景自适应：地面 5（省 127 字符），洞里 6（断头路要早看见）
+      // 实测见 actions.js 的 lookAround3D 注释
+      world = this.actions.lookAround3D(this.actions.pickRange())
     } catch (e) {
       this.log('[vision] ' + e.message)
       // 视觉失败就退回文字感知
@@ -1263,12 +1440,34 @@ class Bot {
     // 家在哪：他得知道"走远了该往回走"，而不是就地开荒
     let homeBlock = ''
     try {
-      homeBlock = this.home ? this.home.summary() : ''
+      if (this.home) {
+        homeBlock = this.home.summary()
+        // 家附近有什么资源 —— findNearHome() 之前写好了但没人调，
+        // 挖矿永远以脚底下为中心找，家附近有矿他也看不见。
+        // 这里只是把情报摆到他眼前，挖矿逻辑本身没动（那是 dig-owner 的地盘）。
+        let res = ''
+        try { res = this.home.homeResourceHint() } catch (e) {}
+        if (res) homeBlock += '\n' + res
+      }
     } catch (e) {
       this.log('[home] ' + e.message)
     }
 
+    // 长期目标：这一步是整件事的第几步、要去哪弄。
+    //
+    // 【补接】之前 promptBlock() 写好了但从来没人调 ——
+    // 长期目标只通过 will.current() 传了一句任务文本过去，
+    // 「这是第 2/4 步」「去哪弄」「这件事是一天天攒出来的」全丢了。
+    // 结果他每轮都像第一次干这事，看不出进度，也不知道方向。
+    let goalBlock = ''
+    try {
+      goalBlock = this.goals ? this.goals.promptBlock() : ''
+    } catch (e) {
+      this.log('[goals] ' + e.message)
+    }
+
     return (selfBlock ? selfBlock + '\n\n' : '') +
+      (goalBlock ? goalBlock + '\n\n' : '') +
       (homeBlock ? '## 家\n' + homeBlock + '\n\n' : '') +
       world + '\n' + extra.join('\n') + (pluginHint ? '\n' + pluginHint : '')
   }

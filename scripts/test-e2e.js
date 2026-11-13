@@ -85,7 +85,7 @@ const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'))
 process.env.AIFRIEND_DATA = path.join('data', 'test-results', 'e2e-judge-runtime')
 
 const mineflayer = require('mineflayer')
-const { pathfinder, Movements } = require('mineflayer-pathfinder')
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const mcData = require('minecraft-data')(cfg.bot.version || '1.21.11')
 const { Actions } = require(path.join(ROOT, 'src', 'actions'))
 const { Bot: JudgeBot } = require(path.join(ROOT, 'main.js'))
@@ -123,6 +123,136 @@ const FAIL_KINDS = {
 /** 测不了的（不是他做不成，是测试夹具没搭起来）—— 不算进成功率 */
 const SKIP_KIND = '跳过（夹具没搭起来，不计入成功率）'
 
+// ==================================================================
+// 测试夹具：**保证有镐**
+// ==================================================================
+//
+// 为什么需要这个：
+//   「挖石头」这个用例原来同时测三件事 —— 造镐、找树、挖矿。
+//   三个都过才 ✅，任何一个挂了就 ❌，于是根本看不出 mine() 修得怎么样。
+//   实测「挖石头」301s 超时里，挖矿本身只占 2 秒，剩下全是造镐（砍树）。
+//
+// 拆开之后：
+//   「做木镐」用例  -> 测造镐
+//   「挖石头」用例  -> 夹具保证有镐，**只测 mine()**
+//
+// 用户给的三种做法里选了 C+B 混合：
+//   1. 先试已知"有树"的固定坐标（goto 过去再砍）—— 最可控
+//   2. 不行就带足预算（300s，不设 ensurePickaxe 的 120s 上限）自己找
+//   3. 都不行就 skip（不算失败，因为这是夹具问题不是能力问题）
+
+/** 已知有树的坐标（历次实测记下来的，见脚本注释里的日期） */
+const KNOWN_TREE_SPOTS = [
+  { x: 86, y: 76, z: 73, note: '2026-11-13 gap-fixer 实测砍到 4 块 oak_log' },
+  { x: 74, y: 65, z: 134, note: '2026-11-13 08:18 实测砍到 6 块 birch_log' },
+  { x: 107, y: 76, z: 66, note: '2026-11-13 10:40 实测砍到 1 块 oak_log' },
+  { x: 57, y: 81, z: -94, note: '2026-11-13 15:43 实测砍到 2 块 oak_log' },
+  { x: 75, y: 75, z: -125, note: '2026-11-13 15:43 实测砍到 6 块 oak_log' }
+]
+
+/**
+ * 让 bot 手上有一把镐（任意种类）。
+ *
+ * @returns {Promise<{ ok:boolean, how:string, secs:number }>}
+ */
+async function ensurePickaxeByFixture (a, bot, ctx, opts = {}) {
+  const budgetMs = opts.budgetMs || 300000
+  const t0 = Date.now()
+  const pickUp = () => bot.inventory.items()
+    .filter(i => /_pickaxe$/.test(i.name))
+    .sort((x, y) => {
+      const rank = (n) => /netherite/.test(n) ? 6 : /diamond/.test(n) ? 5 : /iron/.test(n) ? 4
+        : /stone/.test(n) ? 3 : /golden/.test(n) ? 2 : /wooden/.test(n) ? 1 : 0
+      return rank(y.name) - rank(x.name)
+    })[0]
+
+  // 0. 已经有了
+  let have = pickUp()
+  if (have) return { ok: true, how: `开局已有 ${have.name}`, secs: 0 }
+
+  // 1. 已知坐标：走到树旁直接砍
+  if (bot.pathfinder) {
+    for (const spot of KNOWN_TREE_SPOTS) {
+      if (Date.now() - t0 > budgetMs) break
+      // 太远就别去（>400 格说明出生点完全在另一片区域）
+      const d = Math.hypot(a.pos().x - spot.x, a.pos().z - spot.z)
+      if (d > 400) continue
+      ctx.notes.push(`夹具：试已知树点 (${spot.x},${spot.y},${spot.z}) 距离 ${Math.round(d)} 格（${spot.note}）`)
+      try {
+        // 用 pathfinder 的 GoalXZ 长途接近（不经过 goto，避免 gotoVertical 卡死）
+        const arrived = await Promise.race([
+          (async () => {
+            try {
+              bot.pathfinder.setGoal(new goals.GoalXZ(Math.floor(spot.x), Math.floor(spot.z)))
+            } catch (e) { return false }
+            const s = Date.now()
+            let last = a.pos().clone()
+            let still = 0
+            while (Date.now() - s < 90000) {
+              const p = a.pos()
+              if (Math.hypot(p.x - spot.x, p.z - spot.z) <= 4) return true
+              if (p.distanceTo(last) < 0.12) still += 200
+              else still = 0
+              last = p.clone()
+              if (still > 6000) break
+              await sleep(200)
+            }
+            return Math.hypot(a.pos().x - spot.x, a.pos().z - spot.z) <= 8
+          })(),
+          sleep(95000).then(() => false)
+        ])
+        try { bot.pathfinder.setGoal(null) } catch (e) {}
+
+        if (arrived) {
+          // 找附近原木直接砍（chopTree 在该点附近应该能找到）
+          const before = a.woodCount()
+          try { await a.chopTree(1) } catch (e) {}
+          if (a.woodCount() > before) {
+            ctx.notes.push(`夹具：在已知树点砍到 ${a.woodCount() - before} 块原木`)
+            break
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  // 2. 有木头了 -> 做木板/木棍/木镐（用 craftSmart，它已经验证过）
+  const tryCraft = async () => {
+    try {
+      if (a.woodCount() > 0) await a.anyPlanks(12)
+      if (a.countOf('stick') < 2) await a.craftSmart('stick', 2)
+      await a.craftSmart('wooden_pickaxe', 1)
+    } catch (e) {
+      ctx.notes.push(`夹具：合成失败 ${String(e.message).slice(0, 50)}`)
+    }
+    const p = pickUp()
+    if (p) { try { await bot.equip(p, 'hand') } catch (e) {} }
+    return p
+  }
+
+  have = await tryCraft()
+  if (have) return { ok: true, how: `用已知树点做出 ${have.name}`, secs: Math.round((Date.now() - t0) / 1000) }
+
+  // 3. 兜底：带足 300 秒预算，不设 ensurePickaxe 的 120s 上限，让它自己慢慢找
+  if (Date.now() - t0 < budgetMs - 60000) {
+    ctx.notes.push('夹具：已知树点都不行，放开预算自己找（最多 ~240s）')
+    try {
+      // 直接调 ensurePickaxe 并把预算拉满 —— 这是"允许慢"的版本
+      const leftMs = Math.max(60000, budgetMs - (Date.now() - t0) - 10000)
+      await a.ensurePickaxe({ budgetMs: leftMs })
+      have = pickUp()
+      if (have) {
+        try { await bot.equip(have, 'hand') } catch (e) {}
+        return { ok: true, how: `自己找到材料做出 ${have.name}`, secs: Math.round((Date.now() - t0) / 1000) }
+      }
+    } catch (e) {
+      ctx.notes.push(`夹具：自找失败 ${String(e.message).slice(0, 50)}`)
+    }
+  }
+
+  return { ok: false, how: '夹具造不出镐（出生点附近确实没有可用的树）', secs: Math.round((Date.now() - t0) / 1000) }
+}
+
 const TASKS = [
   // ---------------- 1. 挖石头 ----------------
   {
@@ -132,9 +262,45 @@ const TASKS = [
     budget: 300,
     async run (a, bot, ctx) {
       const cnt = () => a.countOf('cobblestone') + a.countOf('cobbled_deepslate')
-      const before = cnt()
       const t0 = Date.now()
       const hadPick = bot.inventory.items().some(i => /_pickaxe$/.test(i.name))
+
+      // ===== 夹具：先保证有镐，再测 mine() =====
+      //
+      // 【为什么 · 2026-11-13 16:10】
+      // 这个用例原来一次测三件事：造镐 + 找树 + 挖矿。
+      // 实测 301s 超时里挖矿只占 2 秒，剩下全是砍树造镐 ——
+      // 于是"mine() 修得怎么样"完全看不出来。
+      // 造镐已经由「做木镐」用例覆盖，这里不该重复测。
+      //
+      // 夹具造不出镐时按"跳过"处理，不算失败 —— 那是夹具问题，不是能力问题。
+      let fixture = { ok: hadPick, how: hadPick ? '开局已有镐' : '', secs: 0 }
+      if (!hadPick) {
+        ctx.notes.push('挖石头：开局没镐，启用夹具（不设 120s 上限，允许慢）')
+        // 夹具预算不能给满 300 秒 —— 一旦砍树卡住，整轮任务直接超时，
+        // 连一行 mine() 的日志都看不到（实测 prof2：301s 全在试已知树点）。
+        // 给 150 秒：够走 1~2 个已知树点，不够就明确"夹具失败"跳过，
+        // 这样测试至少能给出"mine 没被验证"的结论，而不是含糊的超时。
+        fixture = await ensurePickaxeByFixture(a, bot, ctx, { budgetMs: 150000 })
+        if (!fixture.ok) {
+          return {
+            ok: false,
+            skip: true,
+            kind: SKIP_KIND,
+            detail: `夹具造不出镐（${fixture.how}，${fixture.secs}s），无法单测 mine()`
+          }
+        }
+        ctx.notes.push(`挖石头：夹具就绪 ${fixture.how}（${fixture.secs}s），下面只测 mine()`)
+      }
+
+      // 基线必须在夹具之后取 —— 否则会把造镐过程里挖到的圆石算进来
+      const before = cnt()
+
+      // 【关键】计时也要在夹具之后重新起算。
+      // 原来 t0 在任务开头就定了，于是 `mine 段` 把夹具那 216 秒也算进去，
+      // 报出"mine 段 254s"——但 mine() 自己只跑了 37.8 秒。
+      // 这种统计口径错误会直接把结论带偏（看起来像 mine 很慢）。
+      const tMine0 = Date.now()
 
       // 路径 A：原子动作 mine()。这是"他自己写代码"会调的入口。
       let retA = null
@@ -145,6 +311,7 @@ const TASKS = [
       await sleep(1000)
       const tA = Date.now()
       const afterA = cnt()
+      const mineSecs = Math.round((tA - tMine0) / 1000)
 
       // 路径 B：现成的脚手架 digStone()（会自己往下挖到石头层）。
       // ROADMAP 阶段 1 要回答的就是"原子动作够不够" —— 所以两条路都测，
@@ -183,13 +350,17 @@ const TASKS = [
       const pathB = retB === null ? '（未测）'
         : (after > afterA ? `digStone() 成功 ${afterA}->${after}` : 'digStone() 也失败')
 
+      // 夹具耗时和 mine 耗时分开报 —— 这才是"mine() 单独的真实耗时"
+      const fixtureStr = hadPick
+        ? '开局已有镐'
+        : `夹具 ${fixture.secs}s（${fixture.how}）`
       return {
         ok,
         kind: ok ? null : (errA || errB ? FAIL_KINDS.EXCEPTION : FAIL_KINDS.NO_OUTPUT),
-        detail: `圆石 ${before} -> ${after}｜mine 段 ${Math.round((tA - t0) / 1000)}s｜${pathA}（返回 ${JSON.stringify(retA)}` +
+        detail: `圆石 ${before} -> ${after}｜mine 段 ${mineSecs}s｜${pathA}（返回 ${JSON.stringify(retA)}` +
           `${errA ? '，异常: ' + errA.slice(0, 40) : ''}）｜${pathB}` +
           `${errB ? '，异常: ' + errB.slice(0, 40) : ''}` +
-          `｜${hadPick ? '开局已有镐' : '开局没镐（要先自己造）'}`
+          `｜${fixtureStr}`
       }
     }
   },
@@ -522,49 +693,18 @@ const TASKS = [
       const startY = Math.round(a.pos().y)
       const fixture = []
 
-      // ---- 夹具 1：往下挖 4 格 ----
+      // ---- 夹具 1：往下挖 4 格（用 digDownOne，不靠 goto）----
       let dugDown = 0
       for (let i = 0; i < 4; i++) {
-        const p = a.pos()
-        const below = bot.blockAt(p.offset(0, -1, 0))
-        if (!below || /bedrock|lava|water/.test(below.name)) {
-          fixture.push(`第${i + 1}格下面是 ${below ? below.name : '未知'}，停止下挖`)
+        const p0 = a.pos()
+        const below = bot.blockAt(p0.offset(0, -1, 0))
+        const ok = await digDownOne(bot, a)
+        if (!ok) {
+          fixture.push(`第${i + 1}格下不去（脚下是 ${below ? below.name : '空'}）`)
           break
         }
-        let ok = false
-        // allowBare: 空手也挖。夹具只是要"下到地下"，不需要掉落物。
-        // 原来没传这个选项，空手挖石头被 bestToolFor 拦住，夹具造不出来。
-        try { ok = await a.digAt(below, { allowBare: true }) } catch (e) { break }
-        if (!ok) { fixture.push(`第${i + 1}格挖不动`); break }
         dugDown++
-
-        // 挖完必须真正掉进坑里再挖下一格。
-        //
-        // 实测（/tmp/fix1.js）：挖掉脚下方块后，人经常卡在坑口边缘，
-        // 连挖 2 格 y 只降 0.54 格，第 3 格脚下就变 air 了 ——
-        // 而 dogDown<3 判定因此永远不满足，每轮 skip。
-        // 解决：把人挪到格子正中心，逼它掉下去。
-        const cx = Math.floor(p.x) + 0.5
-        const cz = Math.floor(p.z) + 0.5
-        try { await a.goto(cx, p.y - 1, cz, 0, 6000) } catch (e) {}
-
-        // 确认真的掉下去了。没掉下去就自己再挖一次（可能是脚下又冒出一层）
-        let dropped = false
-        for (let k = 0; k < 12; k++) {
-          const q = a.pos()
-          if (bot.entity.onGround && q.y <= p.y - 0.6) { dropped = true; break }
-          await sleep(150)
-        }
-        if (!dropped) {
-          // 还悬着：把脚下再挖一格，然后再等
-          const q = a.pos()
-          const again = bot.blockAt(q.offset(0, -1, 0))
-          if (again && !/bedrock|lava|water/.test(again.name)) {
-            try { await a.digAt(again, { allowBare: true }) } catch (e) {}
-          }
-          for (let k = 0; k < 12 && !bot.entity.onGround; k++) await sleep(150)
-        }
-        await sleep(250)
+        await sleep(200)
       }
 
       if (dugDown < 3) {
@@ -575,20 +715,25 @@ const TASKS = [
         }
       }
 
-      // ---- 夹具 2：横着挖 3 格，让头顶压着实心 ----
-      // 先挑一个前方是实心的方向（避免直接挖进天然洞穴）
+      // ---- 夹具 2：横着掘进，让头顶压着实心 ----
+      // 目的：让 isUnderground() 判真（"头顶 15 格内有石头"）。
+      // 竖井下来时头顶还是自己挖的竖井 -> 通天 -> 判露天，
+      // 所以必须往侧面拐进去，头上才有原生的实心方块。
       const dirs = [
-        { name: '+X', dx: 1, dz: 0, yaw: -Math.PI / 2 },
-        { name: '-X', dx: -1, dz: 0, yaw: Math.PI / 2 },
-        { name: '+Z', dx: 0, dz: 1, yaw: 0 },
-        { name: '-Z', dx: 0, dz: -1, yaw: Math.PI }
+        { name: '+X', dx: 1, dz: 0 },
+        { name: '-X', dx: -1, dz: 0 },
+        { name: '+Z', dx: 0, dz: 1 },
+        { name: '-Z', dx: 0, dz: -1 }
       ]
+      // 先挑一个前方是实心的方向（避免直接挖进天然洞穴，那样头顶又是空的）
       let chosen = null
       for (const d of dirs) {
-        const p = a.pos()
-        const foot = bot.blockAt(p.offset(d.dx, 0, d.dz))
-        const head = bot.blockAt(p.offset(d.dx, 1, d.dz))
-        if (foot && head && foot.boundingBox === 'block' && head.boundingBox === 'block') {
+        const p0 = a.pos()
+        const foot = bot.blockAt(p0.offset(d.dx, 0, d.dz))
+        const head = bot.blockAt(p0.offset(d.dx, 1, d.dz))
+        const roof = bot.blockAt(p0.offset(d.dx, 2, d.dz))
+        if (foot && head && roof &&
+            foot.boundingBox === 'block' && head.boundingBox === 'block') {
           chosen = d
           break
         }
@@ -597,31 +742,11 @@ const TASKS = [
 
       let tunneled = 0
       for (let step = 0; step < 4; step++) {
-        const p = a.pos()
-        // 挖脚和头两格（allowBare：夹具只为造环境，不要掉落物）
-        for (const dy of [0, 1]) {
-          const b = bot.blockAt(p.offset(chosen.dx, dy, chosen.dz))
-          if (!b || b.name === 'air' || b.name === 'cave_air') continue
-          try { await a.digAt(b, { allowBare: true }) } catch (e) {}
-        }
-        // 走进新挖的格子。
-        // 原来的写法只 setControlState('forward')，朝向可能没对准，
-        // 结果人原地打转 —— 掘进 3 格后还在原地，头顶照样通天，
-        // 于是报「y=66 仍被判为露天」。改成目标坐标寻路，稳得多。
-        const tx = Math.floor(p.x) + chosen.dx
-        const tz = Math.floor(p.z) + chosen.dz
-        const ty = Math.floor(p.y)
-        try { await a.goto(tx, ty, tz, 0, 6000) } catch (e) {}
-        // 确认真的进去了
-        for (let k = 0; k < 10; k++) {
-          const q = a.pos()
-          if (Math.floor(q.x) === tx && Math.floor(q.z) === tz) break
-          await sleep(150)
-        }
-        await sleep(250)
-        tunneled++
-        // 已经够深就停
-        if (step >= 1 && a.isUnderground()) break
+        const moved = await tunnelOneStep(bot, a, chosen.dx, chosen.dz)
+        if (moved) tunneled++
+        await sleep(200)
+        // 已经是"真地下"了就停（省时间）
+        if (tunneled >= 2 && a.isUnderground()) break
       }
       fixture.push(`下挖 ${dugDown} 格，向 ${chosen.name} 掘进 ${tunneled} 格`)
 
@@ -669,6 +794,190 @@ const TASKS = [
 ]
 
 const fmt = (p) => `(${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)})`
+
+// ==================================================================
+// 夹具工具：把自己弄到地下
+// ==================================================================
+//
+// 【为什么不能用 a.goto(cx, y-1, cz) 让人掉进坑里】
+// goto 的到达判据是 `dxz <= tol && dyAbs <= 2`（见 src/actions.js 的 goto）。
+// 目标设成 p.y - 1 时，dyAbs = 1 ≤ 2 一开始就成立，
+// 只要水平距离够近就直接 return true —— 人一步都没动，
+// 调用方却以为"已经下去了"。
+//
+// 实测（/tmp/fixdiag.js）：
+//   第1格: 脚下=grass_block y=71.00
+//     digAt= true
+//     掉落=false 现在y=71.00 onGround=false
+//   没掉下去，break
+//   >>> 最终 y= 71.0 下挖= 1 格
+// 这就是「从地下爬出来」永远报"只挖下去 1 格"的原因。
+//
+// 正确做法：不管路径，直接确认"脚下是空的 + 等人自己掉"。
+// 原版重力会把玩家拉下去，只需要时间。
+
+/** 等玩家真的落到某一层的实心方块上 */
+async function settleOnGround (bot, a, maxTicks = 40) {
+  for (let i = 0; i < maxTicks; i++) {
+    await sleep(100)
+    const p = a.pos()
+    const below = bot.blockAt(p.offset(0, -1, 0))
+    const onSolid = below && below.boundingBox === 'block'
+    if (bot.entity.onGround && onSolid) return true
+  }
+  return false
+}
+
+/**
+ * 往下挖一格，并确保自己真的落进坑里。
+ * @returns {Promise<boolean>} 是否成功下降
+ */
+async function digDownOne (bot, a) {
+  const p0 = a.pos()
+  const y0 = p0.y
+  let below = bot.blockAt(p0.offset(0, -1, 0))
+  if (!below) return false
+  if (/bedrock|lava|water/.test(below.name)) return false
+
+  // 脚下已经是空气：人可能浮在方块边缘（出生点挂在树叶/斜坡上）。
+  //
+  // 【踩过的坑】这里必须**重新取** below。
+  // 原来只在开头取一次快照，然后等落地，落地后仍拿那个旧的 air 对象去 digAt ——
+  // digAt(air) 直接返回 false，于是报"第1格下不去（脚下是 grass_block）"：
+  // 错误信息里 real 的 grass_block 是任务体重新取的，日志却永远是 false。
+  // 现象非常迷惑：诊断脚本能连挖 4 格，e2e 里一格都下不去。
+  if (below.boundingBox !== 'block') {
+    for (let i = 0; i < 30; i++) {
+      await sleep(100)
+      const q = a.pos()
+      const b2 = bot.blockAt(q.offset(0, -1, 0))
+      if (b2 && b2.boundingBox === 'block') break
+    }
+    // 重新取当前位置脚下的方块（不要用上面那个旧快照）
+    let q2 = a.pos()
+    below = bot.blockAt(q2.offset(0, -1, 0))
+
+    // 等 3 秒还浮空，说明出生点挂在半空（树叶/悬空方块边缘），
+    // 重力不会把我们送到地面。往四周挪一格再试。
+    if (!below || below.boundingBox !== 'block') {
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1]]) {
+        try {
+          const yaw = Math.atan2(-dx, dz)
+          await bot.look(yaw, 0, true)
+          bot.setControlState('forward', true)
+          await sleep(600)
+          bot.setControlState('forward', false)
+        } catch (e) {}
+        await sleep(400)
+        q2 = a.pos()
+        const b4 = bot.blockAt(q2.offset(0, -1, 0))
+        if (b4 && b4.boundingBox === 'block') { below = b4; break }
+      }
+    }
+    if (!below || below.boundingBox !== 'block') return false
+    if (/bedrock|lava|water/.test(below.name)) return false
+  }
+
+  // allowBare：夹具只要"挖通"，不要掉落物。
+  // 空手挖石头慢且不掉料，但能把方块挖掉让我们下去。
+  let ok = false
+  try { ok = await a.digAt(below, { allowBare: true }) } catch (e) { return false }
+  if (!ok) return false
+
+  // 关键：不调 goto。等重力把玩家拉下去。
+  for (let i = 0; i < 30; i++) {
+    await sleep(100)
+    if (a.pos().y < y0 - 0.6) break
+  }
+  if (a.pos().y >= y0 - 0.6) {
+    // 没掉下去：可能卡在方块边缘。往中心挪一点点（用原始控制键，不走 pathfinder）
+    try {
+      const cx = Math.floor(p0.x) + 0.5
+      const cz = Math.floor(p0.z) + 0.5
+      const dx = cx - a.pos().x
+      const dz = cz - a.pos().z
+      if (Math.hypot(dx, dz) > 0.25) {
+        await bot.look(Math.atan2(-dx, -dz), 0, true)
+        bot.setControlState('forward', true)
+        await sleep(Math.min(500, Math.max(150, Math.hypot(dx, dz) * 400)))
+        bot.setControlState('forward', false)
+      }
+    } catch (e) {}
+    for (let i = 0; i < 25; i++) {
+      await sleep(100)
+      if (a.pos().y < y0 - 0.6) break
+    }
+  }
+
+  await settleOnGround(bot, a)
+  return a.pos().y < y0 - 0.6
+}
+
+/**
+ * 朝某个方向掘进一格（挖掉脚和头，然后走进去）。
+ * 用控制键而不是 goto —— 这一格距离上 goto 的距离判据不可靠。
+ */
+async function tunnelOneStep (bot, a, dx, dz) {
+  const p0 = a.pos()
+  const base = { x: Math.floor(p0.x), y: Math.floor(p0.y), z: Math.floor(p0.z) }
+
+  // 挖掉前方脚位和头位
+  for (const dy of [0, 1]) {
+    const b = bot.blockAt(bot.entity.position.offset(
+      (base.x + dx) - bot.entity.position.x,
+      (base.y + dy) - bot.entity.position.y,
+      (base.z + dz) - bot.entity.position.z))
+    if (!b || b.name === 'air' || b.name === 'cave_air') continue
+    try { await a.digAt(b, { allowBare: true }) } catch (e) {}
+    await sleep(150)
+  }
+
+  // 走进去：面朝 dx,dz 方向按前进。
+  //
+  // 【踩过的坑】yaw 符号写反了。
+  // Minecraft 的约定：yaw=0 面向 +Z（南），yaw=-π/2 面向 +X（东）。
+  // 前进单位向量 = (-sin(yaw), cos(yaw))。
+  // 要走向 (dx, dz)，解 -sin(yaw)=dx、cos(yaw)=dz，得
+  //   yaw = atan2(-dx, dz)
+  // 原来写成 atan2(-dx, -dz)，等于朝着**反方向**走 ——
+  // 挖开了前面的方块，人却往回退，所以永远"掘进 0 格"。
+  const yaw = Math.atan2(-dx, dz)
+  try {
+    await bot.look(yaw, 0, true)
+    bot.setControlState('forward', true)
+    // 1 格约 0.25 秒，给到 1.2 秒容错；中途到了就停
+    for (let i = 0; i < 12; i++) {
+      await sleep(100)
+      const q = a.pos()
+      if (Math.floor(q.x) === base.x + dx && Math.floor(q.z) === base.z + dz) break
+    }
+    bot.setControlState('forward', false)
+  } catch (e) {}
+  await sleep(200)
+
+  // 还没进去：用 pathfinder 补一次（挖开了就是一条 1 格通道，它能走）
+  {
+    const q = a.pos()
+    if (Math.floor(q.x) !== base.x + dx || Math.floor(q.z) !== base.z + dz) {
+      try {
+        bot.pathfinder.setGoal(new goals.GoalBlock(base.x + dx, base.y, base.z + dz))
+        for (let i = 0; i < 20; i++) {
+          await sleep(150)
+          const r = a.pos()
+          if (Math.floor(r.x) === base.x + dx && Math.floor(r.z) === base.z + dz) break
+        }
+        bot.pathfinder.setGoal(null)
+      } catch (e) {}
+    }
+  }
+
+  // 确认真的进了新格子
+  const q = a.pos()
+  const moved = Math.floor(q.x) === base.x + dx && Math.floor(q.z) === base.z + dz
+  await settleOnGround(bot, a)
+  return moved
+}
+
 
 // ==================================================================
 // 2. 环境自检
@@ -858,6 +1167,115 @@ async function main () {
     }
     await sleep(1000)
   }
+
+  // ================================================================
+  // 掉落物健康检查（Lead 要求：开跑前确认这一轮环境可不可信）
+  // ================================================================
+  //
+  // 背景：实测发现同一个 `mine` 在不同时刻回收率天差地别
+  //   （16:00 那轮 4/5 捡到，16:03 那轮 0/4），用户亲手挖是正常的。
+  // 这说明存在"外部环境"因素：服务器掉落物实体同步、TPS、区块 tick。
+  //
+  // 如果这轮环境本身就不给掉落物，后面所有"挖石头失败"的数据都没有归因价值 ——
+  // 白烧 300 秒还得不出结论。所以开跑前先做个 20 秒的小实验：
+  //   连续挖 3 块**同层**的软方块（dirt/grass_block 这类空手就能挖的），
+  //   看背包涨不涨。涨 = 环境正常；不涨 = 标记本轮不可信。
+  //
+  // 用同层目标是有意的：同层掉落物落在脚边，不受"掉落物掉到下方捡不到"
+  // 那个已知地形因素干扰，测的就是纯粹的"掉落物进不进包"。
+  const lootCheck = { tried: 0, gained: 0, samples: [], ok: false, note: '' }
+  try {
+    console.log('---- 环境健康检查：掉落物能不能进包 ----')
+    const soft = ['dirt', 'grass_block', 'gravel', 'sand', 'coarse_dirt']
+    let digs = 0
+    const t0 = Date.now()
+    // 最多 25 秒 / 最多挖 5 次，尽量拿到 3 个样本
+    while (digs < 5 && lootCheck.samples.length < 3 && Date.now() - t0 < 25000) {
+      if (kicked || !bot.entity) break
+      const p0 = a.pos()
+      // 找同层、伸手范围内的软方块
+      let target = null
+      for (const name of soft) {
+        const def = mcData.blocksByName[name]
+        if (!def) continue
+        let ps = []
+        try {
+          ps = bot.findBlocks({ matching: def.id, maxDistance: 6, count: 8 }) || []
+        } catch (e) { ps = [] }
+        const same = ps
+          .filter(q => {
+            const dy = q.y - p0.y
+            return dy >= -0.6 && dy <= 1.6 && q.distanceTo(p0) <= 4.2
+          })
+          .sort((x, y) => x.distanceTo(p0) - y.distanceTo(p0))
+        if (same.length) {
+          const b = bot.blockAt(same[0])
+          if (b) { target = b; break }
+        }
+      }
+      if (!target) {
+        lootCheck.note = '附近 6 格内没有同层软方块可挖'
+        break
+      }
+
+      const before = soft.reduce((n, k) => n + a.countOf(k), 0)
+      let dug = false
+      // 不要用 allowBare：这个检查要验证的是"正常挖掘的掉落物能不能进包"，
+      // 空手强挖（allowBare）本身就可能不掉落，会把环境误判成异常。
+      // 实测：健康检查报"挖 3 次全 +0"，但同一轮 mine() 用木镐挖到 3/3，
+      // 就是因为检查用的是空手。
+      try { dug = await a.digAt(target) } catch (e) {}
+      digs++
+      lootCheck.tried++
+      if (!dug) {
+        lootCheck.samples.push('挖不动')
+        continue
+      }
+      // 等掉落物进包（吸附有延迟）
+      let gained = 0
+      for (let k = 0; k < 14; k++) {
+        await sleep(200)
+        const now = soft.reduce((n, kk) => n + a.countOf(kk), 0)
+        gained = now - before
+        if (gained > 0) break
+      }
+      // 捡不到就走两步再试一次（可能是掉落物偏了一点）
+      if (gained <= 0) {
+        try { await a.pickupNearby(6) } catch (e) {}
+        await sleep(300)
+        const now = soft.reduce((n, kk) => n + a.countOf(kk), 0)
+        gained = now - before
+      }
+      lootCheck.gained += Math.max(0, gained)
+      lootCheck.samples.push(gained > 0 ? `+${gained}` : '+0')
+      await sleep(300)
+    }
+
+    const hasAnyTool = bot.inventory.items().some(i => /_(pickaxe|axe|shovel)$/.test(i.name))
+    lootCheck.hasTool = hasAnyTool
+    lootCheck.ok = lootCheck.gained > 0
+    lootCheck.note = lootCheck.note ||
+      (lootCheck.ok
+        ? `挖 ${lootCheck.tried} 次，收到 ${lootCheck.gained} 个`
+        : hasAnyTool
+          ? `挖 ${lootCheck.tried} 次，一个都没进包`
+          : `挖 ${lootCheck.tried} 次全 +0，但当前是空手（软方块空手也可能不掉落），本次检查不作数`)
+    // 空手时不下"环境异常"的结论 —— 那是检查方法本身的问题
+    if (!hasAnyTool && !lootCheck.ok) lootCheck.inconclusive = true
+
+    if (lootCheck.ok) {
+      console.log(`✅ 环境正常：${lootCheck.note}（样本 ${lootCheck.samples.join(' ')}）`)
+    } else if (lootCheck.inconclusive) {
+      console.log(`➖ 环境未测出：${lootCheck.note}（样本 ${lootCheck.samples.join(' ')}）`)
+    } else {
+      console.log(`⚠️  环境异常：${lootCheck.note}（样本 ${lootCheck.samples.join(' ')}）`)
+      console.log('   这一轮的"挖石头失败"不能全归到代码上，数据要打折看')
+      if (!envWarning) envWarning = '掉落物回收异常（环境问题），本轮数据参考价值低'
+    }
+  } catch (e) {
+    lootCheck.note = '健康检查本身出错: ' + e.message
+    console.log(`⚠️  健康检查出错: ${e.message}`)
+  }
   console.log('')
 
   // ---- 跑任务 ----
@@ -982,6 +1400,13 @@ async function main () {
   console.log('\n' + '='.repeat(64))
   console.log('  结果')
   console.log('='.repeat(64))
+  if (lootCheck) {
+    console.log(`环境健康  : ${lootCheck.ok ? '✅ 正常' : '⚠️  异常'} — ${lootCheck.note}`)
+    if (!lootCheck.ok) {
+      console.log('            （掉落物回收异常时，下面的失败不能全算代码的账）')
+    }
+  }
+  if (envWarning) console.log(`环境警示  : ${envWarning}`)
   console.log(`成功 ${ok} / ${total}（可评分）  成功率 ${rate}%  ` +
     `${skippedList.length ? `跳过 ${skippedList.length} 项  ` : ''}` +
     `总耗时 ${Math.round(secsTotal / 60)} 分 ${secsTotal % 60} 秒\n`)
@@ -1050,6 +1475,8 @@ async function main () {
     judgeMiss: missCount,
     judgeFalseAlarm: alarmCount,
     kicked: kicked || null,
+    lootCheck,
+    envWarning: envWarning || '',
     baseline,
     results
   }

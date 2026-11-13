@@ -249,16 +249,21 @@ ${this.fatigueHint()}`
     const isNew = !this.mem.people[username]
     this.mem.person(username)
 
-    // 第一次见：可能会问怎么称呼
+    // 第一次见：**不问称呼**。
+    //
+    // 【2026-11-13 15:35 用户反馈】「不用反问，也不用主动问别人怎么称呼，
+    // 如果人家不告诉他叫什么名，他就喊人家那个英文游戏名就行了，
+    // 有人跟他说"叫我什么什么"他才会从游戏英文名改口成这个」
+    //
+    // 之前第一次见面必然问一句"怎么称呼"，很突兀 —— 真人玩家不会每次都问。
+    // 现在：直接记一笔，名字就用游戏 ID。等对方主动说了再改口。
     if (isNew) {
-      this.ctx.log('[chat] 第一次见 ' + username)
-      await this.askNameFor(username)
-      // 顺便记下这次碰面
+      this.ctx.log('[chat] 第一次见 ' + username + '（不问称呼，先用游戏名）')
       this.mem.add({
         text: `第一次见到 ${username}`,
         kind: 'person', who: [username], importance: 0.6, emotion: 0.4
       })
-      return
+      // 不 return —— 继续走正常回复流程，回他说的那句话
     }
 
     // 判断这句话值不值得记
@@ -300,7 +305,18 @@ ${this.fatigueHint()}`
       // 慢一点回，像腾出手来才打字的
       const delay = 1500 + Math.random() * 3000
       this.ctx.log('[chat] 忙着，' + Math.round(delay / 1000) + '秒后回 ' + username)
-      setTimeout(() => this.reply(username, message, { busy: true }), delay)
+
+      // ===== 关键：调度时就占位 =====
+      //
+      // 【实测 · 2026-11-13 16:09】延迟回复（setTimeout 1.5-4.5s）和回头接话
+      // 是两条独立路径。回头接话在 8 秒后才触发，但那时延迟回复可能还没跑完，
+      // 或者已经跑完了 —— 无论如何，只要回头接话先跑，它就看不到标记，会重复说。
+      //
+      // 所以在"决定要回"这一刻就占位，中间任一环节真的没说出来才撤销。
+      this.markReplied(username, message)
+      setTimeout(() => {
+        this.reply(username, message, { busy: true, _placeholder: true }).catch(() => {})
+      }, delay)
       return
     }
 
@@ -355,6 +371,21 @@ ${this.fatigueHint()}`
     // 只接最近的一条（真人不会一口气回十条）
     const item = pending[pending.length - 1]
     item.handled = true
+
+    // ===== 关键：这条已经回过了就别再回 =====
+    //
+    // 【实测 · 2026-11-13 16:09】用户说一句话，他回了两条：
+    //   [16:09:41] [chat] 忙着，4秒后回 Xylitol6983
+    //   [16:09:49] [say] 行，等我挖完这点石头       ← 延迟回复路径
+    //   [16:09:53] [followup] 回头接 Xylitol6983 刚才说的
+    //   [16:09:56] [say] 也行                        ← 回头接话路径
+    //
+    // 延迟回复和回头接话是两条独立路径，互相不知道对方回过。
+    // 前面加了 hasReplied 查重，但 followUpDeferred 没查。
+    if (this.hasReplied(item.who, item.msg)) {
+      this.ctx.log(`[followup] ${item.who} 那句已经回过了，跳过`)
+      return false
+    }
 
     this.ctx.log(`[followup] 回头接 ${item.who} 刚才说的：${item.msg.slice(0, 30)}`)
 
@@ -547,7 +578,9 @@ ${item.who} 刚才说的是：${item.msg}
         content: `${persona.chatHint({ maxLen: busyReply ? 20 : 50 })}${nameHint}${secretHint}${demandHint}${this.fatigueHint()}${busyReply ? '\n\n【注意】你手上正忙着，回一句短的就行，别停下来长聊。可以让他等（"等会儿""我弄完这个"），也可以边干边回。' : ''}
 
 另外：
-- 如果对方在这句话里告诉了你该怎么称呼他（"叫我老王""我叫XX"），自然接受并在回复里用上
+- **不要去问对方叫什么、该怎么称呼**。真人不会每次都问。
+  他现在就叫游戏 ID（${username}），你就这么叫他。
+- 只有对方主动说了"叫我老王""我叫XX"，才改口用那个名字
 - **你正在忙的话，回得短一点**，甚至就一句"等会儿""忙着呢"，不用停下来长篇回
 - 不忙的时候可以多聊两句`
       }

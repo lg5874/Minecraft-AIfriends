@@ -136,17 +136,30 @@ console.log('\n[三、记进度：一步一步往前推]')
   ok(r.stageCompleted === true, '火把和吃的够了 → 又过一步')
 
   // 阶段3：挖铁矿（gather，按增量算）
+  //
+  // 【量已改】原来是"挖够 40 块"，那是"一直待在地下"的直接原因。
+  // 现在一趟 12 块就算够 —— 真人挖矿是"这一趟挖到这些就上去"，不是挖满一箱。
   ok(g.stage().kind === 'gather', '第三步是挖矿')
+  status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 3 } })
+  r = g.observe(status)
+  ok(r.ratio > 0.1 && r.ratio < 0.5, '挖到 3 块粗铁，刚起步', g.progressText())
+
   status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 12 } })
   r = g.observe(status)
-  ok(r.ratio > 0.2 && r.ratio < 0.5, '挖到 12 块粗铁，进度三成左右', g.progressText())
+  ok(r.stageCompleted === true, '12 块粗铁就够一趟 → 过了一步')
 
-  status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 40 } })
+  // 阶段4：必须回地面（surface）
+  ok(g.stage().kind === 'surface', '挖完必须先回地面')
+  status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 12 }, y: 14 })
   r = g.observe(status)
-  ok(r.stageCompleted === true, '40 块粗铁 → 过了一步')
+  ok(r.stageCompleted === false, '还在洞里 y=14，这步不算过', g.progressText())
 
-  // 阶段4：烧成铁锭 → 目标完成
-  status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 40, iron_ingot: 32 } })
+  status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 12 }, y: 66 })
+  r = g.observe(status)
+  ok(r.stageCompleted === true, '回到地面 y=66 → 过了一步')
+
+  // 阶段5：在地上烧成铁锭 → 目标完成
+  status = fakeStatus({ inv: { stone_pickaxe: 1, raw_iron: 12, iron_ingot: 12 }, y: 66 })
   r = g.observe(status)
   ok(r.goalCompleted === true, '最后一步做完 → 整个目标完成')
   ok(g.goal === null, '完成后手上就空了，准备想下一个')
