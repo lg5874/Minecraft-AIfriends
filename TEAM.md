@@ -53,20 +53,46 @@
 
 ## 三、文件归属表（硬约束）
 
-| 文件 / 函数 | 归属 | 别人能改吗 |
+**唯一真相是 `scripts/ownership.json`** —— `pre-commit` hook 只读它。
+下面这张表由它生成，两边对不上时以 json 为准，并且**立刻把这张表改过来**（今晚吃过一次"两本账"的亏）。
+
+| 文件 | 归属 | 别人能改吗 |
 |---|---|---|
-| `src/actions.js` → `getToSurface` / `tryPillar` / `digOne` | code-fixer | ❌ |
-| `src/actions.js` → `mine` / `digAt` / `chopTree` / `digStone` | dig-owner | ❌ |
-| `src/actions.js` → `craft*` / `ensureTable` / `safeCraft` | craft-owner | ❌ |
-| `src/actions.js` → `place*` / `findPlaceSpot` / `pillarUp` | build-owner | ❌ |
-| `src/actions.js` → 其余（goto / bestToolFor / 背包 / 战斗） | **Lead** | ⚠️ 改前通知 |
-| `src/skills.js` | skills-owner | ❌ |
-| `src/memory/**` | memory-owner | ❌ |
-| `src/persona.js` / `talk.js` | **Lead** | ⚠️ 这是人格核心 |
-| `src/selfstate.js` / `perceive.js` / `events.js` | perception-owner | ❌ |
-| `main.js` | **Lead** | ⚠️ 改前通知 |
-| `scripts/**` | test-owner | ❌ |
-| `src/home.js` / `src/goals.js`（新文件） | 各自 owner | ❌ |
+| `main.js` | wiring-owner | ❌ |
+| `src/reflex.js` | combat-owner | ❌ |
+| `src/invite.js` | voice-owner | ❌ |
+| `src/talk.js` | talk-owner | ❌ |
+| `src/persona.js` | talk-owner | ❌ |
+| `src/spontaneous.js` | talk-owner | ❌ |
+| `src/goals.js` | goals-owner | ❌ |
+| `src/judge.js` | judge-owner | ❌ |
+| `src/actions.js` | move-owner | ❌ |
+| `src/session.js` | wiring-owner | ❌ |
+| `src/cost.js` | voice-owner | ❌ |
+| `scripts/verify*` | null（无主，谁都能提交） | ✅ 谁都能提交 |
+| `scripts/test-*` | null（无主，谁都能提交） | ✅ 谁都能提交 |
+| `docs/*` | null（无主，谁都能提交） | ✅ 谁都能提交 |
+| `scripts/git-hooks/*` | null（无主，谁都能提交） | ✅ 谁都能提交 |
+| `scripts/commit-own.sh` | null（无主，谁都能提交） | ✅ 谁都能提交 |
+| `src/llm.js` | null（**改前先 send_message 通知 Lead，由 Lead 排期**） | ⚠️ 改前通知 |
+| `src/will.js` | brain-owner | ❌ |
+| `src/impulse.js` | brain-owner | ❌ |
+| `src/coder.js` | brain-owner | ❌ |
+| `src/perceive.js` | sight-owner | ❌ |
+| `src/audience.js` | brain-owner | ❌ |
+| `src/mood.js` | brain-owner | ❌ |
+| `src/skills.js` | brain-owner | ❌ |
+| `src/events.js` | wiring-owner | ❌ |
+| `src/memory/*` | voice-owner | ❌ |
+
+**怎么提交**（每个 agent 都要知道自己是谁）：
+
+```bash
+export DSH_AGENT_NAME=<你的 owner 名>          # 建议写进 shell 初始化
+bash scripts/commit-own.sh --as <你的 owner> -m "..." -- <你点名的文件>
+```
+
+没有 `DSH_AGENT_NAME` 时默认算 `lead`，会成为"谁的文件都拦"的那个人。
 
 **同一个文件里的不同函数可以分给不同人，但派活必须写清函数名。**
 

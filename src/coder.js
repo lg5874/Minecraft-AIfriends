@@ -174,7 +174,10 @@ class Coder {
       let res
       try {
         res = await this.llm.chat(messages, {
-          maxTokens: this.ctx.cfg.llm.codeMaxTokens,
+          // 【2026-11-14】token 不再是瓶颈：max_tokens 是天花板，不是消耗。
+          // 写技能是模型真在思考的环节，截断的代价（半截代码 + 重试 4 次）比多给预算高得多。
+          // config 里现为 4000，这里取 8000 作**下限**：配置更小时自动抬上来，配置更大时尊重配置。
+          maxTokens: Math.max(8000, Number(this.ctx.cfg.llm.codeMaxTokens) || 0),
           temperature: 0.3
         })
       } catch (e) {

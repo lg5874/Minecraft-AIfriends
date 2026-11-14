@@ -1,6 +1,6 @@
 'use strict'
 /**
- * 徐俊杰的主程序。
+ * 小徐的主程序。
  *
  * 连接 → 活着 → 自己想干点什么 → 跟人说话。
  */
@@ -70,6 +70,12 @@ class Bot {
     // 【实测 · 2026-11-14】原来没传 log，llm 的切换/失败日志一条都不会出现
     // 在 main.js 日志里（实机 170s 里 [llm] 计数 = 0，不是没发生，是没打出来）
     this.llm = new LLM(cfg.llm, (s2) => this.log(s2))
+    // 记忆层：把这一个小时的事攒成一段日记（voice-owner 的 mem-diary）。
+    // 注入 LLM 的同时会起一个 5 分钟 unref 定时器；到点调 maybeWriteDiary()，
+    // 一小时没攒够 3 件事就不写（不硬调模型）。
+    // 不接也不会崩（writeDiary 里有 _ensureLLM 兜底），但那样会多造一个 LLM 客户端，
+    // 而且没人给它起定时器 —— 等于日记永远不写。
+    try { this.mem.attachLLM(this.llm) } catch (e) { this.log('[mem] attachLLM 失败: ' + e.message) }
 
     this.actions = null
     this.coder = null
@@ -179,17 +185,17 @@ class Bot {
 
     bot.on('chat', (username, message) => {
       if (username === bot.username) return
-      // 是不是在跟我说话：叫我名字、叫我外号、或者带我的称呼
-      const myName = bot.username
-      const called = message.includes(myName) ||
-        (this.mem.people[username] && false) ||
-        /^(你|XJJ|小徐|俊杰)/.test(message) ||
-        /[?？]$/.test(message)
-
-      if (this.events) {
-        if (called) this.events.push('chat_me', { who: username, message }, `${username} 跟你说：${message}`)
-        else this.events.push('chat_any', { who: username, message }, `${username} 说：${message}`)
-      }
+      // 【判定升级 · talk-owner 6f0cf79】「是不是在跟我说话」从正则改成模型判。
+      // 正则补不上的漏：「你在哪呢」「在哪呢」没名字、结尾也不是问号 → 老代码判 false，
+      // 于是从来不接话茬。模型能判 true，而「这破地方真难找」不会被误当成叫他。
+      //
+      // 判定是异步的（isAddressedTo 内部 5 秒超时，超了自己退正则）。
+      // 所以只把「判定 + 推事件」放进一条 FIFO 链：
+      //   · 事件回调本身立刻返回 —— 不耽误下面的 invite / talk，也不挡主循环
+      //     （tick 是另一个循环，`await` 在事件回调里不会卡它）
+      //   · 两条消息连着来时，链保证仍按收到的顺序 push（否则后一条可能先入队，
+      //     events 批次的叙述顺序会乱）
+      this._chatEnqueue(username, message)
 
       // 【能被邀请】先看这句是不是在叫他跟着走 / 别跟了
       if (this.invite) { try { this.invite.handleChat(username, message) } catch (e) {} }
@@ -1279,9 +1285,20 @@ class Bot {
         return true
       }
       this.log(`[home] 没走回去：${(r && r.reason) || '不知道为啥'}`)
+      // 【实测 · 2026-11-14 07:51】冷却从错误的时间点算：
+      // `tryHeadHome` 里 `_lastHeadHomeAt` 记的是"开始走"的时刻，可这一趟走了 153 秒
+      // = 冷却（120 秒）在放弃的瞬间就已经过期 -> 1 秒后又 acquire home ->
+      // 日志实录 `[07:51:02] release home（持了 153.0s）` → `[07:51:03] acquire home`。
+      // 结果：home 几乎永久持锁，busy 恒真，主循环连 tick 的临界判断都跑不到
+      // （`if (this.busy) return` 在 `_dropPendingIfCritical()` 之前），
+      // 血低也不去找吃的。这是吞吐上最大的一条。
+      // 改：放弃时重新起算，于是每趟失败后有 120 秒 busy=false 的窗口。
+      this._lastHeadHomeAt = Date.now()
       return false
     } catch (e) {
       this.log('[home] 回家出错: ' + e.message)
+      // 出错也算一次失败的尝试，同样要起算冷却 —— 否则异常路径也会立刻重试
+      this._lastHeadHomeAt = Date.now()
       return false
     } finally {
       // 只放自己这一条。用 release 不用 forceRelease：
@@ -1682,6 +1699,114 @@ class Bot {
     try { this.bot.setControlState('jump', false) } catch (e) {}
   }
 
+  /**
+   * 命比手上这件事重要：血低 + 饿低时丢掉 `pendingTask`，把主循环让给找吃的。
+   *
+   * 【为什么必须有】goals-owner 修了 rest 死锁（bf1d523）之后留了个残余风险：
+   *   `goals` 已经算好 food(110) 是第一优先，但主循环里
+   *   `if (this.pendingTask) { want = this.pendingTask }` 在 `ensureGoal()` **之前** ——
+   *   于是顺序变成：血 7 + 饿 17 → 不休息了 → 先跑「在附近弄点木头」→ 那条不吃东西 → 血继续 7。
+   *
+   * 【歇着时不清】`pendingTask` 里「歇着/回家/收拾/睡」那几类是 rest 分支的合法输入，
+   * 清掉等于把"歇着"也一起取消。
+   *
+   * @returns {boolean} 当前是不是临界（调用方还要用它决定跳不跳冲动）
+   */
+  _dropPendingIfCritical () {
+    const hp = this.bot && this.bot.health
+    const fd = this.bot && this.bot.food
+    // 血用 `<= 8`，不是 `< 8`：`reflex.js:56` 的 HP_PANIC = 8 是 `hp <= HP_PANIC -> 跑+吃`。
+    // 写成 `< 8` 的话，血正好 8 时 reflex 已经在跑+吃了，主循环却还在派「砍木头」——
+    // 两条线打架。8 是"跑+吃"的档，10（WARN）只是"小心点"，所以不对齐 10。
+    const critical = (typeof hp === 'number' && hp <= 8) && (typeof fd === 'number' && fd < 18)
+    if (!critical) return false
+
+    const resting = !!(this.goals && this.goals.isResting && this.goals.isResting())
+    if (resting) {
+      if (this.pendingTask) {
+        this.log(`[comply] 血 ${Math.round(hp)}、饿 ${Math.round(fd)} 都很低，但正在歇着 —— 不动 pendingTask`)
+      }
+      return true
+    }
+    if (!this.pendingTask) return true
+
+    const txt = String(this.pendingTask.text || '')
+    this.log(`[comply] 血 ${Math.round(hp)}、饿 ${Math.round(fd)}：先不吃这件「${txt.slice(0, 16)}」，去弄吃的`)
+    this.pendingTask = null
+    return true
+  }
+
+  /**
+   * 老口径兜底：**一律借用 talk 里那份正则**，不在 main 里再写一遍。
+   *
+   * 两份实现必然漂 —— talk 的 `_regexAddressed` 已经是「跟 main.js 原来的口径保持一致」
+   * 的版本（`bot.username` + 三个模式），这边再抄一份，改了一边另一边不知道。
+   * 只有 talk 还没建好（连接早期）时才用内联那一份。
+   */
+  _chatFallbackCalled (myName, message) {
+    try {
+      if (this.talk && typeof this.talk._regexAddressed === 'function') {
+        return !!this.talk._regexAddressed(message)
+      }
+    } catch (e) {}
+    const m = String(message || '')
+    return (myName && m.includes(myName)) ||
+      /^(你|XJJ|小徐|小徐)/.test(m) ||
+      /[?？]$/.test(m)
+  }
+
+  /**
+   * 判「这句话是不是在跟我说」，然后推 `chat_me` / `chat_any`。
+   *
+   * 抽成方法而不是写在事件回调里：验收要能直接调它拿日志，
+   * 否则只能等真服上刚好有人说一句「在哪呢」。
+   *
+   * @returns {{called:boolean, via:string}}
+   */
+  async _chatDecideAndPush (username, message) {
+    const myName = this.bot ? this.bot.username : ''
+    let called = false
+    let via = 'regex'
+    if (this.talk && typeof this.talk.isAddressedTo === 'function') {
+      try {
+        const r = await this.talk.isAddressedTo(username, message)
+        called = !!(r && r.toMe)
+        via = (r && r.via) || 'model'
+      } catch (e) {
+        // isAddressedTo 自己不会抛（内部全路径 return），这里防的是意外
+        called = this._chatFallbackCalled(myName, message)
+        via = 'regex(catch)'
+        this.log('[chat] 判定抛错，退正则: ' + (e && e.message))
+      }
+    } else {
+      called = this._chatFallbackCalled(myName, message)
+      via = 'regex(no-talk)'
+    }
+
+    if (this.events) {
+      if (called) this.events.push('chat_me', { who: username, message }, `${username} 跟你说：${message}`)
+      else this.events.push('chat_any', { who: username, message }, `${username} 说：${message}`)
+    }
+    return { called, via }
+  }
+
+  /**
+   * 把一条收到的公屏消息排进 FIFO 链：判定 → 推事件。
+   *
+   * 【为什么必须排队】判定是异步的（模型最多 5 秒），两条消息连着来时，
+   * 后一条的快判定可能比前一条先回来 → 事件批次里的说话顺序就反了。
+   * 链保证 push 顺序 == 收到顺序。
+   *
+   * 【为什么这条链不挡主循环】`bot.on('chat')` 是事件回调，链只是往里挂一个 then，
+   * 回调本身立刻返回；tick 是另一个循环，不受影响。
+   */
+  _chatEnqueue (username, message) {
+    this._chatSeq = (this._chatSeq || Promise.resolve())
+      .then(() => this._chatDecideAndPush(username, message))
+      .catch(e => this.log('chat 判定出错: ' + (e && e.message)))
+    return this._chatSeq
+  }
+
   async tick () {
     const bot = this.bot
     if (!bot || !bot.entity) return
@@ -1781,8 +1906,34 @@ class Bot {
         if (y != null && y < SURFACE_Y && sinceTry > 10 * 60 * 1000) {
           this._lastSurfaceTryAt = Date.now()
           this.log(`[day] 天亮了还在下面（y=${Math.round(y)}），爬出去`)
-          try { await this.actions.getToSurface() } catch (e) {
-            this.log('[day] 出洞失败：' + (e && e.message))
+          // 【主循环阻塞点】getToSurface 原来没有上限，实测 `[04:31:29] [act] [surface] 680 秒没升高`
+          // —— 那 680 秒里整条主循环停摆，用户喊他一律不应。爬不上去就该放手。
+          //
+          // 但只做 Promise.race 是不够的：超时只是"不再等"，底层还在按 step 挖方块、
+          // 还在动 pathfinder。主循环往下走就会两条线抢同一个 bot（107 那类 bug）。
+          // getToSurface 每个 step 开头都有 check()，所以发中断信号它下一步就自己放手；
+          // 等它真退出（最多 5 秒）再把信号撤回 —— 这个分支没有别的东西持有动作线，
+          // 不撤的话全局 cancel 会一直立着，后面所有动作都抛「任务被中断」。
+          const surfaceJob = this.actions.getToSurface()
+          let surfaceTimer = null
+          try {
+            await Promise.race([
+              surfaceJob,
+              new Promise((_, rej) => {
+                surfaceTimer = setTimeout(() => rej(new Error('出洞超时 90s')), 90000)
+                if (surfaceTimer.unref) surfaceTimer.unref()
+              })
+            ])
+          } catch (e) {
+            this.log('[day] 出洞失败/超时：' + (e && e.message))
+            this._signalCancel('出洞超时/失败')
+            await Promise.race([surfaceJob.catch(() => {}), sleep(5000)])
+            // 只有真的没人占着动作线才复位（同 interruptCurrent 的口径）：
+            // 否则会把 home/follow/session 的中断信号误清掉。
+            if (this.actions && !this.lock.busy) this.actions.cancel = false
+            try { this.actions.stop() } catch (e2) {}
+          } finally {
+            if (surfaceTimer) clearTimeout(surfaceTimer)
           }
         }
       }
@@ -1959,13 +2110,19 @@ class Bot {
       }
     }
 
+    // 【临界判断】血低 + 饿低 = 命比手上这件事重要，pendingTask 让位给找吃的。
+    // 放在 `if (this.pendingTask)` 消费点**之前**，否则这一条永远轮不到。
+    const critical = this._dropPendingIfCritical()
+
     if (this.pendingTask) {
       want = this.pendingTask
       this.pendingTask = null
       this.log('[comply] 去做答应的事：' + want.text)
     } else {
       // 看看有没有冲动想干别的
-      if (this.impulse && this.taste && this.mood) {
+      // 临界时不问冲动：impulse.maybe() 要问模型（好几秒），血 7 的时候不能等它，
+      // 而且它给出的多半是"看看那边"这类闲事 —— 会把刚让出来的位置又抢走。
+      if (!critical && this.impulse && this.taste && this.mood) {
         const whim = await this.impulse.maybe(this.taste, this.mood, this.will.pending() || '')
         if (whim) {
           want = { text: whim, since: Date.now(), done: false }
@@ -2084,7 +2241,20 @@ class Bot {
         timeoutPromise
       ])
       const secs = Math.round((Date.now() - t0) / 1000)
+      // 【清理模型输出里的机器痕迹】2026-11-14
+      //
+      // 实测（时间线里能直接看到的）：
+      //   <<< 完成（14s）：先把饥饿稳住了（饱食度 undefined），然后走到煤矿石旁…
+      //   <<< 完成（112s）：找到一处较平的地方 x=71.6414073466172 z=-50.501282362381104
+      //
+      // `undefined` 和 16 位小数的坐标，一眼就是机器写的。
+      // 而 outText 会进事件队列（`events.push({text: want.text + ' -> ' + outText.slice(0,60)})`），
+      // 模型下一轮看得到 —— 于是它可能被说出来。
+      //
+      // 只清理不改变语义的两类：undefined/null/NaN，和超过 2 位的小数。
       const outText = String(result.output || '')
+        .replace(/\b(undefined|null|NaN)\b/g, '?')
+        .replace(/(-?\d+\.\d{3,})/g, (m) => String(Math.round(parseFloat(m) * 10) / 10))
 
       // ===== 成败判定 =====
       // 之前这里有两个致命 bug：
@@ -2934,6 +3104,13 @@ class Bot {
 
     let t = null
     try { t = require('./src/realtime').realTime() } catch (e) { return }
+    // 【凌晨 5-8 点不该说「该睡了」】2026-11-14
+    //
+    // final-checker 抓到的：
+    //   [06:21:48] [say] 六点多了 天都亮了 得睡了
+    // 同一句里"天都亮了"和"得睡了"自相矛盾。
+    // `isEarlyMorning` 是 5-8 点，那时候天亮了 —— 真人这时候说的是
+    // "一宿没睡"或者"天都亮了赶紧收拾收拾"，不是"该睡了"。
     if (!t || !(t.isLate || t.isEarlyMorning)) return
 
     const ev = spontaneous.onLateNight()
@@ -2954,7 +3131,9 @@ class Bot {
       this.talk.speak(ev.situation, {
         maxLen: ev.maxLen || 25,
         minGap: 20000,
-        extraHint: '提一句现在几点了/该睡了。随口一句，别像报告时间，也别拿这个当借口长篇大论。'
+        extraHint: t.isLate
+          ? '提一句现在几点了/该睡了。随口一句，别像报告时间，也别拿这个当借口长篇大论。'
+          : '提一句天亮了/一宿没睡。随口一句，别像报告时间，也别说"该睡了"（天都亮了）。'
       }).then(ok => {
         this.log(ok ? `[time] 说了：${t.clock}` : '[time] 这轮没说')
       }).catch(() => {})

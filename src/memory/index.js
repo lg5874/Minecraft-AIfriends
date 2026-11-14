@@ -24,6 +24,21 @@ const { STOP } = writer
 
 const VERSION = 3
 
+/**
+ * 「想起几条」的下限。
+ *
+ * 真人不会只想起 5 件事 —— 场景一换就又想起一批。
+ * 上限本该由"值不值得说"决定，不该由调用方随手传的数字决定。
+ * 20 是"够用又不把提示词撑爆"的经验值；要更多就自己传更大的数。
+ */
+const RECALL_FLOOR = 20
+
+/** 日记：一小时一篇；一小时里连这点事都没有就不硬凑 */
+const DIARY_EVERY_MS = 60 * 60 * 1000
+const DIARY_MIN_LINES = 3
+const DIARY_MAX_LINES = 200
+const DIARY_MAX_TOKENS = 1500
+
 class Memory {
   constructor (dir) {
     this.dir = dir
@@ -36,6 +51,15 @@ class Memory {
     this.session = []        // 本次上线的事件（虚拟分钟 + 文本）
     this.secrets = []        // 别人私下托付的秘密
     this.journal = []        // 工作日志：任务执行结果走这里，不进 entries
+    // 日记：每小时把这一小时的事交给模型，写成一段"我还想记住的"
+    this.diaries = []        // [{at, from, to, text, promptTokens, completionTokens, lines}]
+    this.lastDiaryAt = 0
+    this.diaryEveryMs = DIARY_EVERY_MS
+    // 游戏分钟：1 分钟真实在线 = 1 游戏分钟。
+    // 环境变量只给验证用（AIFRIEND_DIARY_EVERY_MIN=2 → 两分钟一篇），生产不设就是 60。
+    this.diaryEveryMin = Math.max(1, Number(process.env.AIFRIEND_DIARY_EVERY_MIN) || 60)
+    this.llm = null          // 由 attachLLM() 注入；没有就懒加载（见 _ensureLLM）
+    this._diaryTimer = null
     this.lastDecayAt = 0
     this.load()
   }
@@ -58,6 +82,8 @@ class Memory {
       this.journal = Array.isArray(d.journal) ? d.journal : []
       this.lastDecayAt = d.lastDecayAt || 0
       this.summaries = d.summaries || []
+      this.diaries = Array.isArray(d.diaries) ? d.diaries : []
+      this.lastDiaryAt = d.lastDiaryAt || 0
     } catch (e) {
       this.entries = []
       this.people = {}
@@ -166,6 +192,8 @@ class Memory {
         secrets: this.secrets,
         summaries: this.summaries,
         journal: this.journal.slice(-300),
+        diaries: this.diaries.slice(-200),
+        lastDiaryAt: this.lastDiaryAt,
         lastDecayAt: this.lastDecayAt
       }, null, 0)
       // 先 fsync 再 rename：进程被杀只丢这次，机器断电也不会留下空文件
@@ -187,6 +215,15 @@ class Memory {
   /** 主循环每秒调一次 */
   tick (realSeconds = 1) {
     const before = this.clock.now()
+    // 【日记自启动】main.js 只有一个 attachLLM 的口子，没人接就整条功能不跑。
+    // 这里兜一层：真正在跑的实例每 tick 都会经过这里，第一次就顺手把定时器起上。
+    // 定时器是 unref + 5 分钟一跳，离线单测跑几秒根本碰不到它。
+    if (!this._diaryAutoStarted) {
+      this._diaryAutoStarted = true
+      try {
+        if (process.env.AIFRIEND_DIARY !== '0') this.startDiaryLoop()
+      } catch (e) {}
+    }
     this.clock.tick(realSeconds)
     const after = this.clock.now()
     const elapsed = after - before
@@ -454,7 +491,7 @@ class Memory {
     }
     const p = this.people[name]
     p.lastSeen = this.clock.now()
-    // talk.js 的正则会把「俊杰就行」「小徐吧」整段抓进来当称呼。
+    // talk.js 的正则会把「小徐就行」「小徐吧」整段抓进来当称呼。
     // 这里统一洗一遍 —— 不改 talk.js，但存储侧必须是干净的。
     if (p.callMe) p.callMe = cleanCallMe(p.callMe)
     return p
@@ -660,6 +697,11 @@ class Memory {
    */
   remember (query, opts = {}) {
     const now = this.clock.now()
+    // 【2026-11-14 记忆不再是功能限制】用户的要求是"token 无限，
+    // 一句话几十万 token 都行，但不许因为上限导致功能受限"。
+    // 原来这里 `opts.limit || 8` —— 调用方传 5 就只想起 5 条，
+    // 于是他"只记得上一分钟"。现在给一个**下限**：谁传小了都不生效。
+    const limit = Math.max(Number(opts.limit) || 0, RECALL_FLOOR)
     const list = recall.search(
       this.entries,
       {
@@ -668,11 +710,369 @@ class Memory {
         near: opts.near || null,
         places: this.places
       },
-      opts.limit || 8,
+      limit,
       now
     )
     recall.markRecalled(list, now)
     return list
+  }
+
+  // ---------------- 日记：把一小时揉成一段 ----------------
+
+  /**
+   * 注入 LLM 并起定时器。
+   *
+   * 记忆层不自己 new 一个 LLM 是干净的（main.js 只有一个），但也不能因为
+   * "没人给它" 就整条功能不跑 —— 所以 _ensureLLM() 会懒加载一个备用实例。
+   */
+  attachLLM (llm) {
+    if (llm) this.llm = llm
+    this.startDiaryLoop()
+    return this
+  }
+
+  /** 没有注入就自己从 config 造一个（日记是低频调用，多一个客户端无所谓） */
+  _ensureLLM () {
+    if (this.llm) return this.llm
+    try {
+      const ROOT = path.resolve(__dirname, '..', '..')
+      const cfgPath = path.join(ROOT, process.env.AIFRIEND_CONFIG || 'config.json')
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+      if (!cfg || !cfg.llm) return null
+      const LLM = require('../llm')
+      this.llm = new LLM(cfg.llm, () => {})
+      return this.llm
+    } catch (e) {
+      return null
+    }
+  }
+
+  startDiaryLoop (everyMs = 5 * 60 * 1000) {
+    if (this._diaryTimer) return this._diaryTimer
+    this._diaryTimer = setInterval(() => {
+      this.maybeWriteDiary().catch(() => {})
+    }, everyMs)
+    if (this._diaryTimer.unref) this._diaryTimer.unref()
+    return this._diaryTimer
+  }
+
+  stopDiaryLoop () {
+    if (this._diaryTimer) clearInterval(this._diaryTimer)
+    this._diaryTimer = null
+  }
+
+  /**
+   * 这一小时里发生的事，一行一条。
+   *
+   * 来源三个，都带时间戳（游戏分钟）：工作日志 journal、本次上线 session、
+   * 这一小时新写进来的 entries。同一个时间点、同一句话的只留一条。
+   */
+  hourLines (since, until) {
+    const now = until == null ? this.clock.now() : until
+    const from = since == null ? Math.max(0, now - this.diaryEveryMin) : since
+    const seen = new Set()
+    const rows = []
+    const push = (t, text) => {
+      const s = String(text || '').trim()
+      if (!s) return
+      const k = s.slice(0, 40)
+      if (seen.has(k)) return
+      seen.add(k)
+      rows.push({ t: Number(t) || 0, text: s })
+    }
+    for (const j of this.journal || []) if (j.t >= from && j.t <= now) push(j.t, j.text)
+    for (const x of this.session || []) if (x.t >= from && x.t <= now) push(x.t, x.text)
+    for (const e of this.entries || []) {
+      if (e.archived) continue
+      if (e.createdAt >= from && e.createdAt <= now) push(e.createdAt, e.text)
+    }
+    rows.sort((a, b) => a.t - b.t)
+    const kept = rows.length > DIARY_MAX_LINES ? rows.slice(-DIARY_MAX_LINES) : rows
+    return kept.map(r => `- ${Math.max(0, Math.round(now - r.t))} 分钟前 ${r.text}`)
+  }
+
+  /**
+   * 机械闸：坐标必须能在材料里**原样**找到。
+   *
+   * 模型自检靠不住（实测它把 x=71.6414073466172 写成 x=71.64 还说"无"）。
+   * 坐标是"下次会不会往那儿走"的依据，四舍五入也算编 —— 这里用字符串比对，
+   * 不依赖模型的自觉。
+   */
+  _coordCheck (text, material) {
+    const bad = []
+    const has = (v) => String(material).includes(v)
+    const re1 = /[xz]\s*=\s*(-?\d+(?:\.\d+)?)/g
+    let m
+    while ((m = re1.exec(text))) if (!has(m[1])) bad.push(m[1])
+    const re2 = /(-?\d{1,4})\s*,\s*(-?\d{1,4})/g
+    while ((m = re2.exec(text))) {
+      // 排除 "17, 16" 这种普通数字对：要求看起来像坐标（至少一边 ≥ 两位且带负号或 ≥ 10）
+      if (!has(m[1]) || !has(m[2])) bad.push(`${m[1]},${m[2]}`)
+    }
+    const uniq = [...new Set(bad)]
+    return uniq.length ? '这些坐标材料里没有（不许四舍五入、不许编）：' + uniq.join('、') : ''
+  }
+
+  /**
+   * 机械闸：人名。
+   *
+   * 实测（2026-11-14 第二次）：模型写了「我谢了小徐一句 —— 那段路是他救回来的」。
+   * **小徐是他自己**（persona 里的名字），不是别人；它把自己写成了第三个人，
+   * 还编了一场救命。人名必须能在材料里找到，自己名字不许当别人用。
+   */
+  _nameCheck (text, material) {
+    // 他自己的名字（见 src/persona.js：现在叫「小徐」）。写成第三个人就是编。
+    // persona 里现在是「小徐」；旧名已经不在仓库里（真名放 config.json，不进 git）
+    const SELF = [
+      String.fromCharCode(0x5c0f, 0x5f90),                  // 小徐（现在的名字）
+      String.fromCharCode(0x5f90, 0x4fca, 0x6770),          // 旧名
+      String.fromCharCode(0x4fca, 0x6770)                   // 旧名简称
+    ]
+    const bad = []
+    for (const n of SELF) {
+      if (text.includes(n) && !String(material).includes(n)) bad.push(n + '（这是你自己）')
+    }
+    for (const name of Object.keys(this.people || {})) {
+      if (name && text.includes(name) && !String(material).includes(name)) bad.push(name)
+    }
+    const uniq = [...new Set(bad)]
+    return uniq.length ? '这些名字材料里没有（不许编人）：' + uniq.join('、') : ''
+  }
+
+  /**
+   * 写一篇日记。
+   *
+   * 为什么不是"取最相关 5 条"：关键词检索给的是碎片，
+   * 真人记得的是"那天在东北边摔死两回，那破地方我再也不去了"。
+   * 所以把这一小时的事整段交给模型，让它按人睡前回想的方式写一段。
+   * 会记错一点 —— 那恰恰是人。
+   */
+  /**
+   * 「谁出现过」—— 给模型的**事实材料**，不是让他自由发挥的灵感。
+   *
+   * 【为什么必须列这个】2026-11-14 日记第一次跑，模型写了
+   * 「醒过来第一眼是小徐，真得记他一笔，没他这夜就交代了」——
+   * 那一小时 XJJ 根本不在线。用户明天一问"你还记得我吗"，
+   * 这句话就会直接变成答案。编造比假成功危险：没有任何判据会拦它。
+   * 所以人只许从这张表里挑，表里没有的一律不许写。
+   */
+  hourPeople (since, until) {
+    const now = until == null ? this.clock.now() : until
+    const from = since == null ? Math.max(0, now - this.diaryEveryMin) : since
+    const rows = []
+    const names = Object.keys(this.people || {})
+    for (const name of names) {
+      const p = this.people[name] || {}
+      const seen = Number(p.lastSeen || 0)
+      const inWindow = seen >= from && seen <= now
+      const said = []
+      for (const e of this.entries || []) {
+        if (e.archived) continue
+        if (!(e.createdAt >= from && e.createdAt <= now)) continue
+        if (!(e.who || []).includes(name)) continue
+        if (said.length < 3) said.push(String(e.text).slice(0, 40))
+      }
+      const bits = []
+      if (inWindow) {
+        bits.push(`这一小时在（最近 ${Math.max(0, Math.round(now - seen))} 分钟前）`)
+        if (p.talked) bits.push('跟你说过话')
+      } else if (seen > 0) {
+        bits.push(`上一次出现是 ${Math.max(0, Math.round(now - seen))} 分钟前，**这一小时不在**`)
+      } else {
+        bits.push('没有这一小时的记录')
+      }
+      if (said.length) bits.push('相关的事：' + said.map(x => `「${x}」`).join('；'))
+      rows.push({ name, inWindow, line: `- ${name}：${bits.join('，')}` })
+    }
+    rows.sort((a, b) => (b.inWindow ? 1 : 0) - (a.inWindow ? 1 : 0))
+    const kept = rows.slice(0, 10).map(r => r.line)
+    return kept.length ? kept : ['- （这一小时没遇上人）']
+  }
+
+  /**
+   * 自检：这段话里有没有材料里找不到依据的句子。
+   * @returns {Promise<string>} '无' 或者违规说明
+   */
+  async _diarySelfCheck (llm, material, text) {
+    try {
+      const r = await llm.chat([
+        {
+          role: 'system',
+          content: [
+            '你是审核。下面是一段日记，和它唯一允许依据的材料。',
+            '',
+            '【材料】',
+            material,
+            '',
+            '【日记】',
+            text,
+            '',
+            '【问题】逐句核对，这段话里有没有哪一句是材料里找不到依据的？',
+            '特别检查这三类（最容易编）：',
+            '  1. 谁救了你 / 谁帮了你 / 你谢了谁 —— 材料里必须有那件事',
+            '  2. 提到的人名是不是都在「谁出现过」清单里',
+            '  3. 坐标/数量/次数是不是材料里的原文（四舍五入也算不对）',
+            '- 有：只写那一句 + 材料里缺什么，别改写、别评价文笔。',
+            '- 没有：只回一个字「无」。'
+          ].join('\n')
+        },
+        { role: 'user', content: '检查。' }
+      ], { maxTokens: 300, temperature: 0 })
+      return String((r && r.text) || '').trim() || '无'
+    } catch (e) {
+      return '无'   // 审核失败不阻断（但它不会因此变成"有依据"——日记那边仍按材料写）
+    }
+  }
+
+  /**
+   * 写一篇日记。
+   *
+   * 为什么要"整段交给模型"：关键词检索给的是碎片，
+   * 真人记得的是"那天在东北边摔死两回，那破地方我再也不去了"。
+   *
+   * 【三道闸 · 2026-11-14】日记第一次跑就编了「小徐救了我」，
+   * 而那一小时 XJJ 不在线。编造没有任何判据会拦，所以：
+   *   ① 人只能从 hourPeople() 这张事实表里挑
+   *   ② 坐标/数量/次数只能引用材料原文，不许自己算
+   *   ③ 写完自检一遍，自检说有编造就重写；重写还不行就不进长期记忆
+   */
+  async writeDiary (opts = {}) {
+    const llm = opts.llm || this._ensureLLM()
+    if (!llm || typeof llm.chat !== 'function') return null
+    const now = opts.until == null ? this.clock.now() : opts.until
+    const since = opts.since == null ? Math.max(0, now - this.diaryEveryMin) : opts.since
+    const lines = this.hourLines(since, now)
+    const people = this.hourPeople(since, now)
+    if (!opts.force && lines.length < DIARY_MIN_LINES) return null
+
+    const material = [
+      '【这一小时发生的事】',
+      lines.join('\n') || '- （这一小时基本在发呆，没什么事）',
+      '',
+      '【这一小时谁出现过】（只有这些是真的）',
+      people.join('\n')
+    ].join('\n')
+
+    const rules = [
+      '你这是睡前回想。下面是你自己这一小时的材料。',
+      '',
+      material,
+      '',
+      '【写一段你自己的记忆】',
+      '- 只写你还想记住的。像人睡前回想那样，不要逐条列。',
+      '- 要有因果、有情绪、有教训。',
+      '- 别报流水账，别写"第一、第二"，也别用列表。',
+      '- 第一人称，一段话，200 字以内。直接写，别加标题。',
+      '',
+      '【硬规矩 · 违反等于撒谎】',
+      '- 只能写上面列出来的人，以及上面列出来的互动。',
+      '- 「谁救了你」「谁帮了你」「谁跟你说了什么」必须能在材料里找到对应事件；',
+      '  找不到就不许写。"好像有人在旁边"也不行 —— 那是编。',
+      '- 材料里没出现的人，一个字都不许提；不在线的人不许写成在场。',
+      '- 你自己叫小徐。上面名单里的名字才是"别人"；不许把你自己写成一个来救你/帮你的人。',
+      '- 「谁救了你/谁帮了你/你谢了谁」这类，材料里没有对应事件就不许写。',
+      '- 如果这一小时里没有人和你互动，就写"这一小时没遇上人"。',
+      '- 坐标、数量、次数这类数字，只能照抄材料原文，不许自己算、不许四舍五入、不许写"大概"。'
+    ].join('\n')
+
+    const token0 = { p: llm.stats ? llm.stats.promptTokens : 0, c: llm.stats ? llm.stats.completionTokens : 0 }
+    const gen = async (extra) => {
+      const content = extra ? rules + '\n\n【上一版被指出】' + extra + '\n重写，只写材料里有的。' : rules
+      const r = await llm.chat([
+        { role: 'system', content },
+        { role: 'user', content: '写吧。' }
+      ], { maxTokens: DIARY_MAX_TOKENS, temperature: 0.8 })
+      return String((r && r.text) || '').trim()
+    }
+
+    // 模型自检 + 机械闸（坐标/人名）。重写之后也要再跑一遍 ——
+    // 否则"第二版还在编"会直接过关（实测踩过）。
+    const gate = async (text) => {
+      let c = await this._diarySelfCheck(llm, material, text)
+      if (/^无[。.]?$/.test(String(c).trim())) {
+        const bad = this._coordCheck(text, material) || this._nameCheck(text, material)
+        if (bad) c = bad
+      }
+      return c
+    }
+
+    let out = ''
+    let check = '无'
+    let firstCheck = ''
+    let rewrote = false
+    try {
+      out = await gen('')
+      if (!out) return null
+      check = await gate(out)
+      if (!/^无[。.]?$/.test(check.trim())) {
+        rewrote = true
+        firstCheck = String(check)
+        this.journal.push({ t: now, text: short('日记自检发现无依据：' + check), why: 'diary-check' })
+        if (this.journal.length > 300) this.journal.shift()
+        const out2 = await gen(check)
+        if (out2) {
+          out = out2
+          check = await gate(out)
+        }
+      }
+    } catch (e) {
+      this.journal.push({ t: now, text: short('日记没写成：' + e.message), why: 'diary-fail' })
+      if (this.journal.length > 300) this.journal.shift()
+      return null
+    }
+    if (!out) return null
+    out = out.replace(/\s*\n\s*/g, ' ').trim()
+    if (out.length > 600) out = out.slice(0, 600)
+
+    const clean = /^无[。.]?$/.test(check.trim())
+    const diary = {
+      at: now,
+      from: since,
+      to: now,
+      lines: lines.length,
+      text: out,
+      selfCheck: check,
+      firstCheck,
+      clean,
+      rewrote,
+      // 自检没过（重写还没过）：这段话不进长期记忆 —— 宁可少记，不许编
+      keptInMemory: clean,
+      promptTokens: (llm.stats ? llm.stats.promptTokens : 0) - token0.p,
+      completionTokens: (llm.stats ? llm.stats.completionTokens : 0) - token0.c
+    }
+    this.diaries.push(diary)
+    if (this.diaries.length > 200) this.diaries.shift()
+    this.lastDiaryAt = now
+    if (clean) {
+      this.add({
+        text: out,
+        kind: KINDS.EVENT,
+        emotion: 0.6,
+        importance: 0.92,
+        force: true
+      })
+    } else {
+      this.journal.push({ t: now, text: short('日记有编造嫌疑，没进长期记忆：' + check), why: 'diary-reject' })
+      if (this.journal.length > 300) this.journal.shift()
+    }
+    this.save()
+    return diary
+  }
+
+  /** 到点就写；一小时里没几件事就等下一轮（不硬凑） */
+  async maybeWriteDiary (opts = {}) {
+    const now = this.clock.now()
+    // 【第一次】从没写过（或刚迁移过来）：只要料够就该写一篇，
+    // 不能因为"钟从 0 起算"就永远判定成"刚写过"（这坑 _lastShoutAt 踩过）。
+    const firstTime = !this.lastDiaryAt
+    if (!opts.force && !firstTime && now - this.lastDiaryAt < this.diaryEveryMin) return null
+    const since = this.lastDiaryAt || Math.max(0, now - this.diaryEveryMin)
+    return this.writeDiary(Object.assign({}, opts, { since, until: now }))
+  }
+
+  /** 最近的日记（给提示词 / 报告用） */
+  recentDiary (n = 1) {
+    return (this.diaries || []).slice(-n)
   }
 
   // ---------------- 给提示词用 ----------------
@@ -894,7 +1294,7 @@ function normWho (w) {
  *
  * talk.js 用 `(?:叫我|喊我|我叫|我是)\s*([\u4e00-\u9fa5A-Za-z0-9_]{1,12})`
  * 抓称呼，会把后面的语气词一起吃进来：
- *   「叫我俊杰就行」-> 俊杰就行
+ *   「叫我小徐就行」-> 小徐就行
  *   「叫我小徐吧」  -> 小徐吧
  *   「我叫老王啊」  -> 老王啊
  * 这里把尾巴上的虚词剁掉。宁可短一点，也别让他喊错人。

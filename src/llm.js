@@ -332,6 +332,22 @@ class LLM {
       max_tokens: opts.maxTokens || p.chatMaxTokens,
       stream: false
     }
+    // 【2026-11-14】说话这条线固定 reasoning_effort=low。
+    //
+    // 实测（scripts/bench-thinking.js，同一批真实失败案例）：
+    //   low 92% 通过 / 不开 75% / medium 83% / high 67%
+    // 原因不在"思考有没有用"，在于任务性质：模型拿到的是**一段关于他的叙述**，
+    // 任务本质是 copy+paraphrase —— 想得越久，越容易把源文本整段吐出来。
+    // 另外这个 provider 默认就开思考（不传 thinking 也有 reasoning_content），
+    // 所以"不开"那一档其实也是开着思考的，别指望它省延迟。
+    //
+    // 保留逃生门：opts.reasoningEffort / provider.reasoningEffort 可覆盖，
+    // 传 'off' 表示这次别带这两个字段（给不认这两个参数的端点用）。
+    const effort = opts.reasoningEffort || p.reasoningEffort || 'low'
+    if (effort && effort !== 'off') {
+      body.reasoning_effort = effort
+      if (opts.thinking !== false) body.thinking = { type: 'enabled' }
+    }
     if (opts.json) body.response_format = { type: 'json_object' }
     if (opts.stop) body.stop = opts.stop
 

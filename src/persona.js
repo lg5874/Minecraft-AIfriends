@@ -206,7 +206,7 @@ function systemPrompt (mem, stateLine, recalled, opts) {
   const moodBlock = opts.mood ? opts.mood.prompt() : ''
   const people = mem.peopleDigest()
   const places = mem.placesDigest()
-  const recent = mem.recentSession(10)
+  const recent = mem.recentSession(40)
   const last = mem.lastSummary()
   const basics = knowledge.basics.slice(0, 22).map(k => '- ' + k).join('\n')
   const rules = (knowledge.worldRules || []).map(k => '- ' + k).join('\n')
@@ -248,7 +248,7 @@ function systemPrompt (mem, stateLine, recalled, opts) {
   const P = (opts && opts.cfg && opts.cfg.persona) || {}
   const identity = P.identity ||
     process.env.AIFRIEND_IDENTITY ||
-    '你叫徐俊杰，21 岁，男。安徽肥东人，高中在肥东县第一中学，现在在华中科技大学读大四。皮肤有点黑，戴眼镜。'
+    '你叫小徐，二十来岁，男。南方小城来的，在一所大学读书。皮肤有点黑，戴眼镜。'
 
   return `${identity}
 

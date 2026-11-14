@@ -367,6 +367,27 @@ const POOL = [
     }
   },
   {
+    // ===== 【rest 死锁的配套出口】=====
+    // 血低 + 饿着时，光解除 rest 还不够：手上可能还挂着"砍木头"，
+    // 得有一条"先弄吃的"的目标把优先级抢过来。
+    key: 'food',
+    title: '先弄点吃的，把血养回来',
+    why: '血只剩几格，饿着回不了血',
+    tag: '生存',
+    // 吃的在哪都能找（地上/树上/箱子里），不受"在地下"那条位置扣分影响
+    locationAware: true,
+    stages: [
+      { kind: 'do', title: '找点能吃的：打猎、摘野果、翻箱子都行', need: { count: 1 } }
+    ],
+    score (status) {
+      const hp = Number(status.health)
+      const food = Number(status.food)
+      if (!isFinite(hp) || !isFinite(food)) return 0
+      // 只在这一个组合下顶到最高：血 <8 且饿 <18（吃不到自然回血的门槛）
+      return (hp < 8 && food < 18) ? 110 : 0
+    }
+  },
+  {
     key: 'explore',
     title: '往一个方向走远点，看看那边有什么',
     why: '总在这一小片转，想知道外面是什么样',
@@ -665,6 +686,27 @@ class Goals {
    */
   isResting () {
     try {
+      // ===== 【rest 死锁出口】=====
+      //
+      // 实测：血 7 + 饿 17 时 mood.resting 一直为真 -> 主循环每 3 秒
+      // 「正在歇着，等缓过来再说」-> 不派活 -> 吃不到东西 -> 饿着不回血 ->
+      // 血永远 7 -> 更 rest。正反馈锁死。
+      //
+      // 真人这时候不会继续躺着：命比歇着重要。血 < 8 且饿 < 18（没到能自然
+      // 回血的门槛）时，rest 不生效，让主循环去弄吃的。
+      // 只放这一种组合：血正常但累、或者血低但吃饱了，都照样歇。
+      const s0 = this.lastStatus || {}
+      const hp0 = Number(s0.health)
+      const food0 = Number(s0.food)
+      if (isFinite(hp0) && isFinite(food0) && hp0 < 8 && food0 < 18) {
+        const now0 = this.now()
+        if (!this._restOverrideAt || now0 - this._restOverrideAt > 60000) {
+          this._restOverrideAt = now0
+          this.log(`[goals] 血 ${hp0}、饿 ${food0}：命比歇着重要，先不歇了（去弄吃的）`)
+        }
+        return false
+      }
+
       let m = this.ctx && this.ctx.mood
       // main.js 目前没往 goals.ctx 里塞 mood（那个文件不归我改）。
       // mood.js 自己导出了 active()：进程里最后构造的那个 Mood 实例，

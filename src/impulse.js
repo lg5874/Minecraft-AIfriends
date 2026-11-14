@@ -68,7 +68,7 @@ feeling 从 -1 到 1：
 - 你自己喜欢什么，就照实说。`
 
   try {
-    const r = await llm.json([{ role: 'user', content: prompt }], { maxTokens: 150, temperature: 0.9 })
+    const r = await llm.json([{ role: 'user', content: prompt }], { maxTokens: 600, temperature: 0.9 })
     const feeling = Number(r.feeling)
     if (!isFinite(feeling)) return null
     return { feeling: Math.max(-1, Math.min(1, feeling)), why: String(r.why || '').slice(0, 80) }
@@ -171,7 +171,7 @@ ${likes ? '你发现自己挺喜欢' + likes + '。' : '你还不太清楚自己
 - 如果你其实不想走神，就只输出 [继续]`
 
     try {
-      const r = await llm.chat([{ role: 'user', content: prompt }], { maxTokens: 80, temperature: 1.2 })
+      const r = await llm.chat([{ role: 'user', content: prompt }], { maxTokens: 600, temperature: 1.2 })
       const t = (r.text || '').split('\n')[0].trim().replace(/^["「『]|["」』]$/g, '')
       if (!t || t.includes('[继续]') || t.length > 40) return null
       this.ctx.log('[impulse] 想干别的：' + t)

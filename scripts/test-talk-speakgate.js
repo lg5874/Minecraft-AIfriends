@@ -204,6 +204,22 @@ async function main () {
     }
   }
 
+  // ================================================================
+  console.log('\n[B6] 历史窗口：模型看得见最近 40 条，内存留 200 条')
+  {
+    const x = mkTalk()
+    for (let i = 0; i < 60; i++) x.talk.history.push({ who: '老王', msg: '第' + i + '句' })
+    const joined = x.talk.speakMessages('随便说点', {}).map(m => m.content).join('\n')
+    ok(joined.includes('第59句'), '最近一条在 prompt 里')
+    ok(joined.includes('第20句'), '第 20 句在窗口内（40 条）')
+    ok(!joined.includes('第19句'), '第 19 句超出 40 条窗口，不在 prompt 里（旧实现连第 10 句都看不到）')
+
+    // 内存上限：源码里不再有 40 的截断
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'talk.js'), 'utf8')
+    ok(!/history\.length > 40\b/.test(src), '源码里没有 history > 40 的截断')
+    ok(/history\.length > 200/.test(src), '内存留 200 条')
+  }
+
   console.log('\n===== 结果 =====')
   console.log(`${pass} 通过，${fail} 失败`)
   if (fail) process.exit(1)

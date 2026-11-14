@@ -6,6 +6,14 @@ const { goals } = require('mineflayer-pathfinder')
 const { Vec3 } = require('vec3')
 const damage = require('./damage')
 
+// 有毒食物：能吃，但腐肉有 80% 概率给 30 秒「饥饿」（越吃越饿），
+// 蜘蛛眼/毒马铃薯/河豚各有各的负面效果 —— 只当最后一档，且吃的时候要说出来。
+// （注意：**蘑菇不是食物** —— 1.21 的 foodsByName 里没有 brown_mushroom，
+//   生蘑菇只能做煲。别为了"背包里还有蘑菇"去加它，consume 会直接失败。）
+const POISON_FOOD = /^(rotten_flesh|spider_eye|poisonous_potato|pufferfish)$/
+// 数据表拿不到时的兜底名字表（补了老正则漏掉的：浆果/海带/甜菜根/蜂蜜）
+const FOOD_NAME = /bread|cooked_|apple|carrot|potato|beetroot|beef|porkchop|mutton|chicken|rabbit|salmon|cod|melon|baked|stew|kelp|berries|honey_bottle/
+
 const HOSTILE = new Set([
   'zombie', 'zombie_villager', 'skeleton', 'creeper', 'spider', 'cave_spider',
   'enderman', 'witch', 'drowned', 'husk', 'stray', 'bogged', 'pillager',
@@ -31,6 +39,7 @@ class Reflex {
     this.SOS_HP = 6
     this.sosUntil = 0
     this.sosKind = ''
+    this._sosSaid = []      // 15 分钟内喊过的求救话 {text, at}（不喊重样的）
 
     // ===== 战斗分档（2026-11-14） =====
     //
@@ -46,6 +55,19 @@ class Reflex {
     this.HP_FLEE = 10    // 血 <= 10 -> 真跑
     this.HP_PANIC = 8    // 血 <= 8  -> 跑 + 吃
     this.HP_CRIT = 5     // 血 <= 5  -> 跑 + 吃 + 不接新任务
+
+    // MC 自然回血线：food >= 18 且饱和度 > 0 才回血。
+    // 现场死循环就是卡在这 1 点（饿 17 → 不回血 → 血一直 7）。
+    this.REGEN_FOOD = 18
+    // 吃东西的冷却：同一个东西刚吃过就别连着吃（腐肉要更久，它会带回血副作用）
+    this.FOOD_COOLDOWN_MS = 10000
+    this.POISON_COOLDOWN_MS = 30000
+    // "这东西对我没用"的记忆时长（吃了腐肉等于白吃，两分钟内不再指望它）
+    this.NO_POISON_MS = 120000
+    // 只剩毒食时，血低到这个数才允许吃（比 panic 线 5 高一点：真到要命了）
+    this.POISON_HP = 6
+    this._foodAt = {}
+    this._noPoisonUntil = 0
 
     this.hpTrace = []       // 最近几秒的血量采样 {t, hp}
     this.lastHp = null
@@ -145,6 +167,101 @@ class Reflex {
     this.lastHp = hp
   }
 
+  /** 方块能站吗（空气/水/岩浆都不算落脚点） */
+  _standable (b) {
+    if (!b || !b.name) return false
+    return !/^(air|cave_air|water|lava|bubble_column|seagrass|tall_seagrass|kelp)$/.test(b.name)
+  }
+
+  /**
+   * 掉下去会不会摔？水不算摔（能游），岩浆也不算"摔"——但岩浆会烫死人，
+   * 这里只有"脚下有没有能承接的东西"这一个问题，所以水算承接。
+   */
+  _support (b) {
+    if (!b || !b.name) return false
+    return this._standable(b) || /^(water|kelp|seagrass|tall_seagrass|bubble_column)$/.test(b.name)
+  }
+
+  /**
+   * 退之前先看落点：从脚下往 dir 方向退 1~2 格，那两格有能站的地方吗？
+   *
+   * 【2026-11-14 · 摔死的最后一环】`recoil()` 原来是"扭头就退 2 格 + 跳"，
+   * **完全没有落点检查**。实测：
+   *   [07:13:35] 3 秒内掉 6 血 —— 先退开 2 格 + 跳一下
+   *   [07:13:38] 35.3 格 -> 摔死了
+   * 掉 30 格 ≈ 掉 20 血（必死）；硬吃一下怪的攻击只掉 2~5 血。
+   * **所以"不知道背后是什么"的时候就不该退。**
+   * move-owner 在 actions.js 加的 `[ledge]` 50ms 闸是"退了之后兜底"，
+   * 这里是"退之前就判断"，两层叠起来才稳（50ms 采样可能漏掉边缘）。
+   */
+  safeToStepBack (dir, steps = 2) {
+    if (!dir || !isFinite(dir.x) || !isFinite(dir.z)) return false
+    try {
+      const bot = this.bot
+      const p = bot.entity.position
+      for (let k = 1; k <= Math.max(1, steps); k++) {
+        const bx = Math.floor(p.x + dir.x * k)
+        const by = Math.floor(p.y)
+        const bz = Math.floor(p.z + dir.z * k)
+        const feet = bot.blockAt(new Vec3(bx, by, bz))
+        const head = bot.blockAt(new Vec3(bx, by + 1, bz))
+        if (!feet || !head) return false
+        if (this._standable(feet) || this._standable(head)) {
+          // 第二格被墙挡住不算危险（退不到那么远）；第一格就挡着 = 压根退不动
+          return k > 1
+        }
+        let support = false
+        for (let dy = 1; dy <= 3; dy++) {
+          if (this._support(bot.blockAt(new Vec3(bx, by - dy, bz)))) { support = true; break }
+        }
+        if (!support) return false                                         // 下面 3 格全空 = 崖/坑
+      }
+      return true
+    } catch (e) {
+      return false      // 判不出来就当不安全（宁可硬吃一下）
+    }
+  }
+
+  /**
+   * 挑一个能退的方向 + 退几格。
+   *
+   * 【两级退】2026-11-14 实机统计：只判"退 2 格"时 `退=4 / 不退=12`，
+   * 75% 的情况站着不动 —— 挨打钉在原地蹦，不像活人。
+   * 退 2 格要求太高，退 1 格最多也就掉 0.5 心，比硬吃 2~5 血划算。
+   * 所以：2 格 -> 1 格 -> 都不行才原地跳。
+   *
+   * @returns {{dir:{x:number,z:number}, steps:number}|null}
+   */
+  pickRetreatDir () {
+    const dirs = []
+    try {
+      const p = this.bot.entity.position
+      const origin = this.attackOrigin()
+      if (p && origin) {
+        const dx = p.x - origin.x
+        const dz = p.z - origin.z
+        const len = Math.hypot(dx, dz)
+        // 有来源就只往"背向来源"退：退不了宁可不退 ——
+        // 往侧面/朝怪的方向退，等于把自己送到攻击范围里，还可能踩空。
+        if (len > 0.1) {
+          const away = { x: dx / len, z: dz / len }
+          if (this.safeToStepBack(away, 2)) return { dir: away, steps: 2 }
+          if (this.safeToStepBack(away, 1)) return { dir: away, steps: 1 }
+          return null
+        }
+      }
+      // 不知道来源：四个正方向里挑第一个脚下有地的
+      dirs.push({ x: 1, z: 0 }, { x: -1, z: 0 }, { x: 0, z: 1 }, { x: 0, z: -1 })
+    } catch (e) {}
+    for (const d of dirs) {
+      if (this.safeToStepBack(d, 2)) return { dir: d, steps: 2 }
+    }
+    for (const d of dirs) {
+      if (this.safeToStepBack(d, 1)) return { dir: d, steps: 1 }
+    }
+    return null
+  }
+
   /**
    * 立刻弹开：后退 + 跳一下。
    *
@@ -162,15 +279,22 @@ class Reflex {
     let origin = null
     try { origin = this.attackOrigin() } catch (e) {}
 
+    // 【退之前看落点】没确认脚下有地方踩就不退 —— 掉 30 格必死，硬吃一下只掉 2~5 血
+    let pick = null
+    try { pick = this.pickRetreatDir() } catch (e) {}
+    let mode = 'still'
+    let steps = 0
     try {
-      const p = bot.entity && bot.entity.position
-      if (p && origin) {
-        // 背对来源（这样"后退"真的是远离，而不是往枪口上撞）
-        const yaw = Math.atan2(p.x - origin.x, p.z - origin.z)
-        try { bot.look(yaw, 0, true) } catch (e) {}
+      if (pick && pick.dir) {
+        mode = 'back'
+        steps = pick.steps || 1
+        const dir = pick.dir
+        // 面朝退路的反方向，"后退"才是往 dir 走
+        try { bot.look(Math.atan2(dir.x, dir.z), 0, true) } catch (e) {}
+        bot.setControlState('back', true)
+        setTimeout(() => { try { bot.setControlState('back', false) } catch (e) {} }, steps >= 2 ? 420 : 240)
       }
-      bot.setControlState('back', true)
-      setTimeout(() => { try { bot.setControlState('back', false) } catch (e) {} }, 420)
+      // 原地也要跳一下：脱离岩浆/营火/浆果丛这种站着就掉血的地方
       bot.setControlState('jump', true)
       setTimeout(() => { try { bot.setControlState('jump', false) } catch (e) {} }, 260)
     } catch (e) {}
@@ -186,7 +310,10 @@ class Reflex {
     const shown = Math.max(1, drop, pair)
     const detail = pair > 0 ? `（最近一下 ${prev}→${cur}）` : ''
     if (cur != null && cur <= 0) return          // 已经死了，弹开没意义
-    this.logThrottled(`[reflex] 3 秒内掉 ${shown.toFixed(0)} 血${detail} —— ${why}，先退开 2 格 + 跳一下`, 3000, 'recoil')
+    const act = mode === 'back'
+      ? (steps >= 2 ? '先退开 2 格 + 跳一下' : '退 1 格（两格退不了）+ 跳一下')
+      : (origin ? '退路上是坑/挡着，原地跳一下（不后退）' : '不知道背后是什么，原地跳一下（不后退）')
+    this.logThrottled(`[reflex] 3 秒内掉 ${shown.toFixed(0)} 血${detail} —— ${why}，${act}`, 3000, 'recoil')
   }
 
   /** 最近一次伤害的来源位置：真实体 -> 位置 -> 最近敌对 -> null */
@@ -292,16 +419,43 @@ class Reflex {
           // 真人反复喊救命也会换说法：先喊人、再报状况、最后骂一句。
           const pool = k === 'drown'
             ? ['我快淹死了', '水里上不去', '我沉底了', '憋不住了 谁来拉我一把',
-              '我在这底下 上不来', '完了 气不够了', '谁会游泳啊']
+              '我在这底下 上不来', '完了 气不够了', '谁会游泳啊', '我卡水下了',
+              '往上浮不动 拉我一把', '水里出不去 救命', '我快憋死了', '这片水怎么这么深']
             : (k === 'lava' || k === 'on_fire' || k === 'in_fire')
               ? ['着火了', '烫死我了', '我身上着火了', '我操 烧起来了',
-                '快烧没了 谁有水', '烫死 我往回跑']
+                '快烧没了 谁有水', '烫死 我往回跑', '烧起来了 赶紧跑',
+                '岩浆边上呢 别过来', '我脚底是岩浆', '烫 烫 烫', '快把我浇一下']
               : (hp <= 6
                   ? ['血不多了', '快撑不住了', '有人吗 我快不行了', '我快挺不住了 有吃的吗',
                     '我这边情况不太妙', '快没了 谁在附近', '我得缓一下 不然要交代在这',
-                    '妈的 血见底了', '再不来人我就没了', '撑住 撑住']
-                  : ['血有点低', '我得缓一下', '先不折腾了 缓口气', '有点顶不住', '让我坐会儿'])
-          this.ctx.say(pool[Math.floor(Math.random() * pool.length)])
+                    '妈的 血见底了', '再不来人我就没了', '撑住 撑住',
+                    '血就剩一点了', '我快被打死了', '来个人 我要没了', '谁有吃的 给我一口',
+                    '站不住了', '我快交代了']
+                  : ['血有点低', '我得缓一下', '先不折腾了 缓口气', '有点顶不住',
+                    '让我坐会儿', '掉了点血 没事', '血不太满 先稳一下', '我歇会儿 别打岔',
+                    '缓一下再弄'])
+
+          // 【同一句 15 分钟内不喊第二遍】2026-11-14
+          //
+          // 现场：06:12:45「我快挺不住了 有吃的吗」，06:27:56 一字不差又来一遍
+          // （随机从池子里抽，抽中了同一句）。talk.say() 的 30 分钟复读拦截现在
+          // 能兜住它，但"兜住"= 这句直接没了 —— 血 3 卡洞里一声不吭更糟。
+          // 所以在这里先挑没喊过的：池子里还有就换一句，全喊完了这次就不喊
+          // （连着两句一模一样，比沉默更假）。
+          const nowSay = Date.now()
+          this._sosSaid = (this._sosSaid || []).filter(x => nowSay - x.at < 15 * 60 * 1000)
+          const used = new Set(this._sosSaid.map(x => x.text))
+          // 从"没喊过的"里精确抽一条：随机抽 12 次会漏 —— 池子只剩 1 条时
+          // 约 46% 抽不中，明明还有新说法却提前静默了（和注释里说的"还有就换一句"不符）。
+          const fresh = pool.filter(c => !used.has(c))
+          const line = fresh.length ? fresh[Math.floor(Math.random() * fresh.length)] : null
+          if (line) {
+            this._sosSaid.push({ text: line, at: nowSay })
+            if (this._sosSaid.length > 60) this._sosSaid.shift()
+            this.ctx.say(line)
+          } else {
+            try { this.ctx.log('[sos 静默] 15 分钟里的说法都用过了，这次不重复喊') } catch (e) {}
+          }
         }
       } catch (e) {}
     }
@@ -336,16 +490,153 @@ class Reflex {
     try { this.eatNow() } catch (e) {}
   }
 
-  /** 立刻吃一口，不看饥饿值（保命用） */
-  eatNow () {
+  /**
+   * 背包里**能吃**的东西。
+   *
+   * 老写法是一条名字正则，漏了蜂蜜瓶/干海带/熟鲑鱼这类，也把 `rotten_flesh`
+   * 这种吃了要中毒的算进来。1.21 的 `foodsByName` 数据表是现成的，优先用它，
+   * 数据表不在才退回名字正则（宁可多吃，不可饿着）。
+   */
+  foodItems (opts = {}) {
+    const items = (this.bot.inventory && this.bot.inventory.items && this.bot.inventory.items()) || []
+    let byName = null
+    try { byName = this.bot.registry && this.bot.registry.foodsByName } catch (e) {}
+    const normal = []
+    const poison = []
+    for (const i of items) {
+      if (!i || !i.name) continue
+      const isPoison = Reflex.POISON_FOOD.test(i.name)
+      // 数据表优先：1.21 的 foodsByName 认得出 beetroot / dried_kelp /
+      // honey_bottle / sweet_berries / glow_berries 这些老正则漏掉的；
+      // 表不在才退回名字正则（宁可多吃，不可饿着）。
+      const edible = byName ? !!byName[i.name] : (Reflex.FOOD_NAME.test(i.name) || isPoison)
+      if (!edible) continue
+      ;(isPoison ? poison : normal).push(i)
+    }
+    // 正常食物按"回得多"排序；有毒的永远排最后
+    const score = (n) => {
+      try {
+        const f = byName && byName[n]
+        if (f) return (f.foodPoints || 0) + (f.saturationRatio || 0) / 10
+      } catch (e) {}
+      return 1
+    }
+    normal.sort((a, b) => score(b.name) - score(a.name))
+    return opts && opts.includePoison ? normal.concat(poison) : normal
+  }
+
+  /**
+   * 立刻吃一口，不看饥饿值（保命用）。
+   *
+   * 【2026-11-14 · 为什么加了日志和卡死保护】
+   * 现场他血 7、饿 17 蹲了 4 分钟，日志里一行都没提吃 —— 因为老实现
+   * **失败是全静默的**（没吃的就直接 return，equip/consume 失败也吞掉），
+   * 排查时只能靠猜。现在三种结果都会说出来：
+   *   · 没吃的      -> `[eat] 饿 17，想吃但背包里没吃的`
+   *   · 吃到了      -> `[eat] 饿 17 < 18，吃一个 cooked_beef`
+   *   · equip 失败  -> `[eat] 吃 cooked_beef 失败: ...`
+   * 另外 `this.eating` 一旦卡住（equip 的 Promise 不回来）就永远不会再吃，
+   * 所以 15 秒还没结束就当它卡了，强制复位。
+   *
+   * @returns {string|null} 吃了什么（null = 没吃成）
+   */
+  eatNow (why) {
     const bot = this.bot
-    if (this.eating) return
-    const food = bot.inventory.items().find(i =>
-      /bread|cooked_|apple|carrot|potato|beef|porkchop|mutton|chicken|melon|baked|stew|kelp|berries/.test(i.name))
-    if (!food) return
+    const now = Date.now()
+    if (this.eating) {
+      if (now - (this._eatingAt || 0) < 15000) return null
+      this.eating = false
+      this.logThrottled('[eat] 上回吃东西卡住了（15 秒没结束），强制复位再试', 30000, 'eatingStuck')
+    }
+    // 【同一个东西 N 秒内不重复吃】2026-11-14 现场：
+    //   07:32:12 / 07:32:20 / 07:32:28 每 8 秒吃一次腐肉，饿一直 16 ——
+    //   腐肉 +4 饱食但带 30 秒「饥饿」，净收益接近 0，于是 keepFed 每次都判"还没到 18"，
+    //   又吃一次。冷却这道闸就是拦这个的。
+    this._foodAt = this._foodAt || {}
+    const cooling = (i) => (this._foodAt[i.name] || 0) > now
+    const foods = this.foodItems().filter(i => !cooling(i))
+    const poison = this.foodItems({ includePoison: true })
+      .filter(i => Reflex.POISON_FOOD.test(i.name) && !cooling(i))
+
+    if (!foods.length && !poison.length) {
+      const hp = Math.round(bot.health)
+      const any = this.foodItems({ includePoison: true })
+      if (any.length) {
+        // 有吃的但都在冷却里（刚吃过）—— 说一次就够，别刷屏
+        this.logThrottled(`[eat] 饿 ${bot.food}，刚吃过 ${any[0].name}（冷却中），等一下再说`, 30000, 'foodCooling')
+      } else {
+        this.logThrottled(`[eat] 饿 ${bot.food}、血 ${hp}，想吃但背包里没吃的（背包 ${(bot.inventory.items() || []).length} 种）`, 60000, 'noFood')
+      }
+      return null
+    }
+
+    // 有正经食物就吃正经的
+    let food = foods[0]
+    if (!food) {
+      // 【只剩毒食】不饿到要命、或者刚吃过它没用 -> 忍着，去找正经吃的。
+      // "忍着"比"吃腐肉"对：腐肉的饥饿效果是负收益，吃了等于白搭一条命的时间。
+      const hp = typeof bot.health === 'number' ? bot.health : 20
+      const remembered = now < (this._noPoisonUntil || 0)
+      if (hp > this.POISON_HP || remembered) {
+        const why = remembered
+          ? '刚吃过它，饱食度又被饥饿吃回去了'
+          : `血还有 ${Math.round(hp)}，没到 ${this.POISON_HP} 的救命线`
+        this.logThrottled(`[eat] 只有 ${poison[0].name}，但它会让我更饿（${why}）—— 忍着，去找正经吃的`, 60000, 'poisonHold')
+        return null
+      }
+      food = poison[0]
+      this.logThrottled(`[eat] 血 ${Math.round(hp)} ≤ ${this.POISON_HP}，没别的吃的，只能垫 ${food.name}（腐肉有 80% 概率给 30 秒「饥饿」）`, 30000, 'eatPoison')
+      // 记一句"这东西对我不顶饱"：两分钟内不再指望它
+      this._noPoisonUntil = now + this.NO_POISON_MS
+      this._foodAt[food.name] = now + this.POISON_COOLDOWN_MS
+    } else {
+      this._foodAt[food.name] = now + this.FOOD_COOLDOWN_MS
+    }
     this.eating = true
-    bot.equip(food, 'hand').then(() => bot.consume()).catch(() => {})
+    this._eatingAt = now
+    bot.equip(food, 'hand')
+      .then(() => bot.consume())
+      .then(() => { this._lastAte = { name: food.name, at: Date.now(), why: why || '' } })
+      .catch((e) => {
+        this.logThrottled(`[eat] 吃 ${food.name} 失败: ${e && e.message ? e.message : e}`, 30000, 'eatFail')
+      })
       .finally(() => { this.eating = false })
+    return food.name
+  }
+
+  /**
+   * 维持"回血线"：饿 < 18 又有吃的就吃。
+   *
+   * MC 的自然回血条件是 **food >= 18 且饱和度 > 0**。现场就是这么卡死的：
+   * 血 7、饿 17（差 1 点）→ 永远不回血 → 一直躺在那 → 怪一来就死。
+   * 原来"吃"只在血低档位里做一次，而且失败是静默的。
+   *
+   * 这不是新行为，是把「吃」从"快死了才吃"修成"饿到回血线以下就吃"。
+   * 不做过头：血是满的就不吃（省食物）。
+   */
+  keepFed () {
+    const bot = this.bot
+    const food = bot.food
+    const hp = bot.health
+    if (typeof food !== 'number' || typeof hp !== 'number' || !isFinite(food)) return null
+    if (typeof hp !== 'number' || hp <= 0) return null
+
+    if (food < this.REGEN_FOOD) {
+      // 【口径】饿 < 18 就吃，不看血量 —— 17 意味着"永远不回血"，
+      // 等血掉了再补已经晚了两下。省一口食物<多一条命。
+      const ate = this.eatNow('regen')
+      if (ate) {
+        const busy = this.isBusy()
+        this.logThrottled(`[eat] 饿 ${food} < ${this.REGEN_FOOD}（这条线以下不自然回血）${busy ? '，正在干活也先吃' : ''}，吃一个 ${ate}`, 8000, 'eatRegen')
+      }
+      return ate
+    }
+
+    // 已经在回血线以上：什么都不做，但要能证明"没吃"
+    if (hp < 20) {
+      this.logThrottled(`[eat] 饿 ${food} ≥ ${this.REGEN_FOOD}，会自然回血，先不吃`, 300000, 'eatSkip')
+    }
+    return null
   }
 
   /**
@@ -660,6 +951,15 @@ class Reflex {
       return
     }
 
+    // ===== 回血线（2026-11-14）=====
+    // 【为什么要放在分档之前】血低档位里那句 eatNow 是"救命吃"，
+    // 但现场的死法是"饿 17 卡在回血线下面 → 一直不回血 → 被拖死"。
+    // 吃这件事得在**还没到救命档**的时候就开始做，而且血低时也要继续做。
+    // 只在真的在干活（busy）且还没饿到危险程度时让路，别为了一口饭打断任务。
+    // 干活时也让吃：饿 17 就是"永远不回血"，为了一口饭打断 1.6 秒，
+    // 比"挖着挖着血见底"便宜得多（实测他就是边干边掉到血 7 的）。
+    try { this.keepFed() } catch (e) {}
+
     // ===== 战斗分档（2026-11-14）=====
     //
     // 【为什么放在 busy 之前】
@@ -684,17 +984,6 @@ class Reflex {
       // 算出一个巨大的位移（或反过来），判定完全失真。
       this.syncStuckBaseline()
       return
-    }
-
-    // 2. 饿到不行就吃
-    if (bot.food <= 17 && !this.eating) {
-      const food = bot.inventory.items().find(i =>
-        /bread|cooked_|apple|carrot|potato|beef|porkchop|mutton|chicken|melon|baked|stew/.test(i.name))
-      if (food) {
-        this.eating = true
-        bot.equip(food, 'hand').then(() => bot.consume()).catch(() => {})
-          .finally(() => { this.eating = false })
-      }
     }
 
     // 3. 血不够 + 身边有怪 / 正在挨打 -> 拉开距离（1 档，不拼命跑）
@@ -966,5 +1255,8 @@ class Reflex {
     } catch (e) {}
   }
 }
+
+Reflex.POISON_FOOD = POISON_FOOD
+Reflex.FOOD_NAME = FOOD_NAME
 
 module.exports = Reflex

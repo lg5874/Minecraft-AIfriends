@@ -33,7 +33,8 @@ function makeBot (opts = {}) {
     time: { timeOfDay: 6000 },
     inventory: { items: () => (opts.food === false ? [] : [{ name: 'bread', count: 3 }]) },
     pathfinder: { setGoal: (g) => calls.goals.push(g), isMoving: () => false },
-    blockAt: () => ({ name: 'stone' }),
+    // 方块世界：默认是"平地"（y<64 石头、上面空气），个别测试改成悬崖/墙
+    blockAt: opts.blockAt || ((pos) => ({ name: (pos && pos.y < 64) ? 'stone' : 'air' })),
     setControlState: (k, v) => { if (k === 'back' && v) calls.back++; if (k === 'jump' && v) calls.jump++ },
     getControlState: () => false,
     look: () => { calls.look++ },
@@ -305,6 +306,229 @@ console.log('\n[9 panic 期间照样能逃（闸门只挡"开新任务"）]')
   r.tick()                       // 主循环被闸门挡住，但 reflex 自己的定时器不会
   ok(calls.goals.length > goalsBefore, 'panic 中 tick 仍然逃跑（不是站着等死）', 'goals=' + calls.goals.length)
   ok(calls.equip > 0, 'panic 中仍然尝试吃东西')
+}
+
+console.log('\n[10 回血线（food >= 18 才自然回血）]')
+{
+  // ① 饿 17 + 血 7 + 背包有吃的 -> 主动吃（验收 1）
+  const { r, bot, calls } = mkReflex()
+  const mark = logs.length
+  bot.food = 17; bot.health = 7
+  const ate = r.keepFed()
+  ok(ate === 'bread' && calls.equip > 0, '饿 17 + 血 7 -> 直接吃（不用等救命档）', 'ate=' + ate)
+  const line = logs.slice(mark).find(l => /\[eat\] 饿 17 < 18/.test(l))
+  ok(!!line, '日志说清为什么吃：' + (line || '（没有）'))
+}
+{
+  // ② 饿 19（已在回血线上）-> 不吃（验收 2）
+  const { r, bot, calls } = mkReflex()
+  const mark = logs.length
+  bot.food = 19; bot.health = 7
+  const ate = r.keepFed()
+  ok(ate === null && calls.equip === 0, '饿 19 >= 18 -> 不吃（不浪费）', 'equip=' + calls.equip)
+  const line = logs.slice(mark).find(l => /\[eat\] 饿 19 ≥ 18/.test(l))
+  ok(!!line, '日志说清"会自然回血，先不吃"：' + (line || '（没有）'))
+}
+{
+  // ③ 血满 + 饿 17 也要吃：饿 17 = 永远不回血，等血掉了再补已经晚两下
+  const { r, bot, calls } = mkReflex()
+  const mark = logs.length
+  bot.food = 17; bot.health = 20
+  r.keepFed()
+  ok(calls.equip > 0, '血满 + 饿 17 也吃（17 意味着永远不回血）', 'equip=' + calls.equip)
+  ok(logs.slice(mark).some(l => /\[eat\] 饿 17 < 18/.test(l)), '日志写清原因')
+}
+{
+  // ④ 背包没吃的 -> 说清楚（这是今天排查困难的根源：静默失败）
+  const { r, bot, calls } = mkReflex({ food: false })
+  const mark = logs.length
+  bot.food = 17; bot.health = 7
+  const ate = r.keepFed()
+  ok(ate === null && calls.equip === 0, '没吃的 -> 不吃')
+  ok(logs.slice(mark).some(l => /想吃但背包里没吃的/.test(l)),
+    '不再静默：日志写"想吃但背包里没吃的"', logs.slice(mark).join(' | '))
+}
+{
+  // ⑤ 集成：血满（0 档）+ 饿 17，tick 也要吃 —— 老代码只有血低才吃，这是死循环的来源
+  const { r, bot, calls } = mkReflex()
+  bot.food = 17; bot.health = 20; bot.entities = {}
+  r.tick()
+  ok(calls.equip > 0, '血满 + 饿 17：tick 里也会吃（不必等到快死）', 'equip=' + calls.equip)
+}
+{
+  // ⑥ 集成：饿 19 -> tick 不吃
+  const { r, bot, calls } = mkReflex()
+  bot.food = 19; bot.health = 20; bot.entities = {}
+  r.tick()
+  ok(calls.equip === 0, '饿 19：tick 不吃', 'equip=' + calls.equip)
+}
+{
+  // ⑦ 卡死保护：eating 卡住 15 秒不会永久禁吃
+  const { r, bot, calls } = mkReflex()
+  bot.food = 17; bot.health = 7
+  r.eating = true
+  r._eatingAt = Date.now() - 20000
+  const ate = r.eatNow('regen')
+  ok(ate === 'bread', 'eating 卡住 20 秒 -> 强制复位后照样吃', 'ate=' + ate)
+  ok(logs.some(l => /卡住了/.test(l)), '并且说出来')
+}
+{
+  // ⑧ 中毒食物不吃
+  const { r } = mkReflex()
+  r.bot.inventory.items = () => [{ name: 'rotten_flesh', count: 2 }, { name: 'cooked_beef', count: 1 }]
+  const list = r.foodItems().map(i => i.name)
+  ok(list.includes('cooked_beef') && !list.includes('rotten_flesh'), '腐肉不当正餐（中毒），熟牛肉算', list.join(','))
+}
+console.log('\n[11 腐肉：忍着 > 吃（07:32 每 8 秒一条的现场）]')
+{
+  // ⑨ 只剩腐肉、血 7（> 6）-> 不吃，记一句"忍着"
+  const { r, bot, calls } = mkReflex()
+  const mark = logs.length
+  bot.inventory.items = () => [{ name: 'rotten_flesh', count: 8 }]
+  bot.food = 16; bot.health = 7
+  const ate = r.eatNow('regen')
+  ok(ate === null && calls.equip === 0, '血 7（>6）只有腐肉 -> 不吃', 'ate=' + ate)
+  const line = logs.slice(mark).find(l => /只有 rotten_flesh，但它会让我更饿/.test(l))
+  ok(!!line, '并且说清为什么忍着（吃了更饿）', line || '（没有）')
+}
+{
+  // ⑨b 血 6 -> 才吃，且说原因、记"没用"
+  const { r, bot, calls } = mkReflex()
+  const mark = logs.length
+  bot.inventory.items = () => [{ name: 'rotten_flesh', count: 8 }]
+  bot.food = 16; bot.health = 6
+  const ate = r.eatNow('regen')
+  ok(ate === 'rotten_flesh' && calls.equip > 0, '血 6（≤6）-> 救命档才垫腐肉', 'ate=' + ate)
+  const line = logs.slice(mark).find(l => /只能垫 rotten_flesh/.test(l))
+  ok(!!line, '说清这是救命档：' + (line || '（没有）'))
+  ok(r._noPoisonUntil > Date.now(), '吃过之后记下"这东西不顶饱"（120 秒内不再指望）')
+  // 立刻再要吃 -> 被记忆拦住
+  const before = calls.equip
+  bot.health = 6; bot.food = 16
+  const again = r.eatNow('regen')
+  ok(again === null && calls.equip === before, '紧接着再喊吃 -> 被拦（不会每 8 秒一条）', 'again=' + again)
+}
+{
+  // ⑨c 吃一次后 30 秒内不再吃（冷却）
+  const { r, bot, calls } = mkReflex()
+  bot.inventory.items = () => [{ name: 'rotten_flesh', count: 8 }]
+  bot.food = 16; bot.health = 6
+  r.eatNow('regen')
+  r.eating = false                       // 模拟 consume 已结束
+  r._noPoisonUntil = 0                   // 单独验冷却，不受记忆影响
+  const before = calls.equip
+  ok(r.eatNow('regen') === null && calls.equip === before, '腐肉：吃一次后 30 秒内不再吃（冷却闸）')
+  // 30 秒后可以再吃
+  r._foodAt.rotten_flesh = Date.now() - 1
+  r._noPoisonUntil = 0
+  ok(r.eatNow('regen') === 'rotten_flesh', '冷却过期后才会再吃')
+}
+{
+  // ⑨d 正经食物也有短冷却（防止 eatNow 在 consume 还没结束时被连调）
+  const { r, bot, calls } = mkReflex()
+  bot.inventory.items = () => [{ name: 'bread', count: 3 }]
+  bot.food = 17; bot.health = 10
+  ok(r.eatNow('regen') === 'bread', '第一次吃面包')
+  r.eating = false
+  ok(r.eatNow('regen') === null && calls.equip === 1, '10 秒内不重复吃同一个东西', 'equip=' + calls.equip)
+}
+{
+  // ⑨e keepFed 集成：只有腐肉 + 血 7 -> 连喊 5 次也只记一条"忍着"，不反复吃
+  const { r, bot, calls } = mkReflex()
+  const mark = logs.length
+  bot.inventory.items = () => [{ name: 'rotten_flesh', count: 8 }]
+  bot.food = 16; bot.health = 7
+  for (let i = 0; i < 5; i++) r.keepFed()
+  const holds = logs.slice(mark).filter(l => /只有 rotten_flesh/.test(l)).length
+  ok(calls.equip === 0, '连喊 5 次，一次也没吃（不再是 8 秒循环）')
+  ok(holds === 1, '日志只记一条（不刷屏）', '条数=' + holds)
+}
+{
+  // ⑩ 有正经食物就不碰腐肉
+  const { r } = mkReflex()
+  r.bot.inventory.items = () => [{ name: 'rotten_flesh', count: 3 }, { name: 'bread', count: 1 }]
+  ok(r.foodItems()[0].name === 'bread', '正常食物排在腐肉前面', r.foodItems().map(i => i.name).join(','))
+}
+{
+  // ⑪ 数据表口径：生蘑菇不是食物（1.21 只能做煲），别为了"背包里有蘑菇"去 consume
+  const { r } = mkReflex()
+  r.bot.registry = { foodsByName: { bread: { foodPoints: 5 }, honey_bottle: { foodPoints: 6 }, sweet_berries: { foodPoints: 2 } } }
+  r.bot.inventory.items = () => [{ name: 'brown_mushroom', count: 1 }, { name: 'honey_bottle', count: 1 }]
+  const list = r.foodItems().map(i => i.name)
+  ok(!list.includes('brown_mushroom'), '生蘑菇不算食物（数据表里没有它）', list.join(','))
+  ok(list.includes('honey_bottle'), '蜂蜜瓶算食物（老正则漏了它）')
+}
+
+console.log('\n[12 退之前看落点（摔死的最后一环）]')
+{
+  // 背后是平地 -> 正常退
+  const { r, bot, calls } = mkReflex()
+  bot.health = 20
+  r.lastDamage = { at: Date.now(), name: 'mob_attack', pos: { x: 2, y: 64, z: 0 } }
+  r.recoil(5, { hp: 15 })
+  ok(calls.back > 0, '背后有地 -> 正常后退', 'back=' + calls.back)
+  ok(logs.slice(-3).some(l => /先退开 2 格/.test(l)), '日志：先退开 2 格')
+}
+{
+  // 背后是悬崖（退路两格内下面全空）-> 不退，只原地跳
+  const { r, bot, calls } = mkReflex({
+    blockAt: (pos) => {
+      if (!pos) return { name: 'air' }
+      // 只有脚下（x<=0 且 y<64）有地，往 +x 两格是空的
+      if (pos.x >= 1) return { name: 'air' }
+      return { name: pos.y < 64 ? 'stone' : 'air' }
+    }
+  })
+  bot.health = 20
+  r.lastDamage = { at: Date.now(), name: 'mob_attack', pos: { x: -2, y: 64, z: 0 } }  // 来源在 -x，退路是 +x（悬崖）
+  const before = calls.back
+  r.recoil(5, { hp: 15 })
+  ok(calls.back === before, '退路上是坑 -> 不后退（原地不动）', 'back=' + calls.back)
+  ok(calls.jump > 0, '但还是跳一下（脱离岩浆/营火靠它）')
+  ok(logs.slice(-3).some(l => /退路上是坑/.test(l)), '日志说清：退路上是坑/挡着，原地跳一下', logs.slice(-3).join(' | '))
+}
+{
+  // 完全不知道背后是什么（没有来源、四周都是虚空）-> 不退
+  const { r, bot, calls } = mkReflex({ blockAt: () => ({ name: 'air' }) })
+  bot.health = 20
+  r.lastDamage = null
+  r.recoil(5, { hp: 15 })
+  ok(calls.back === 0, '四周都是空的 -> 一步都不退')
+  ok(logs.slice(-3).some(l => /不知道背后是什么/.test(l)), '日志说清原因')
+}
+{
+  // 没来源但旁边有地 -> 仍要退（"看不见的怪也要有反应"这条不能丢）
+  const { r, bot, calls } = mkReflex()
+  bot.health = 20
+  r.lastDamage = null
+  r.recoil(5, { hp: 15 })
+  ok(calls.back > 0, '看不见来源时，找一个有地的方向退', 'back=' + calls.back)
+}
+
+{
+  // 两级退②：两格退不了、一格有地 -> 退 1 格（不是站着不动）
+  const { r, bot, calls } = mkReflex({
+    blockAt: (pos) => {
+      if (!pos) return { name: 'air' }
+      const bx = Math.floor(pos.x)
+      if (bx >= 2) return { name: 'air' }                     // 第二格是虚空
+      return { name: pos.y < 64 ? 'stone' : 'air' }           // 第一格有地
+    }
+  })
+  bot.health = 20
+  r.lastDamage = { at: Date.now(), name: 'mob_attack', pos: { x: -2, y: 64, z: 0 } }  // 来源在 -x，退路 +x
+  r.recoil(5, { hp: 15 })
+  ok(calls.back > 0, '两格退不了时，退 1 格（不再钉在原地）', 'back=' + calls.back)
+  ok(logs.slice(-3).some(l => /退 1 格（两格退不了）/.test(l)), '日志：退 1 格（两格退不了）', logs.slice(-3).join(' | '))
+}
+{
+  // 两级退③：一格都退不了 -> 原地跳
+  const { r, bot, calls } = mkReflex({ blockAt: () => ({ name: 'air' }) })
+  bot.health = 20
+  r.lastDamage = { at: Date.now(), name: 'mob_attack', pos: { x: -2, y: 64, z: 0 } }
+  r.recoil(5, { hp: 15 })
+  ok(calls.back === 0 && calls.jump > 0, '一格都没有 -> 原地跳（不后退）')
+  ok(logs.slice(-3).some(l => /退路上是坑/.test(l)), '日志说清为什么不动')
 }
 
 // consume 是在 equip().then() 里调的，要等一个微任务

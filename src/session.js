@@ -765,15 +765,23 @@ class Session {
   _speakReturn (diff, lines, snap) {
     if (!lines || !lines.length) return
     // ① 箱子里的东西少了 —— robbed 模板终于有触发器了
+    // 【别再随便指控别人偷东西】2026-11-14
+    //
+    // 实测（final-checker 07:35 抓到的）：
+    //   [06:17:29] [say] 我东西呢 少了一堆
+    //   [06:38:45] [say] 我东西谁拿的 少了一堆
+    // 而他那一晚死了 6 次（骷髅/摔/掠夺者/苦力怕），
+    // **死亡掉落、合成消耗、吃东西、放方块，全被算成"身上的东西少了" -> 报 robbed**。
+    // 模板原文是 `有人拿了你的东西` —— 用户一进来就可能被他指控偷东西。
+    //
+    // 箱子里少了才是真的被拿（只有别人能开箱子）。
+    // 身上少了有太多正常原因，不能当"被偷"。
     const boxLoss = diff.containerLoss || []
-    const invLoss = diff.invLoss || []
-    if (boxLoss.length || invLoss.length) {
+    const invLoss = []   // 保留变量，下面日志里还用得到，但不参与 robbed 判定
+    if (boxLoss.length) {
       const parts = []
       if (boxLoss.length) {
         parts.push('箱子里的' + boxLoss.slice(0, 2).map(x => `${cnNum(x.n)}${nounOf(x.item)}`).join('、') + '没了')
-      }
-      if (invLoss.length) {
-        parts.push('身上带的' + invLoss.slice(0, 2).map(x => `${cnNum(x.n)}${nounOf(x.item)}`).join('、') + '没了')
       }
       try {
         const { onComplain } = require('./spontaneous')
@@ -865,7 +873,27 @@ class Session {
     // 收工之后不该再被 goals 拉去挖矿，只该回家、坐着、站门口看看。
     const busy = this._busy()
     if (now - (this._lastRestTaskAt || 0) > this.cfg.restTaskSeconds * 1000 && !busy) {
-      const task = REST_TASKS[this._restTaskIdx % REST_TASKS.length]
+      // 【家里没箱子就别派"收进箱子"】2026-11-14
+      //
+      // 实测（final-checker 07:35）：`[07:01:56] 扫家：… 0 个箱子`，
+      // 而 REST_TASKS 轮换里第一条就是「回家待着，把身上的东西收进箱子」。
+      // 于是：派任务 -> `打不开 chest（试了3次）` -> 判据靠"位移"放过 -> 判完成
+      // -> 下一轮又派同一条。四分钟内原地打转，13:06-14:09 那一段
+      // 在 61:06-62:09 一字不差重播了一遍（盲执行人就是这么发现"像脚本"的）。
+      //
+      // 修法：轮换时跳过"要箱子"的那条。不改成"先造箱子"——那是新行为，不是修 bug。
+      const hasChest = (() => {
+        try {
+          const cs = (this.state.snapshot && this.state.snapshot.containers) || []
+          return cs.length > 0
+        } catch (e) { return false }
+      })()
+      let task = REST_TASKS[this._restTaskIdx % REST_TASKS.length]
+      for (let guard = 0; guard < REST_TASKS.length; guard++) {
+        if (!(task.includes('箱子') && !hasChest)) break
+        this._restTaskIdx++
+        task = REST_TASKS[this._restTaskIdx % REST_TASKS.length]
+      }
       this._restTaskIdx++
       this._lastRestTaskAt = now
       this._setTask(task)

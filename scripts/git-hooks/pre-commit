@@ -1,0 +1,171 @@
+#!/usr/bin/env node
+/**
+ * pre-commit：拦住「提交不属于自己的文件」。
+ *
+ * 【它是怎么来的】
+ * 2026-11-14 通宵，Lead 自己改了 main.js / src/session.js / src/talk.js ——
+ * 那些文件早就分配给 wiring-owner / session-owner / talk-owner 了。
+ * 提醒不管用，得让越权在物理上提交不了。
+ *
+ * 【2026-11-14 08:00 修的 bug：多 agent 共用 index】
+ * 现场：verify-owner 只 `git add docs/VERIFY-BASELINE.md`，另一位 agent 同时把
+ * src/reflex.js 暂存了。本 hook 读的是 `git diff --cached`（**整个暂存区**），
+ * 于是报「src/reflex.js owner = combat-owner」把 verify-owner 的提交拦了。
+ *
+ * 根因不是读错了，是**这个仓库所有 agent 共用一个 index**：
+ * 只要不做「只提交我自己的路径」，git 真的会把别人的文件一起提交出去。
+ * 所以真正要修的不是判定，是**让"我要提交哪些文件"这件事变成显式的**。
+ *
+ * 【现在的规则】
+ * 1. `git commit -- <你的文件>`（部分提交）时，git 会给 hook 一个临时 index，
+ *    `git diff --cached` 就只剩你要提交的那些 —— 判定精确，不会误伤别人暂存的文件。
+ *    推荐用：`bash scripts/commit-own.sh -m "..."`（自动算路径，见下）。
+ * 2. 裸 `git commit`（整个 index）时，如果里面混着别人的文件，**仍然拦** ——
+ *    因为放行就等于把别人的改动署上你的名字提交出去（这正是本 hook 要防的事故）。
+ *    但拦截信息会直接给你可以复制粘贴的修法，不再是干巴巴一句"被拦"。
+ * 3. `ALLOW_FOREIGN_STAGED=1 git commit ...` 强行放行（会打印谁被带上了）。
+ * 4. owner 为 null 的文件（docs/*、scripts/test-* 等）永远放行。
+ *
+ * 【怎么绕过（确实必须自己改别人的文件时）】
+ *   echo "src/reflex.js 原因：<一句话>，<为什么不能派>" >> /tmp/lead-override.txt
+ * 提交后 override 会被删掉（一次性）。
+ */
+
+const { execSync } = require('child_process')
+const fs = require('fs')
+const path = require('path')
+
+const ROOT = path.resolve(__dirname, '..', '..')
+const MAP_PATH = path.join(ROOT, 'scripts', 'ownership.json')
+const OVERRIDE = '/tmp/lead-override.txt'
+
+function sh (cmd) {
+  try { return execSync(cmd, { cwd: ROOT, encoding: 'utf8' }).trim() } catch (e) { return '' }
+}
+
+let map = {}
+try {
+  map = JSON.parse(fs.readFileSync(MAP_PATH, 'utf8'))
+} catch (e) {
+  process.exit(0)   // 没有归属表就放行（不阻塞没配这个的项目）
+}
+// 下划线开头的是说明字段
+const RULES = Object.entries(map).filter(([k]) => !k.startsWith('_'))
+
+function ownerOf (file) {
+  for (const [rule, owner] of RULES) {
+    if (rule === file) return { owner, rule }
+  }
+  for (const [rule, owner] of RULES) {
+    if (!rule.includes('*')) continue
+    const re = new RegExp('^' + rule.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$')
+    if (re.test(file)) return { owner, rule }
+  }
+  return null
+}
+
+const staged = sh('git diff --cached --name-only').split('\n').filter(Boolean)
+if (!staged.length) process.exit(0)
+
+// 部分提交（git commit -- <路径>）时 git 会换临时 index；此时 staged 就是"我要提交的"
+const partial = !!process.env.GIT_INDEX_FILE && !/\.git[/\\]index$/.test(process.env.GIT_INDEX_FILE)
+
+let overrideText = ''
+try { overrideText = fs.readFileSync(OVERRIDE, 'utf8') } catch (e) {}
+
+const allowForeign = /^(1|true|yes)$/i.test(process.env.ALLOW_FOREIGN_STAGED || '')
+
+// 提交者身份。没设就是 lead —— 旧版本正是因为没这行，wiring-owner 提交自己的 main.js 也被拦。
+const AS = (process.env.DSH_AGENT_NAME || 'lead').trim()
+
+const blocked = []
+const freed = []
+const mine = []
+for (const f of staged) {
+  const hit = ownerOf(f)
+  if (!hit || !hit.owner) { freed.push(f); mine.push(f); continue }        // 无主 / null -> 放行
+  if (hit.owner === AS) { freed.push(f); mine.push(f); continue }          // 自己的文件 -> 放行
+  if (overrideText.includes(f) && /原因[:：]/.test(overrideText)) { freed.push(f); mine.push(f); continue }
+  blocked.push({ file: f, owner: hit.owner, rule: hit.rule })
+}
+if (!blocked.length) {
+  try { if (overrideText) fs.unlinkSync(OVERRIDE) } catch (e) {}
+  process.exit(0)
+}
+
+if (allowForeign) {
+  console.error('')
+  console.error(`⚠️  ALLOW_FOREIGN_STAGED=1：强行放行（当前身份 = ${AS}），以下文件会被一起提交`)
+  for (const b of blocked) console.error(`   ${b.file.padEnd(30)} owner = ${b.owner}`)
+  console.error('   如果这不是你想要的，现在 Ctrl-C，然后看下面的修法。')
+  console.error('')
+  try { if (overrideText) fs.unlinkSync(OVERRIDE) } catch (e) {}
+  process.exit(0)
+}
+
+// 可选：不想被打断时，让 hook 把别人的文件从暂存区摘掉、自己照常提交。
+// 这是唯一能让「裸 git commit」放行又不把别人代码带上的办法（内容不动，对方 git add 一次即可）。
+const autoExclude = /^(1|true|yes)$/i.test(process.env.HOOK_AUTO_EXCLUDE || '')
+if (autoExclude && partial) {
+  // 点名提交时不摘任何东西 —— 那些正是你要提交的。摘了等于自己拆自己的台。
+  console.error('')
+  console.error(`⛔ HOOK_AUTO_EXCLUDE 对「点名的路径」不生效：你显式要提交的文件不归你（当前身份 = ${AS}）`)
+  for (const b of blocked) console.error(`   ${b.file.padEnd(30)} owner = ${b.owner}`)
+  console.error('')
+  console.error('  如果这真是你的文件：DSH_AGENT_NAME=<你的 owner> git commit ...')
+  console.error('')
+  process.exit(1)
+}
+if (autoExclude && !partial) {
+  const files = blocked.map(b => `'${b.file.replace(/'/g, `'\\''`)}'`).join(' ')
+  sh(`git restore --staged ${files}`)
+  console.error('')
+  console.error('⚠️  HOOK_AUTO_EXCLUDE=1：已把别人的文件从本次提交里摘出去（内容没动）')
+  for (const b of blocked) console.error(`   ${b.file.padEnd(30)} owner = ${b.owner}`)
+  console.error('   对方需要重新 git add 一次；本次提交只含你自己的文件。')
+  console.error('')
+  if (!mine.length) {
+    sh(`git add -- ${files}`)   // 全是别人的 -> 放回去，别把人家的暂存吃掉
+    console.error(`⛔ 摘完发现暂存区里没有一个是你的（当前身份 = ${AS}）—— 已全部放回，什么都没提交。`)
+    console.error('   如果是你自己的文件被当成别人的：DSH_AGENT_NAME=<你的 owner> 再提交。')
+    console.error('')
+    process.exit(1)
+  }
+  process.exit(0)
+}
+
+console.error('')
+if (partial) {
+  console.error('⛔ 提交被拦：你要提交的路径里有不归你的文件')
+} else {
+  console.error('⛔ 提交被拦：暂存区里有不归你的文件（多 agent 共用一个 index，裸 git commit 会把它一起提交）')
+}
+console.error('')
+console.error(`   当前身份 = ${AS}（可用 DSH_AGENT_NAME 覆盖，例如 DSH_AGENT_NAME=wiring-owner）`)
+console.error('')
+for (const b of blocked) {
+  console.error(`   ${b.file.padEnd(30)} owner = ${b.owner}   (规则 ${b.rule})`)
+}
+console.error('')
+
+if (!partial) {
+  console.error('  提示：先跑  git diff --cached --name-only  看是不是有别人的文件躺在暂存区。')
+  if (mine.length) {
+    console.error('')
+    console.error('  只提交你自己的那些（推荐，复制粘贴即可）：')
+    console.error(`     git commit -- ${mine.map(f => `'${f}'`).join(' ')} -m "……"`)
+    console.error('     或者一步到位：bash scripts/commit-own.sh -m "……"')
+  } else {
+    console.error('')
+    console.error('  暂存区里没有一个是你的文件 —— 你可能只是想看看，别提交就好。')
+  }
+  console.error('')
+  console.error('  把别人的摘出去（不会动内容，对方 git add 一次就回来）：')
+  console.error(`     git restore --staged ${blocked.map(b => `'${b.file}'`).join(' ')}`)
+}
+
+console.error('')
+console.error('  确实必须自己改（owner 不可用 / 紧急热修）：')
+console.error(`     echo "${blocked[0].file} 原因：<一句话>，<为什么不能派>" >> ${OVERRIDE}`)
+console.error('')
+process.exit(1)

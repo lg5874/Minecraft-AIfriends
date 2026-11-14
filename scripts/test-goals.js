@@ -914,6 +914,48 @@ console.log('\n[二十三、卡死看门狗 + 连续挖不动 → 强制 explore
 }
 
 // ================================================================
+console.log('\n[二十四、rest 死锁出口：血低 + 饿着时不许歇着]')
+{
+  const st = (hp, food, y = 70) => ({
+    pos: { x: 0, y, z: 0 }, health: hp, food,
+    inventory: {}, time: '白天', underground: y < 58
+  })
+
+  // 判据本身：只放行「血 <8 且饿 <18」这一种组合
+  {
+    const g = new Goals(tmp(), { ctx: { log: () => {}, mood: { resting: true } } })
+    g.lastStatus = { health: 7, food: 17 }
+    ok(g.isResting() === false, '血 7 + 饿 17 → 不再 rest（命比歇着重要）')
+    g.lastStatus = { health: 7, food: 19 }
+    ok(g.isResting() === true, '血 7 但吃饱了（饿 19）→ 仍然 rest')
+    g.lastStatus = { health: 12, food: 10 }
+    ok(g.isResting() === true, '饿 10 但血 12 → 仍然 rest（不把 rest 整个关掉）')
+  }
+
+  // 解除 rest 的同时，得有一条"先弄吃的"把优先级抢过来
+  {
+    const g = new Goals(tmp(), { ctx: { log: () => {}, mood: { resting: true } } })
+    const s = st(7, 17)
+    g.lastStatus = s
+    const cs = g.candidates(s)
+    ok(cs[0] && cs[0].key === 'food', '血 7 + 饿 17 → candidates 第一是 food',
+      cs.slice(0, 3).map(c => c.key + '(' + c.score + ')').join(' '))
+    ok(g.candidates(st(7, 17, 42))[0].key === 'food', '在地下也照样先找吃的（不被位置扣分压掉）')
+
+    g.llm = null
+    const goal = await g.ensure(s)
+    ok(goal && goal.key === 'food' && goal.stages.length >= 1, 'ensure 真的立了「先弄点吃的」', goal && goal.key)
+  }
+
+  // 正常状态 food 不该冒出来
+  {
+    const F = Goals.POOL.find(x => x.key === 'food')
+    ok(F.score(st(12, 10)) === 0 && F.score(st(7, 19)) === 0 && F.score(st(20, 20)) === 0,
+      '血/饿不在临界区 → food 分数为 0')
+  }
+}
+
+// ================================================================
 }
 
 main().then(() => {

@@ -16,6 +16,8 @@
  * 也好过抽卡一样的重复。
  */
 
+const fs = require('fs')
+const path = require('path')
 const persona = require('./persona')
 const secretsMod = require('./secrets')
 const persuasion = require('./persuasion')
@@ -200,12 +202,27 @@ const BRACKET_LABEL = /\[[\u4e00-\u9fa5]{1,6}\]/
  */
 const META_WORD_CHECK = /(你说过的话|用过太多|用得太多次|别再用|重复太多|换个说法|换个词)/
 
+/**
+ * 一句里堆了两个以上带引号的短语 = 在念提示词（2026-11-14 07:00）。
+ *
+ * 【现场】
+ *   [06:59:18] [say] 我必须不去想「我怎么看昨天」「这一局
+ * 触发是 complain:loss。提示词里给了几个"角度"的示例，模型把它们连着念了出来。
+ *
+ * 真人说话不会在一句里套两个引号短语 —— 那是列举，不是讲话。
+ */
+const MANY_QUOTES = (t) => {
+  const n = (t.match(/[「『“"]/g) || []).length
+  return n >= 2 && /「[^」]{0,20}」|『[^』]{0,20}』|[“"][^”"]{0,20}[”"]/.test(t)
+}
+
 function isBrokenUtterance (text) {
   const t = String(text || '').trim()
   if (!t) return true
   if (LEADING_PUNCT.test(t)) return true
   if (BRACKET_LABEL.test(t)) return true
   if (META_WORD_CHECK.test(t)) return true
+  if (MANY_QUOTES(t)) return true
   if (QUOTE_HISTORY.test(t)) return true
   // 只有一个字（「嗯」「哦」「不」）—— 昨晚 UNHUMAN-SCAN 第 1 条的另一种形态
   if (t.replace(/[\s，。、；：！？,.!?]/g, '').length <= 1) return true
@@ -348,6 +365,32 @@ class Talk {
     this._ackTimer = null
     this._ackRecoveryTimer = null
     this._ackSentAt = 0
+
+    // ===== 判「是不是在跟我说话」（2026-11-14）=====
+    // 主循环那边现在用一条正则：带名字 / 以问号结尾 就算在跟他说话。
+    // 正则分不清「你在哪呢」（在问他）和「这破地方真难找」（自言自语），
+    // 盲读者那句「从来不接别人的话茬」就是这条正则的产物。
+    // 这里把判断交给模型，但**只判一次**（同一条消息走缓存），并且**3 秒兜底**回正则。
+    this.addrTimeoutMs = 5000     // 超过就退回正则；5 秒是"基本都会答上来"的线
+    this.addrCacheMs = 10 * 60 * 1000
+    this.addrFallbackCacheMs = 60 * 1000
+    this._addrCache = new Map()   // key: user\0msg -> {at, res}
+    this.addrCalls = 0            // 真调了几次模型（验收用）
+    this.addrCacheHits = 0
+    this.addrTimeouts = 0
+    this.addrModelTrue = 0
+    this.addrModelFalse = 0
+
+    // ===== 现实时间（2026-11-14）=====
+    // memory 里的 firstSeen / lastSeen 是**游戏分钟**（只算在线时长），
+    // 跨重启算不出"老王 3 天没来了"。这里另存一份现实时间戳：
+    //   每个人上次说话的时刻 + 上一次上线的时刻
+    // 只写一个小文件（dataDir/talk-presence.json），10 秒最多落一次盘。
+    this._presenceFile = path.join(this.ctx.dataDir || '/tmp', 'talk-presence.json')
+    this._presence = { lastOnlineAt: 0, people: {} }
+    this._presenceSavedAt = 0
+    this._sessionStartAt = Date.now()
+    this._loadPresence()
   }
 
   /**
@@ -474,7 +517,33 @@ class Talk {
     return Math.max(mine, globalCount) < this.sayWindowMax
   }
 
+  /**
+   * 所有出口的统一收口。
+   *
+   * 【2026-11-14 修：并发竞态】
+   * 原来 say() 一进来就查闸门，然后 `await humanDelay()`（生产 900~5200ms），
+   * **发出去之后**才写 lastSayAt / recentSaid。闸门是"检查 → 等几秒 → 才提交"，
+   * 中间那段 await 就是竞态窗口。
+   *
+   * 现场（/tmp/newcode.log 06:15:37~38，血 4→2→0 那三秒）：
+   *   [06:15:37] [say] 再不来人我就没了          ← A 进闸门时 lastSayAt 还是旧的
+   *   [06:15:38] [say 限速] … 这句不说：我这边情况不太妙
+   *   [06:15:38] [say] 再不来人我就没了          ← B 跟 A 同一瞬间进闸门，也没被挡
+   * 同一句连发两遍，中间那句**不同**的反被限速丢掉 —— 就是"检查-等待-才提交"。
+   *
+   * 修法：非 reserved 的调用**排队**串行执行。第二句进来时第一句已经提交过时间戳，
+   * 闸门和复读判定都看得见它。代价是最坏多等一次打字延迟，比连发两句强。
+   * reserved 的调用不进队列：它在 reserveSpeak 那一刻就已经占过坑、写好了时间戳。
+   */
   async say (text, opts = {}) {
+    if (opts.reserved) return this._sayInner(text, opts)
+    const run = () => this._sayInner(text, opts)
+    const p = (this._sayQueue || Promise.resolve()).then(run, run)
+    this._sayQueue = p.then(() => {}, () => {})
+    return p
+  }
+
+  async _sayInner (text, opts = {}) {
     if (!text) return false
     let t = String(text).trim()
     if (!t) return false
@@ -615,7 +684,15 @@ class Talk {
       this.cancelPendingAck()
       // 真的打出去了才记进 recentSaid（语气疲劳 + 复读拦截都靠它）
       this.recentSaid.push({ text: t, at: Date.now(), kind: detectSayKind(t) })
-      if (this.recentSaid.length > 10) this.recentSaid.shift()
+      // 【2026-11-14 修】原来这里是 `if (length > 10) shift()`。
+      // 判定逻辑宣称"30 分钟窗口"，实际只存得住 10 条 —— 现场：
+      // 06:12:45「我快挺不住了 有吃的吗」、06:27:56 一字不差又来一遍，
+      // 中间隔了 14 条 [say]，第 11 条就把原句挤出去了，30 分钟窗口形同虚设。
+      // 改成按时间剪（30 分钟）+ 上限 200 条（正常一小时也就几十句，涨不上去）。
+      {
+        const cutoff = Date.now() - 30 * 60 * 1000
+        this.recentSaid = this.recentSaid.filter(x => (x.at || 0) >= cutoff).slice(-200)
+      }
       // 说了"我下去了/我去挖"就记一笔（没发出去的不算，所以放这里）
       this.noticeIntention(t)
       return true
@@ -774,6 +851,88 @@ class Talk {
    * @param {string[]} [opts.people] 相关的人
    * @param {number} [opts.chance] 说话的意愿 0~1（默认 1；想让他"可能不说"就调低）
    */
+  /**
+   * 说话请求的消息体。
+   *
+   * 【2026-11-14 改：从「改写叙述」改成「自主决定」】
+   *
+   * 旧版第一句是「现在发生了一件事，你要在游戏公屏上说一句」，然后把 situation
+   * （一段第三人称事件叙述）原样贴进去，等于让模型"把这段话变成人话"。
+   * 模型手里只有那段叙述可抓 —— 22% 的回声不是模型漏嘴，是这个 prompt 的必然产物；
+   * 今晚加的六层判据，有一半在拦这个 prompt 自己造出来的东西。
+   *
+   * 新版三处不同：
+   *   ① 不再命令"你要说一句"
+   *   ② 叙述改成【事实】，并明说"别把这些字样念出来"
+   *   ③ [不说] 从逃生门变成默认：「大多数时候你应该什么都不说」
+   *
+   * 没有可复述的文本 → 回声断根；默认不说 → 话只会变少，不会变多。
+   *
+   * style='rewrite' 是旧版原文，只给 A/B 用（scripts/bench-prompt-ab.js）。
+   * 生产不传 style，走 'auto'。
+   */
+  speakMessages (situation, opts = {}, stateLine = '') {
+    const style = opts.promptStyle || this.promptStyle || 'auto'
+    const recalled = this.mem.remember(situation, { people: opts.people || [], limit: 5 })
+    const head = {
+      role: 'system',
+      content: persona.systemPrompt(this.mem, stateLine, recalled, {
+        secrets: this.mem.secrets, taste: this.ctx.taste, mood: this.ctx.mood
+      })
+    }
+
+    // 【2026-11-14 窗口 10 → 40】只给模型看最近 10 条 = 只记得上一分钟，
+    // 用户的原话是"别因为 token 上限导致功能受限"。40 条按输入量算也就 +2K tok。
+    const recentBlock = (this.history || []).length
+      ? [{ role: 'system', content: '刚才聊的：\n' + this.history.slice(-40).map(h => `${h.who}: ${h.msg}`).join('\n') }]
+      : []
+
+    if (style === 'rewrite') {
+      return [head, {
+        role: 'system',
+        content: `现在发生了一件事，你要在游戏公屏上说一句。
+
+这件事是：${situation}
+
+要求：
+- 只说你要打出来的字，不要引号，不要"我说："前缀
+- 不超过 ${opts.maxLen || 40} 个字
+- 像真人随口一句，不要完整得像写作文
+- 不要每次都感叹，普通事就平静地说
+- 不要用书面语
+${opts.extraHint ? '- ' + opts.extraHint : ''}
+- **绝对不要念出方块的英文名、数量、坐标、括号里的返回值**。说人话。
+- 如果你觉得这事不值一提、不想说，就只输出 [不说]
+${this.fatigueHint()}`
+      }, ...recentBlock]
+    }
+
+    const maxLen = Math.min(opts.maxLen || 20, 20)
+    return [head, {
+      role: 'system',
+      content: `【时间】（事实，别念出来）
+${this.timeFacts(opts).map(x => '- ' + x).join('\n')}
+这些时间你心里有数就行：没人问的时候别主动报时；但隔了很久没见、或者对方问几点/几号，顺口提一句很自然。
+
+【你现在的情况】（这些是事实，不是要你说的话）
+${this.describeDoing()}
+
+【刚才发生了什么】（同样是事实，别把这些字样念出来）
+${situation}
+
+【先决定要不要开口】
+- 大多数时候不值得开口：天黑、挖石头、走路、别人只是路过 —— 这些占了公屏就是刷屏。
+- 值得开口的只有三种：有人直接跟你说话；出了真事（死了/被炸/捡到好东西）；你实在憋不住想吐槽。
+- 不值得，就只输出 [不说] 两个词，不要别的。
+
+【如果值得说】
+- 一句话，不超过 ${maxLen} 个字，像随口说的，别像写作文。
+${opts.extraHint ? '- ' + opts.extraHint : ''}
+- 别念方块的英文名、坐标、括号里的返回值。说人话。
+${this.fatigueHint()}`
+    }, ...recentBlock]
+  }
+
   async speak (situation, opts = {}) {
     // 冷却：别一句话接一句话地刷
     const sinceLast = Date.now() - (this.lastSpokeAt || 0)
@@ -806,33 +965,7 @@ class Talk {
     this._danger = danger
     this._hp = dg.hp
 
-    const recalled = this.mem.remember(situation, { people: opts.people || [], limit: 5 })
-
-    const msgs = [
-      { role: 'system', content: persona.systemPrompt(this.mem, stateLine, recalled, {
-        secrets: this.mem.secrets, taste: this.ctx.taste, mood: this.ctx.mood
-      }) },
-      {
-        role: 'system',
-        content: `现在发生了一件事，你要在游戏公屏上说一句。
-
-这件事是：${situation}
-
-要求：
-- 只说你要打出来的字，不要引号，不要"我说："前缀
-- 不超过 ${opts.maxLen || 40} 个字
-- 像真人随口一句，不要完整得像写作文
-- 不要每次都感叹，普通事就平静地说
-- 不要用书面语
-${opts.extraHint ? '- ' + opts.extraHint : ''}
-- **绝对不要念出方块的英文名、数量、坐标、括号里的返回值**。说人话。
-- 如果你觉得这事不值一提、不想说，就只输出 [不说]
-${this.fatigueHint()}`
-      }
-    ]
-
-    const recent = this.history.slice(-10).map(h => `${h.who}: ${h.msg}`).join('\n')
-    if (recent) msgs.push({ role: 'system', content: '刚才聊的：\n' + recent })
+    const msgs = this.speakMessages(situation, opts, stateLine)
 
     let out = null
     try {
@@ -851,7 +984,8 @@ ${this.fatigueHint()}`
       return false
     }
 
-    out = cleanLine(out, opts.maxLen || 40)
+    // 提示词要 20 字，这里留一点超冲余量（截半句比多五个字更难看）
+    out = cleanLine(out, Math.min(opts.maxLen || 20, 30))
     if (!out) return false
     // 指令泄漏：日志里那句「答一句短的。大概意思是：看见你上线了。」就是从这里进来的。
     // say() 里还有一道；这里先拦，是为了别把它写进 history / 记忆（写进去下次还会学它）。
@@ -869,7 +1003,7 @@ ${this.fatigueHint()}`
     }
 
     this.history.push({ who: '我', msg: out })
-    if (this.history.length > 40) this.history = this.history.slice(-40)
+    if (this.history.length > 200) this.history = this.history.slice(-200)
 
     // 记录放到 say() 成功之后 —— 提前 push 的话，
     // say() 里的复读拦截会撞见"刚加进去的自己"，第一句就发不出去。
@@ -880,9 +1014,215 @@ ${this.fatigueHint()}`
     return this.say(out, { reserved, danger })
   }
 
+  // ============================================================
+  // 现实时间（2026-11-14）
+  // ============================================================
+
+  /** 读侧车文件；把"这一次上线"记下来，上一次的留作 lastSessionAt */
+  _loadPresence () {
+    try {
+      const d = JSON.parse(fs.readFileSync(this._presenceFile, 'utf8'))
+      if (d && typeof d === 'object') {
+        this._presence.people = d.people && typeof d.people === 'object' ? d.people : {}
+        this._presence.lastOnlineAt = Number(d.lastOnlineAt) || 0
+      }
+    } catch (e) { /* 第一次跑，没有文件 */ }
+    this.lastSessionAt = this._presence.lastOnlineAt || 0
+    this._presence.lastOnlineAt = Date.now()
+    this._savePresence(true)
+  }
+
+  /** 记一个人"刚说过话" */
+  _notePresence (name) {
+    const n = String(name || '').trim()
+    if (!n) return
+    this._presence.people[n] = Date.now()
+    const keys = Object.keys(this._presence.people)
+    if (keys.length > 200) {
+      keys.sort((a, b) => this._presence.people[a] - this._presence.people[b])
+      for (const k of keys.slice(0, keys.length - 200)) delete this._presence.people[k]
+    }
+    this._savePresence()
+  }
+
+  _savePresence (force) {
+    const now = Date.now()
+    if (!force && now - (this._presenceSavedAt || 0) < 10000) return
+    this._presenceSavedAt = now
+    try {
+      fs.mkdirSync(path.dirname(this._presenceFile), { recursive: true })
+      fs.writeFileSync(this._presenceFile, JSON.stringify({
+        lastOnlineAt: this._presence.lastOnlineAt,
+        people: this._presence.people
+      }), 'utf8')
+    } catch (e) { /* 写不了就算了，时间感不是致命功能 */ }
+  }
+
+  /** 把时间戳说成人话：刚刚 / 12 分钟前 / 今天上午 / 昨天下午 / 3 天前 */
+  _whenLabel (ts) {
+    const now = new Date()
+    const d = new Date(ts)
+    const diff = Date.now() - ts
+    if (diff < 0) return '刚刚'
+    if (diff < 90 * 1000) return '刚刚'
+    if (diff < 60 * 60 * 1000) return Math.max(1, Math.round(diff / 60000)) + ' 分钟前'
+    const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+    const days = Math.round((day(now) - day(d)) / 86400000)
+    const part = d.getHours() < 5 ? '凌晨' : d.getHours() < 8 ? '早上' : d.getHours() < 11 ? '上午'
+      : d.getHours() < 13 ? '中午' : d.getHours() < 17 ? '下午' : d.getHours() < 19 ? '傍晚'
+        : d.getHours() < 23 ? '晚上' : '深夜'
+    if (days <= 0) return '今天' + part
+    if (days === 1) return '昨天' + part
+    if (days === 2) return '前天' + part
+    if (days < 7) return days + ' 天前'
+    return Math.round(days / 7) + ' 周前'
+  }
+
+  /**
+   * 时间事实（给 prompt 用）。
+   * 只出事实，不写话术 —— 让他自己决定要不要说"咱俩三天没见了"。
+   * @param {object} opts { people: string[] }
+   * @returns {string[]}
+   */
+  timeFacts (opts = {}) {
+    const rt = realtime.realTime()
+    const d = rt.date
+    const out = []
+    out.push(`现在是 ${d.getMonth() + 1} 月 ${d.getDate()} 号 ${rt.weekdayName} ${rt.part}（${rt.clock}）`)
+    out.push(this.lastSessionAt
+      ? `你上一次在这个服里是${this._whenLabel(this.lastSessionAt)}`
+      : '你是第一次来这个服')
+    const mins = Math.max(1, Math.round((Date.now() - (this._sessionStartAt || Date.now())) / 60000))
+    if (mins >= 3) out.push(`这次你上来已经 ${mins} 分钟了`)
+
+    const names = (opts.people && opts.people.length)
+      ? opts.people.slice(0, 3)
+      : Object.keys(this._presence.people).slice(-2)
+    for (const n of names) {
+      const t = this._presence.people[n]
+      if (t) out.push(`${n} 上次跟你说话是${this._whenLabel(t)}`)
+    }
+    return out
+  }
+
+  /**
+   * 这句话是不是在对我说？想让我做什么？
+   *
+   * 【为什么从正则换成模型】2026-11-14
+   * main.js 原来：`message.includes(myName) || /^(你|…)/ || /[?？]$/`。
+   * 判不出「你在哪呢」是在问他（结尾是"呢"不是问号），
+   * 也挡不住「这破地方真难找」被当成问句（它不结尾问号，但换一句「这地方咋这么难找？」就误判）。
+   * 今晚盲读者的原话是「从来不接别人的话茬」—— 一半是这条正则。
+   *
+   * 【为什么敢交给模型】这不是"生成"，是二选一 + 一个短语，模型在这类判断上比正则稳。
+   * 而且判错了代价小：判成 toMe 只是"多看一条"，还有后面一整条回复链把关。
+   *
+   * 【三条硬约束】
+   *   ① 只判一次：同一条消息（who+text）走缓存，10 分钟内不重复问
+   *   ② 3 秒兜底：超时/乱码/异常一律退回正则，主循环不会卡在这里
+   *   ③ 不改 chat_me 那条链：调用方拿到 toMe 之后怎么走，跟以前一模一样
+   *
+   * @returns {Promise<{toMe:boolean, want:string, urgent:number, via:'model'|'regex', ms:number}>}
+   */
+  async isAddressedTo (username, message, opts = {}) {
+    const msg = String(message || '')
+    const t0 = Date.now()
+    if (!msg) return { toMe: false, want: '', urgent: 0, via: 'regex', ms: 0 }
+
+    const key = String(username || '') + '\u0000' + msg
+    const hit = this._addrCache.get(key)
+    if (hit) {
+      const ttl = hit.res.via === 'model' ? this.addrCacheMs : this.addrFallbackCacheMs
+      if (Date.now() - hit.at < ttl) {
+        this.addrCacheHits++
+        return hit.res
+      }
+      this._addrCache.delete(key)
+    }
+
+    const remember = (res) => {
+      res.ms = Date.now() - t0
+      this._addrCache.set(key, { at: Date.now(), res })
+      if (this._addrCache.size > 200) this._addrCache.delete(this._addrCache.keys().next().value)
+      return res
+    }
+
+    const viaRegex = (why) => {
+      const toMe = this._regexAddressed(msg)
+      this.ctx.log(`[addr] ${why} → 正则兜底 toMe=${toMe}：「${msg.slice(0, 18)}」`)
+      return remember({ toMe, want: '', urgent: 0, via: 'regex' })
+    }
+
+    // 最近公屏：他自己说过的话 + 别人说的，按 history 顺序
+    const recent = (this.history || []).slice(-12)
+      .map(h => `${h.who}: ${h.msg}`)
+      .join('\n')
+
+    const msgs = [{
+      role: 'system',
+      content: `你在一个 Minecraft 服务器的公屏上。判断最后一句话是不是在跟「你」（${this.bot.username}）说。
+
+【最近公屏】
+${recent || '（还没人说话）'}
+${username}: ${msg}
+
+【判断】
+- 它是在跟 ${this.bot.username} 说话，还是在自言自语/跟别人说？
+- 如果是跟你说的，他想让你做什么？用一个短语回答（比如 报位置、接话、问在干啥、让你帮忙、打招呼、别理）。
+- 紧急程度 0~1（只是闲聊给 0，问你救命/在哪给 0.5 以上）。
+
+只回 JSON，不要解释：
+{"toMe": true, "want": "报位置", "urgent": 0.6}`
+    }]
+
+    this.addrCalls++
+    let r = null
+    let timer = null
+    const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(null), this.addrTimeoutMs) })
+    try {
+      r = await Promise.race([
+        this.llm.chat(msgs, { maxTokens: 400, temperature: 0.2, json: true }),
+        timeout
+      ])
+    } catch (e) {
+      return viaRegex('判不了（' + String(e.message).slice(0, 24) + '）')
+    } finally {
+      // 谁先到就把另一个撤掉：模型正常返回时不留一个空转的 3 秒计时器
+      if (timer) clearTimeout(timer)
+    }
+    if (!r) { this.addrTimeouts++; return viaRegex(`超过 ${this.addrTimeoutMs}ms 没回`) }
+
+    const text = String(r.text || '')
+    const m = text.match(/\{[\s\S]*\}/)
+    let obj = null
+    try { obj = m ? JSON.parse(m[0]) : null } catch (e) { obj = null }
+    if (!obj || typeof obj.toMe !== 'boolean') return viaRegex('返回不是 JSON')
+
+    const res = {
+      toMe: !!obj.toMe,
+      want: String(obj.want || '').slice(0, 20),
+      urgent: Number.isFinite(Number(obj.urgent)) ? Math.max(0, Math.min(1, Number(obj.urgent))) : 0,
+      via: 'model'
+    }
+    if (res.toMe) this.addrModelTrue++
+    else this.addrModelFalse++
+    this.ctx.log(`[addr] toMe=${res.toMe} want=${res.want || '-'} urgent=${res.urgent} ${Date.now() - t0}ms`)
+    return remember(res)
+  }
+
+  /** 老正则兜底：跟 main.js 原来的口径保持一致，出问题时行为不变 */
+  _regexAddressed (msg) {
+    const m = String(msg || '')
+    const me = this.bot && this.bot.username ? String(this.bot.username) : ''
+    return (me && m.includes(me)) ||
+      /^(你|XJJ|小徐|小徐)/.test(m) ||
+      /[?？]$/.test(m)
+  }
+
   /** 收到别人的话 */
   async onChat (username, message) {
     if (username === this.bot.username) return
+    this._notePresence(username)
 
     // ===== 指令型文本拦截 =====
     // 别的 AI 会把提示词漏到公屏（"现在你该说一句话接上。对方说了「邪门」，"）。
@@ -1316,7 +1656,7 @@ ${item.who} 刚才说的是：${item.msg}
       }
     ]
 
-    const recent = this.history.slice(-8).map(h => `${h.who}: ${h.msg}`).join('\n')
+    const recent = this.history.slice(-40).map(h => `${h.who}: ${h.msg}`).join('\n')
     if (recent) msgs.push({ role: 'system', content: '刚才的对话：\n' + recent })
     msgs.push({ role: 'user', content: `${username} 说：${message}` })
 
@@ -1362,7 +1702,7 @@ ${item.who} 刚才说的是：${item.msg}
 
     this.history.push({ who: username, msg: message })
     this.history.push({ who: '我', msg: out })
-    if (this.history.length > 40) this.history = this.history.slice(-40)
+    if (this.history.length > 200) this.history = this.history.slice(-200)
 
     // 记录放到 say() 成功之后 —— 提前 push 的话，
     // say() 里的复读拦截会撞见"刚加进去的自己"，第一句就发不出去。
@@ -1478,7 +1818,7 @@ function cleanLine (out, maxLen) {
 /**
  * 判断一个玩家是不是"另一个 AI"。
  * 这纯粹是程序层的自我保护：防止两个 bot 无限对答把服务器聊天刷爆。
- * 注意：徐俊杰本人不会觉得对方是 AI，这只是代码层面的防护。
+ * 注意：小徐本人不会觉得对方是 AI，这只是代码层面的防护。
  */
 Talk.prototype.looksLikeBot = function (username) {
   const name = String(username || '').trim()

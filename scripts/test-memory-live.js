@@ -158,12 +158,12 @@ section('[三] 场景：玩家说"我叫老王"')
   ok(m.peopleDigest().includes('XJJVER6'), '人物摘要里有他')
 
   // 真人会改口 —— 改口要能覆盖，但历史要留着
-  m.person('XJJVER6').callMe = '俊杰'
-  ok(m.people.XJJVER6.callMe === '俊杰', '改口后以新的为准')
+  m.person('XJJVER6').callMe = '小徐'
+  ok(m.people.XJJVER6.callMe === '小徐', '改口后以新的为准')
 
-  // talk.js 的正则会把「俊杰就行」整段当称呼塞进来 —— 存储侧必须洗干净
-  m.person('XJJVER6').callMe = '俊杰就行'
-  ok(m.person('XJJVER6').callMe === '俊杰', '脏称呼清洗：俊杰就行 → ' + m.person('XJJVER6').callMe)
+  // talk.js 的正则会把「小徐就行」整段当称呼塞进来 —— 存储侧必须洗干净
+  m.person('XJJVER6').callMe = '小徐就行'
+  ok(m.person('XJJVER6').callMe === '小徐', '脏称呼清洗：小徐就行 → ' + m.person('XJJVER6').callMe)
   m.person('XJJVER6').callMe = '小徐吧'
   ok(m.person('XJJVER6').callMe === '小徐', '脏称呼清洗：小徐吧 → ' + m.person('XJJVER6').callMe)
   m.person('XJJVER6').callMe = '果哥'

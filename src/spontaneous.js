@@ -694,8 +694,18 @@ class Spontaneity {
     this.lastSpokeAt = now
     if (kind === 'social') this.lastSocialAt = now
 
+    // 【2026-11-14 方案 5】要不要开口，交给模型，不在这里掷骰子。
+    //
+    // 原来这里传 `chance: ev.chance`（0.25~0.85），代码层先掷一次骰子，
+    // 骰子不过连模型都不问 —— 相当于"这个话题值不值得说"由写死的概率决定，
+    // 而模型根本没机会判断"现在有没有想说的"。
+    //
+    // talk.speak() 的 prompt 已经改成自主版了（会输出 [不说]），判断权集中在那一处：
+    // 这里不掷骰子，凡是走到这一步的事件都让模型自己决定。
+    // 代价只是多几次模型调用（实测触发约 50 次/小时，冷却后能走到这一步的更少），
+    // 换来的是"说不说"只有一个决策点，而不是概率 × 模型两层。
     const said = await talk.speak(ev.situation, {
-      chance: ev.chance,
+      chance: 1,
       maxLen: Math.min(ev.maxLen || 20, 24),
       people: ev.people || [],
       extraHint: kind === 'social'

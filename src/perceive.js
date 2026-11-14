@@ -64,12 +64,241 @@ const MOB_NAME = {
 // 八个方向的中文名（Minecraft 里 -Z 是北）
 const DIRS = ['北', '东北', '东', '东南', '南', '西南', '西', '西北']
 
+// ============ 视觉（图，不是表）============
+//
+// 【为什么要有这一整段】2026-11-14
+//
+// 原来喂给模型的是计数表：「附近有 173 个 stone、24 个 dirt、3 个 oak_log」。
+// 模型拿到这个，答不出"前面是堵墙"——它只知道有多少块石头，不知道石头在哪。
+//
+// 真人看地形看的是**布局**：这边一堵墙、那边有个口子、脚下这块地是挖过的。
+// 布局是二维的，二维的东西只能拿图喂，文字描述还原不了。
+//
+// 所以这里生成三张图 + 两张剖面，再让模型自己把图"看成人话"：
+//   · 俯视切片：你脚下这一层的材质（通道、墙、水、坑都在这层）
+//   · 高差图  ：每个格子比你脚底高/低几格（"哪边能过去"靠这张）
+//   · 实体图  ：谁站在哪一格（被围住的时候一眼就看见）
+//   · 剖面    ：东西向 / 南北向各一刀（头顶压不压、前面通不通）
+//
+// 图 + 原始数字一起给模型，让它自己说"这像什么"—— 表格换不出这个。
+
+const SIGHT = {
+  R: 8,            // 俯视半宽 -> 17x17（取奇数才能让 @ 真的居中）
+  HALF: 6,         // 剖面半宽
+  UP: 4,           // 剖面向上看几格
+  DOWN: 7,         // 剖面向下看几格
+  SCAN_DOWN: 14,       // 材质普查往下扫几格
+  TTL_MS: 30 * 1000,   // 超过 30 秒重算
+  MOVE_BLOCKS: 8,      // 走超过 8 格重算
+  MAX_TOKENS: 2000,    // 不省。实测 800 会被 thinking 吃干，content 空着回来
+  MIN_SCENE_MS: 1500,  // 两次模型调用之间至少隔这么久（防抖，不是省钱）
+  HARD_FLOOR_MS: 15 * 1000, // 硬下限：不管怎么触发，两次模型调用至少隔 15 秒（跑起来时每 5 秒就过期一次）
+  FAIL_BACKOFF_MS: 90 * 1000
+}
+
+const LEGEND = '@你 ▓石头/实心 ▒土沙砾 ░空气 ≈水 !岩浆 T树干 t树叶 O矿 ' +
+  '*光源 C箱子/台 =门梯栅栏 #基岩/黑曜 +人造方块(木板/圆石/砖) ?看不清'
+
+/**
+ * 一个方块 -> 一个字符。
+ *
+ * 【为什么用字符而不是首字母】图是要"看"的：▓ 和 ░ 一眼能分出实心和空，
+ * s 和 a 不行。而且一行 17 个字符，模型读起来就是一幅画。
+ *
+ * 【+ 人造方块 是故意的】"这面墙看着是自己垒的"这句话的信息量全在这个字符上。
+ * cobblestone / planks / 砖 和天然 stone 必须能分开。
+ */
+function symOf (b) {
+  if (b === null || b === undefined) return '?'   // 区块没加载：看不见，不是空气
+  const n = b.name
+  if (!n) return '?'
+  if (n === 'air' || n === 'cave_air' || n === 'void_air') return '░'
+  if (n.includes('water') || n === 'bubble_column' || n === 'kelp' ||
+      n === 'seagrass' || n === 'tall_seagrass' || n === 'ice' || n === 'frosted_ice') return '≈'
+  if (n.includes('lava') || n === 'magma_block') return '!'
+  if (/(^|_)log$/.test(n) || /_wood$|hyphae$/.test(n)) return 'T'
+  if (n.includes('leaves') || n === 'azalea' || n === 'flowering_azalea') return 't'
+  if (n.includes('torch') || n.includes('lantern') || n.includes('candle') ||
+      n === 'glowstone' || n.includes('froglight') || n === 'shroomlight' ||
+      n === 'sea_lantern' || n === 'campfire' || n === 'soul_campfire' ||
+      n === 'fire' || n === 'soul_fire' || n === 'jack_o_lantern') return '*'
+  if (n.includes('chest') || n.includes('barrel') || n === 'crafting_table' ||
+      n.includes('furnace') || n === 'anvil' || n === 'smithing_table' ||
+      n === 'enchanting_table' || n === 'brewing_stand' || n === 'hopper' ||
+      n === 'dispenser' || n === 'dropper' || n === 'lectern' ||
+      n === 'stonecutter' || n === 'cartography_table' || n === 'fletching_table' ||
+      n === 'loom' || n === 'grindstone' || n === 'beacon' || n === 'conduit') return 'C'
+  if (n.includes('door') || n.includes('fence') || n === 'ladder' ||
+      n.includes('rail') || n === 'scaffolding' || n.includes('trapdoor') ||
+      n.includes('_gate') || n === 'vine' || n === 'cobweb' ||
+      n === 'chain' || n === 'iron_bars') return '='
+  if (n === 'bedrock' || n === 'obsidian' || n === 'crying_obsidian' ||
+      n === 'barrier' || n === 'end_portal_frame') return '#'
+  if (n.includes('ore') || n === 'ancient_debris') return 'O'
+  // 人造：玩家放下去的东西。圆石算 —— 天然圆石极少，出现在墙里基本都是人垒的
+  if (/planks$|_bricks?$|_tiles?$|concrete|terracotta|wool$|glass$|_glass|_slab$|_stairs$/i.test(n) ||
+      n === 'cobblestone' || n === 'mossy_cobblestone' || n === 'cobbled_deepslate' ||
+      n === 'smooth_stone' || n === 'polished_andesite' || n === 'polished_granite' ||
+      n === 'polished_diorite' || n === 'chiseled_stone_bricks' || n === 'quartz_block' ||
+      n === 'white_concrete' || n === 'hay_block' || n === 'bookshelf') return '+'
+  if (/dirt|grass_block|sand|gravel|clay|podzol|mycelium|mud$|snow|farmland|soul_soil|rooted_dirt|moss_block|sculk|netherrack|soul_sand|_nylium/.test(n)) return '▒'
+  return '▓'
+}
+
+/** 这个方块算不算"挡路"（实心） */
+function solidOf (b) {
+  if (!b) return false
+  return b.boundingBox === 'block'
+}
+
+/**
+ * 高差图的一个字符。
+ *
+ * @param {number|null} dy  往下扫到的第一个实心方块相对脚底的行数（-1 = 脚底那块）
+ * @param {boolean} blind   这一列从头到尾都读不到
+ *
+ * 约定（图例里也写了）：
+ *   0   和你脚底同高（能走）
+ *   1   高出一格（要跳/要挖）
+ *   #   到头顶那格就是实心 —— 挡路或者压顶
+ *   .   低一格     ,  低两格     -  低三格以上
+ *   _   这一列一直到底都没东西（洞/悬崖）
+ *   ?   看不清（区块没加载）
+ */
+function groundChar (dy, blind) {
+  if (dy === null) return blind ? '?' : '_'
+  if (dy === 1) return '#'
+  const rel = dy + 1
+  if (rel === 0) return '0'
+  if (rel > 0) return String(Math.min(rel, 6))
+  if (rel === -1) return '.'
+  if (rel === -2) return ','
+  return '-'
+}
+
+
+/**
+ * 模型的输出收一下，别把坐标/数量带进来。
+ * 只做"明显违反要求"的清理，不过度删改 —— 句子是它自己的。
+ */
+function cleanScene (t) {
+  let s = String(t || '')
+  s = s.replace(/\r/g, '')
+  s = s.replace(/```[\s\S]*?```/g, ' ')
+  s = s.replace(/^【[^】]{0,12}】\s*/gm, '')       // 它自己加的标题
+  s = s.replace(/\b[xX]\s*[=:]\s*-?\d+/g, '')     // 坐标
+  s = s.replace(/\b[zZ]\s*[=:]\s*-?\d+/g, '')
+  s = s.replace(/\(?-?\d{1,3}\s*,\s*-?\d{1,3}\s*,\s*-?\d{1,3}\)?/g, '')  // (x,y,z)
+  s = s.replace(/\d{2,}\s*个/g, '很多')            // 「173 个石头」
+  s = s.split('\n').map(x => x.trim()).filter(Boolean).join('\n')
+  // 最多留 6 句 —— 再长就不是"看一眼"了
+  const parts = s.split(/(?<=[。！？!?])/).filter(x => x.trim())
+  if (parts.length > 6) s = parts.slice(0, 6).join('')
+  return s.trim()
+}
+
 class Perception {
   constructor (bot, ctx) {
     this.bot = bot
-    this.ctx = ctx          // { mem, events }
+    this.ctx = ctx || {}    // { mem, events, llm, log }
+    this.mem = this.ctx.mem
+    this.events = this.ctx.events
+    this.llm = this.ctx.llm || null
+    this.log = this.ctx.log || (() => {})
     this.lastPos = null
     this.lastScanAt = 0
+
+    // ---- 视觉缓存 ----
+    // 地形变化慢。每 tick 调一次模型纯属浪费，而且没必要 —— 30 秒内世界不长草。
+    this.sight = {
+      map: null,          // { text, at, pos, y, underground, blind }
+      mapDirty: true,     // 周围方块变了
+      scene: '',          // 模型说的那几句人话
+      sceneAt: 0,
+      scenePos: null,
+      inflight: false,
+      failAt: 0,
+      lastCallAt: 0,
+      // 记账（验收要用，不是装饰）
+      reads: 0,           // 被问了几次"你看见什么"
+      hits: 0,            // 其中几次直接给了缓存
+      calls: 0,           // 真正调了几次模型
+      fails: 0,
+      tokens: { prompt: 0, completion: 0 },
+      lastMs: 0,
+      lastErr: null,
+      callsLog: []        // [{at, why, ms, prompt, completion, text}]
+    }
+    this._timer = null
+    this._onBlock = null
+    this._onEnd = null
+
+    // 有 llm 就自己起来看 —— wiring 只需要多传这一个字段，
+    // 不用谁记得每 tick 来喂。（探针/测试传 ctx.autoStart=false 关掉）
+    if (!this.llm) {
+      this.log('[sight] 没拿到 llm —— 只出图，不说话。main.js 要传 llm: this.llm')
+    }
+    if (this.ctx.autoStart !== false && this.llm && this.bot) {
+      const t = setTimeout(() => { try { this.start() } catch (e) {} }, 3000)
+      if (t.unref) t.unref()
+    }
+  }
+
+  // ============ 生命周期 ============
+
+  /**
+   * 起来自己看。
+   *
+   * wiring 只需要传一个 llm 字段，剩下的自己动 —— 不用谁记得每 tick 来喂。
+   * （有 llm 才起；没有 llm 就只出图，图本身也是"看见"。）
+   */
+  start (opts = {}) {
+    if (this._timer) return false
+    if (!this.bot) return false
+
+    // 方块变了就标脏（挖了 / 放了 / 别人在旁边盖房子）
+    this._onBlock = (oldBlock, newBlock) => {
+      try {
+        const p = this.pos()
+        if (!p) return
+        const b = newBlock && newBlock.position
+        if (!b) return
+        const dx = b.x - p.x
+        const dz = b.z - p.z
+        if (Math.abs(dx) <= SIGHT.R + 1 && Math.abs(dz) <= SIGHT.R + 1 &&
+            Math.abs(b.y - p.y) <= 12) {
+          this.sight.mapDirty = true
+        }
+      } catch (e) {}
+    }
+    try { this.bot.on('blockUpdate', this._onBlock) } catch (e) {}
+
+    this._onEnd = () => { this.sight.mapDirty = true; this.sight.scene = '' }
+    try { this.bot.once('end', this._onEnd) } catch (e) {}
+
+    // 5 秒一看：够快（他走动后 5 秒内就有新图），又不至于空转
+    if (opts.timer !== false) {
+      this._timer = setInterval(() => { this._tick() }, 5000)
+      if (this._timer.unref) this._timer.unref()
+      // 第一张图别等 5 秒
+      const t = setTimeout(() => { this._tick() }, 2500)
+      if (t.unref) t.unref()
+    }
+    return true
+  }
+
+  stop () {
+    if (this._timer) { clearInterval(this._timer); this._timer = null }
+    try { if (this._onBlock) this.bot.removeListener('blockUpdate', this._onBlock) } catch (e) {}
+    this._onBlock = null
+  }
+
+  _tick () {
+    if (!this.canSee()) return
+    // 后台刷新：不 await，错了就等下一次
+    this.ensureScene({ why: 'tick' }).catch(e => {
+      this.log('[sight] ' + (e && e.message))
+    })
   }
 
   // ---------------- 基础工具 ----------------
@@ -527,6 +756,489 @@ class Perception {
     return bits.join('，')
   }
 
+  // ============ 视觉：三张图 + 两刀剖面 ============
+
+  /**
+   * 建一次网格。17x17 三个层 + 两条剖面，约 5000 次 blockAt。
+   * 30 秒最多一次，忽略不计。
+   */
+  _grid () {
+    const p = this.pos()
+    if (!p) return null
+    const R = SIGHT.R
+    const fx = Math.floor(p.x)
+    const fy = Math.floor(p.y)       // 脚所在的那一格
+    const fz = Math.floor(p.z)
+    const base = new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
+    const N = base
+    const at = (dx, dy, dz) => this.blockAt(N.offset(dx, dy, dz))
+
+    const view = []     // [dz][dx] 俯视合成图：挡路的看材质，空着的看地面
+    const ground = []   // [dz][dx] 高差字符
+    const ent = []      // [dz][dx] 实体层
+    const feat = { man: 0, light: 0, table: 0, water: 0, lava: 0, ore: 0, tree: 0, door: 0 }
+    const manAt = { x: 0, z: 0 }
+    let blind = 0
+    let cells = 0
+
+    for (let dz = -R; dz <= R; dz++) {
+      const rowV = []
+      const rowG = []
+      for (let dx = -R; dx <= R; dx++) {
+        cells++
+        const bFeet = at(dx, 0, dz)       // 身体那格：实心就是挡路的（墙/树/箱子）
+        if (!bFeet) blind++
+        // 脚下这格：往下找第一块实心。坡地上 feet-1 是空气，
+        // 死盯这一层会让整张图变成 ░（第一版就是这么错的，实测整片草地看不见）
+        let bFloor = null
+        for (let dy = -1; dy >= -4; dy--) {
+          const b = at(dx, dy, dz)
+          if (!b) continue
+          if (solidOf(b) || b.name.includes('water') || b.name.includes('lava')) { bFloor = b; break }
+        }
+
+        // ① 合成俯视：挡路的显示它自己的材质，空着的显示脚下是什么
+        let c
+        if (bFeet && bFeet.boundingBox === 'block') c = symOf(bFeet)
+        else if (bFeet && (bFeet.name.includes('water') || bFeet.name.includes('lava'))) c = symOf(bFeet)
+        else c = symOf(bFloor)
+        if (dx === 0 && dz === 0) c = '@'
+        rowV.push(c)
+
+        // ② 高差（第一块实心）+ 顺手做一遍 3D 材质普查
+        //    普查是"这墙是圆石补的""这里有矿"的唯一来源 —— 只看一层看不出这些
+        let first = null
+        let colBlind = false
+        for (let dy = 1; dy >= -SIGHT.SCAN_DOWN; dy--) {
+          const b = at(dx, dy, dz)
+          if (!b) { colBlind = true; continue }
+          const solid = solidOf(b)
+          if (!solid && !b.name.includes('water') && !b.name.includes('lava')) continue
+          const ch = symOf(b)
+          if (ch === '+') { feat.man++; manAt.x += dx; manAt.z += dz } else if (ch === '*') feat.light++
+          else if (ch === 'C') feat.table++
+          else if (ch === '≈') feat.water++
+          else if (ch === '!') feat.lava++
+          else if (ch === 'O') feat.ore++
+          else if (ch === 'T' || ch === 't') feat.tree++
+          else if (ch === '=') feat.door++
+          if (first === null && solid) first = dy
+        }
+        rowG.push(groundChar(first, colBlind && first === null))
+      }
+      view.push(rowV)
+      ground.push(rowG)
+    }
+
+    // ③ 实体层
+    for (let dz = -R; dz <= R; dz++) ent.push(new Array(2 * R + 1).fill('·'))
+    let entN = 0
+    for (const e of Object.values(this.bot.entities || {})) {
+      if (!e || e === this.bot.entity || !e.position) continue
+      const ex = Math.floor(e.position.x) - fx
+      const ez = Math.floor(e.position.z) - fz
+      const ey = Math.floor(e.position.y) - fy
+      if (Math.abs(ex) > R || Math.abs(ez) > R || Math.abs(ey) > 6) continue
+      ent[ez + R][ex + R] = e.type === 'player' ? '●' : (HOSTILE.has(e.name) ? '▲' : '○')
+      entN++
+    }
+
+    return { view, ground, ent, entN, feat, manAt, fx, fy, fz, blind, cells, p: new Vec3(p.x, p.y, p.z) }
+  }
+
+  /**
+   * 整个"图"块，带上标题和图例。
+   *
+   * @param {{force?:boolean}} opts
+   */
+  mapView (opts = {}) {
+    const now = Date.now()
+    const p = this.pos()
+    if (!p) return { text: '（看不见：还没进游戏，或者刚断线）', at: now, blind: true, pos: null, grid: null }
+
+    const st = this.sight
+    const far = !st.map || !st.map.pos || st.map.pos.distanceTo(p) > SIGHT.MOVE_BLOCKS
+    const old = !st.map || now - st.map.at > SIGHT.TTL_MS
+    if (!opts.force && st.map && !st.mapDirty && !far && !old) return st.map
+
+    let g = null
+    try { g = this._grid() } catch (e) { this.log('[sight] grid: ' + e.message) }
+    if (!g) {
+      const bad = { text: '（地形读不出来，可能刚断线）', at: now, blind: true, pos: new Vec3(p.x, p.y, p.z), grid: null, traces: [] }
+      st.map = bad
+      return bad
+    }
+
+    const L = []
+    L.push(`【图例】${LEGEND}`)
+    L.push(`【俯视图 · 你身上这一层的平面（北在上，@是你，每格 1 方块；${2 * SIGHT.R + 1}x${2 * SIGHT.R + 1}）】`)
+    for (const row of g.view) L.push('  ' + row.join(''))
+    L.push('【高差图 · 每格和你脚底差几格（0 平 1-6 高出来 # 到你头那么高 . 低一格 , 低两格 - 更低 _ 底下是空的 ? 看不见）】')
+    for (const row of g.ground) L.push('  ' + row.join(''))
+    if (g.entN > 0) {
+      L.push('【谁站在哪（▲怪 ●人 ○动物）】')
+      for (const row of g.ent) L.push('  ' + row.join(''))
+    }
+    L.push('')
+    L.push(this._profile(g, 'x'))
+    L.push(this._profile(g, 'z'))
+
+    const blindPct = g.cells ? g.blind / g.cells : 0
+    if (blindPct > 0.4) L.push(`【注意】${Math.round(blindPct * 100)}% 的格子读不到（区块没加载）。图上 '?' 是"看不清"，不是"空气"，别当成通路。`)
+
+    const text = L.join('\n')
+    const rec = {
+      text,
+      at: now,
+      pos: new Vec3(p.x, p.y, p.z),
+      grid: g,
+      fx: g.fx,
+      fy: g.fy,
+      fz: g.fz,
+      blind: blindPct > 0.4,
+      underground: this.isUnderground(),
+      traces: this.traces(g)
+    }
+    st.map = rec
+    st.mapDirty = false
+    return rec
+  }
+
+  /** 一条竖剖面：东西向（x）或南北向（z），过你脚下 */
+  _profile (g, axis) {
+    const half = SIGHT.HALF
+    const up = SIGHT.UP
+    const down = SIGHT.DOWN
+    const p = this.pos()
+    const head = axis === 'x' ? '【侧视图 · 东西向（左西右东）】' : '【侧视图 · 南北向（左北右南）】'
+    const out = [head]
+    for (let dy = up; dy >= -down; dy--) {
+      let row = ''
+      for (let d = -half; d <= half; d++) {
+        const b = axis === 'x' ? this.blockAt(p.offset(d, dy, 0)) : this.blockAt(p.offset(0, dy, d))
+        let c = symOf(b)
+        if (d === 0 && dy === 0) c = '@'
+        else if (d === 0 && dy === 1) c = 'Y'     // 你的身体（头）
+        row += c
+      }
+      out.push(`y=${Math.floor(p.y) + dy}`.padEnd(8) + ' ' + row)
+    }
+    return out.join('\n')
+  }
+
+  /**
+   * 痕迹 —— "这里被人挖过""这墙是补的""有人在这干过活"。
+   *
+   * 这一段是"注意到"的核心：数字表永远说不出这些，
+   * 因为它们不是"有什么"，是"哪里不对劲"。
+   */
+  traces (g) {
+    if (!g) return []
+    const R = SIGHT.R
+    const out = []
+    const dirAt = (dx, dz) => this.dirOf(dx, dz)
+    const cellOf = (arr, dx, dz) => (arr[dz + R] ? arr[dz + R][dx + R] : '?')
+
+    // ① 一格宽的长通道：人挖的矿道 / 走廊
+    //    判断：这条线上能过（0 / . / ,），南北两边都堵着 -> 东西向走廊
+    const pass = c => c === '0' || c === '.' || c === ','
+    let tunnel = null
+    for (let dz = -R + 1; dz <= R - 1 && !tunnel; dz++) {
+      let run = 0
+      let best = 0
+      let atX = 0
+      for (let dx = -R + 1; dx <= R - 1; dx++) {
+        const c = cellOf(g.ground, dx, dz)
+        const n = cellOf(g.ground, dx, dz - 1)
+        const s = cellOf(g.ground, dx, dz + 1)
+        if (pass(c) && !pass(n) && !pass(s)) {
+          run++
+          if (run > best) { best = run; atX = dx }
+        } else run = 0
+      }
+      if (best >= 6) tunnel = `一条笔直的一格宽通道，在${dirAt(atX, dz)}边延伸出去`
+    }
+    if (!tunnel) {
+      for (let dx = -R + 1; dx <= R - 1 && !tunnel; dx++) {
+        let run = 0
+        let best = 0
+        let atZ = 0
+        for (let dz = -R + 1; dz <= R - 1; dz++) {
+          const c = cellOf(g.ground, dx, dz)
+          const w = cellOf(g.ground, dx - 1, dz)
+          const e = cellOf(g.ground, dx + 1, dz)
+          if (pass(c) && !pass(w) && !pass(e)) {
+            run++
+            if (run > best) { best = run; atZ = dz }
+          } else run = 0
+        }
+        if (best >= 6) tunnel = `一条笔直的一格宽通道，在${dirAt(dx, atZ)}边延伸出去`
+      }
+    }
+    if (tunnel) out.push(tunnel)
+
+    // ② 挡路的实心：墙 / 山体 / 洞壁
+    let wall = 0
+    let wx = 0
+    let wz = 0
+    // 只数内圈：地图最外两圈基本都是"视野边缘的石头"，会把方向带偏
+    const Ri = R - 2
+    for (let dz = -Ri; dz <= Ri; dz++) {
+      for (let dx = -Ri; dx <= Ri; dx++) {
+        if (cellOf(g.ground, dx, dz) === '#') { wall++; wx += dx; wz += dz }
+      }
+    }
+    const wallPct = g.cells ? wall / g.cells : 0
+    if (wallPct > 0.55) out.push('四周基本都堵着，你像是待在一条通道或者洞里')
+    else if (wall >= 8) out.push(`${dirAt(wx / wall, wz / wall)}边有一片到头的实心，像墙或者山体`)
+
+    // ③ 脚边的坑 / 断崖
+    let drop = 0
+    for (const [name, dx, dz] of [['北', 0, -1], ['南', 0, 1], ['东', 1, 0], ['西', -1, 0]]) {
+      for (let d = 1; d <= 3; d++) {
+        const c = cellOf(g.ground, dx * d, dz * d)
+        if (c === '-' || c === '_') { out.push(`${name}边三格内是个坑，踩空会掉下去`); drop++; break }
+      }
+      if (drop >= 2) break
+    }
+
+    // ④ 人造方块：补过的墙、垒过的东西
+    if (g.feat.man >= 8) {
+      const m = g.feat.man
+      const dx = g.manAt.x / m
+      const dz = g.manAt.z / m
+      out.push(`${dirAt(dx, dz)}边有一片砌过的方块（圆石/木板/砖那类），看着是人垒的`)
+    }
+
+    // ⑤ 有人在这干过活
+    if (g.feat.light && g.feat.table) out.push('插着火把、还摆着工作台或箱子，有人在这住过或者常来')
+    else if (g.feat.table) out.push('附近有箱子或工作台，有人在这收拾过')
+    else if (g.feat.light) out.push('附近有火把，有人来过')
+
+    // ⑥ 水 / 岩浆
+    if (g.feat.lava > 0) out.push('有岩浆，别掉进去')
+    else if (g.feat.water > 0) out.push('附近有水')
+
+    // ⑦ 树 / 矿
+    if (g.feat.tree > 0) out.push('附近有树')
+    if (g.feat.ore >= 4) out.push('眼前的石头里有矿露出来')
+
+    // ⑧ 头顶压不压
+    const p = this.pos()
+    if (p) {
+      const head2 = this.blockAt(p.offset(0, 2, 0))
+      const head3 = this.blockAt(p.offset(0, 3, 0))
+      if ((head2 && solidOf(head2)) || (head3 && solidOf(head3))) out.push('头顶很低，两层之内就压着石头，得低头走')
+    }
+
+    return out.slice(0, 6)
+  }
+
+  // ============ 让模型把图说成人话 ============
+
+  /** 缓存还有效吗（三个条件：没走远 / 没变过 / 没超时） */
+  sceneFresh (p) {
+    const st = this.sight
+    if (!st.scene) return false
+    if (st.mapDirty) return false
+    if (Date.now() - st.sceneAt > SIGHT.TTL_MS) return false
+    if (!st.scenePos || !p) return false
+    if (st.scenePos.distanceTo(p) > SIGHT.MOVE_BLOCKS) return false
+    return true
+  }
+
+  /** 同步读上一次的景象。说话/做决定的地方用这个 —— 不能等模型。 */
+  sceneText () {
+    const p = this.pos()
+    if (!this.sight.scene) return ''
+    if (!this.sceneFresh(p)) {
+      // 过期了也先给旧的：旧的景象比没有强，后台马上会换新的
+      return this.sight.scene
+    }
+    return this.sight.scene
+  }
+
+  /**
+   * 确保有一份新鲜的景象。有缓存就不调模型。
+   *
+   * @param {{force?:boolean, why?:string}} opts
+   * @returns {Promise<string>} 那几句人话（或图，没有 llm 时）
+   */
+  async ensureScene (opts = {}) {
+    const st = this.sight
+    st.reads++
+    const p = this.pos()
+    if (!p || !this.canSee()) { st.hits++; return st.scene || '' }
+
+    const fresh = this.sceneFresh(p)
+    if (fresh && !opts.force) { st.hits++; return st.scene }
+    if (st.inflight) { st.hits++; return st.scene || '' }
+    // 去抖只拦"刚刚算过"（防同一个 tick 里连着打）——
+    // 原来这里拦的是 nextTryAt，结果"走远 9 格该重算"被 4 秒去抖吃掉了（实测）。
+    if (!opts.force && st.sceneAt && Date.now() - st.sceneAt < SIGHT.MIN_SCENE_MS) {
+      st.hits++
+      return st.scene || ''
+    }
+    // 失败退避
+    if (!opts.force && st.failAt && Date.now() - st.failAt < SIGHT.FAIL_BACKOFF_MS) {
+      st.hits++
+      return st.scene || ''
+    }
+    // 硬下限：冲刺的时候 5 秒就走出 28 格，"走远 8 格就重算"每 tick 都成立 ——
+    // 那不叫感知，那叫烧 token。15 秒一次封顶，期间先给上一眼。
+    if (!opts.force && st.lastCallAt && Date.now() - st.lastCallAt < SIGHT.HARD_FLOOR_MS) {
+      st.hits++
+      return st.scene || ''
+    }
+
+    const map = this.mapView({ force: opts.forceMap })
+    if (!this.llm) {
+      // 没有模型：图本身就是"看见"。不说话，但也不瞎。
+      st.hits++
+      st.scene = ''
+      st.sceneAt = Date.now()
+      st.scenePos = new Vec3(p.x, p.y, p.z)
+      return map.text
+    }
+
+    st.inflight = true
+    st.lastCallAt = Date.now()
+    const t0 = Date.now()
+    const why = opts.why || 'ask'
+    try {
+      const prompt = this._scenePrompt(map, p)
+      const msgs = [{ role: 'user', content: prompt }]
+      let r = await this.llm.chat(msgs, { maxTokens: SIGHT.MAX_TOKENS, temperature: 1.0 })
+      let usage = (r.raw && r.raw.usage) || {}
+      let text = cleanScene(r.text)
+
+      // 【实测 · 2026-11-14】这个端点默认开着 thinking，reasoning 也算在
+      // completion_tokens 里。800 的预算会被思考吃干，content 空着回来
+      // （finish=length，usage 800/800）。所以预算拉到 2000；
+      // 万一还是被吃干，再加一档重试一次 —— 宁可多花 token，不许"看不见"。
+      if (!text && r.finish === 'length') {
+        const retry = await this.llm.chat(msgs, { maxTokens: SIGHT.MAX_TOKENS * 2, temperature: 1.0 })
+        const u2 = (retry.raw && retry.raw.usage) || {}
+        usage = {
+          prompt_tokens: (usage.prompt_tokens || 0) + (u2.prompt_tokens || 0),
+          completion_tokens: (usage.completion_tokens || 0) + (u2.completion_tokens || 0)
+        }
+        r = retry
+        text = cleanScene(retry.text)
+      }
+      const ms = Date.now() - t0
+
+      st.calls++
+      st.tokens.prompt += usage.prompt_tokens || 0
+      st.tokens.completion += usage.completion_tokens || 0
+      st.lastMs = ms
+      if (text) {
+        st.scene = text
+        st.sceneAt = Date.now()
+        st.scenePos = new Vec3(p.x, p.y, p.z)
+      } else {
+        st.fails++
+        st.failAt = Date.now()
+        st.lastErr = 'empty content（finish=' + r.finish + '）'
+      }
+      st.callsLog.push({
+        at: Date.now(),
+        why,
+        ms,
+        prompt: usage.prompt_tokens || 0,
+        completion: usage.completion_tokens || 0,
+        text: String(text || '').slice(0, 60)
+      })
+      if (st.callsLog.length > 30) st.callsLog.shift()
+      this.log(`[sight] 看了一次（${why}）：${ms}ms，${usage.prompt_tokens || 0}+${usage.completion_tokens || 0} tok`)
+      return st.scene
+    } catch (e) {
+      st.fails++
+      st.failAt = Date.now()
+      st.lastErr = String(e && e.message || e).slice(0, 120)
+      this.log('[sight] 看失败：' + st.lastErr)
+      return st.scene || map.text
+    } finally {
+      st.inflight = false
+    }
+  }
+
+  /** 给模型看的那段话。图和原始数据都给它，让它自己判断什么重要。 */
+  _scenePrompt (map, p) {
+    const g = map.grid
+    const bits = []
+    bits.push('你在玩 Minecraft。下面是你此刻"看到"的东西 —— 不是让你算的，是让你看的。')
+    bits.push('')
+    bits.push(map.text)
+    bits.push('')
+
+    // 原始数据：保留，但只是底料
+    const raw = []
+    try { raw.push('周围的东西：' + this.describeNearby(24, 6)) } catch (e) {}
+    try { raw.push('人：' + this.describePeople(48)) } catch (e) {}
+    try {
+      const t = this.describeThreats(20, 4)
+      if (t) raw.push('怪：' + t)
+    } catch (e) {}
+    if (raw.length) {
+      bits.push('【原始数据（底料，别照抄）】')
+      bits.push(raw.join('\n'))
+      bits.push('')
+    }
+
+    const tr = map.traces || []
+    if (tr.length) {
+      bits.push('【已经注意到的痕迹（可以采纳，也可以推翻）】')
+      bits.push(tr.map(x => '- ' + x).join('\n'))
+      bits.push('')
+    }
+
+    const where = []
+    where.push(map.underground === true ? '你在地下' : map.underground === false ? '你在地面上' : '你在哪看不清楚')
+    try {
+      const tod = this.bot.time && this.bot.time.timeOfDay
+      if (tod != null) where.push(tod < 12000 ? '白天' : tod < 13800 ? '天快黑了' : tod < 22200 ? '夜里' : '天快亮了')
+      if (this.bot.isRaining) where.push('在下雨')
+    } catch (e) {}
+    try {
+      const below = this.blockAt(this.pos().offset(0, -1, 0))
+      if (below) where.push('脚下是' + (INTERESTING[below.name] || groundWord(below.name)))
+    } catch (e) {}
+    if (map.traces && map.traces.some(t => /火把|箱子/.test(t))) where.push('这地方有人活动过')
+    bits.push('【现在的处境】' + where.join('，'))
+
+    bits.push('')
+    bits.push('用 3-5 句话描述你看到的景象：')
+    bits.push('- 说"这像什么"：一堵墙 / 一条走廊 / 一个院子 / 一段矿道 / 一片林子 / 一个坑')
+    bits.push('- 说有没有路可走、往哪边走，哪边不对劲、哪里可能出事')
+    bits.push('- 不要报坐标，不要报数量（别说"有 173 个石头"，说"这边全是石头"）')
+    bits.push('- 不要念方块英文名，不要用列表，不要写"根据图"、"图中显示"这种话')
+    bits.push('- 像一个人站在那抬眼扫了一圈，心里过的一句话')
+    bits.push('- 例子：「前面一堵石墙，看着是自己垒的。左边有个口子能过去。脚下这块地挖过，石头是新的断口。」')
+    return bits.join('\n')
+  }
+
+  /**
+   * 一次给足的"你看见什么"：景象 + 图。
+   * 给 goals / 任务上下文用 —— 那两处要图也要话。
+   */
+  sightBlock (opts = {}) {
+    const map = this.mapView(opts)
+    const parts = []
+    const scene = this.sceneText()
+    if (scene) parts.push('【景象】' + scene.replace(/\n/g, ''))
+    parts.push(map.text)
+    const tr = map.traces || []
+    if (tr.length) parts.push('【痕迹】' + tr.join('；'))
+    return parts.join('\n')
+  }
+
+  /** 只要那几句人话。给 contextForTask 里已经有图的地方用。 */
+  sightLine () {
+    const s = this.sceneText()
+    return s ? '【景象】' + s.replace(/\n/g, '') : ''
+  }
+
   // ---------------- 汇总 ----------------
 
   /**
@@ -547,6 +1259,13 @@ class Perception {
     const self = safe(() => this.describeSelf(), '（自己状态读不到）')
 
     const lines = []
+    // 【景象】排第一 —— 这是"他看见世界"的那一眼，比任何计数都重要
+    const sight = safe(() => this.sightLine(), '')
+    if (sight) lines.push(sight)
+    if (opts.map !== false) {
+      const mv = safe(() => this.mapView(opts), null)
+      if (mv && mv.text) lines.push(mv.text)
+    }
     lines.push(`【你在哪】${terrain}`)
     lines.push(`【附近】${nearby}`)
     if (threats) lines.push(`【有威胁】${threats}`)
@@ -563,19 +1282,22 @@ class Perception {
     return lines.join('\n')
   }
 
-  /** 简版快照，给需要省 token 的地方用 */
+  /** 简版快照，说话用。图上不进来，但那几句"人话"必须进来。 */
   brief () {
     const safe = (fn, fallback) => {
       try { return fn() } catch (e) { return fallback }
     }
     const lines = []
+    // 自己的状态排第一：persona.dangerOf 靠这行判危险等级（血 18/20）
+    lines.push(safe(() => this.describeSelf(), '状态读不到'))
+    const sight = safe(() => this.sightLine(), '')
+    if (sight) lines.push(sight)
     lines.push(safe(() => this.describeTerrain(), '不知道自己在哪'))
     const threats = safe(() => this.describeThreats(14, 3), '')
     if (threats) lines.push('威胁：' + threats)
     const people = safe(() => this.describePeople(32), '看不清')
     lines.push('人：' + people)
-    lines.push(safe(() => this.describeSelf(), '状态读不到'))
-    return lines.join('；')
+    return lines.join('\n')
   }
 }
 

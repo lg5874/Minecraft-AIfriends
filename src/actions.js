@@ -182,6 +182,23 @@ class Actions {
     }, 50)
     if (this._fallTimer.unref) this._fallTimer.unref()
 
+    // 【摔死修复 · 2026-11-14 07:20】悬崖边禁止后退。
+    //
+    // 实测 death chain（supervisor.log）：
+    //   [07:14:50] [reflex] 3 秒内掉 6 血 —— 被 mob_attack，先退开 2 格 + 跳一下
+    //   [07:14:53] [act] [fall] 落差 31.3 格：y 69→38 @ 71,2
+    //   [07:14:53] [death] 摔死了（来源：damage_event / fall）
+    // 另一条同理：07:13:35 退开 -> 07:13:38 35.3 格 -> 死。
+    //
+    // reflex 的 recoil 是「back + jump 420ms」，**没有落点检查**（那是 reflex.js，
+    // 不归我改）。人在崖边被怪打一下，一后退就是 30 格自由落体。
+    // 这里在 actions 的 50ms 计时器里做最后一道闸：只有在按着 back、
+    // 且正后方是一个 >3 格的坑时才松手。pathfinder 不用 back 键，不影响寻路。
+    this._edgeTimer = setInterval(() => {
+      try { this._guardEdgeControls() } catch (e) {}
+    }, 50)
+    if (this._edgeTimer.unref) this._edgeTimer.unref()
+
     // 静默看门狗：150 秒没有任何 [act] 日志 = 可能又挂死在某个 await 上。
     // Promise 没有取消，救不回来；但至少把「看起来在发呆」变成一条能查的日志。
     this._stallTimer = setInterval(() => {
@@ -214,6 +231,33 @@ class Actions {
     if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null }
     if (this._fallTimer) { clearInterval(this._fallTimer); this._fallTimer = null }
     if (this._stallTimer) { clearInterval(this._stallTimer); this._stallTimer = null }
+    if (this._edgeTimer) { clearInterval(this._edgeTimer); this._edgeTimer = null }
+  }
+
+  /**
+   * 悬崖边禁止后退（reflex 的 recoil 会盲按 back，实测把它推下 31/35 格深沟）。
+   * 只在「正按着 back」且「正后方是 >3 格落差」时松手，其余一律不干预。
+   */
+  _guardEdgeControls () {
+    const bot = this.bot
+    const e = bot && bot.entity
+    if (!e || !e.position) return
+    const c = bot.controlState
+    if (!c || !c.back) return
+    const p = e.position
+    const yaw = e.yaw || 0
+    // forward = (-sin yaw, -cos yaw)  ->  backward = (+sin yaw, +cos yaw)
+    const bx = Math.round(Math.sin(yaw))
+    const bz = Math.round(Math.cos(yaw))
+    if (!bx && !bz) return
+    const drop = this.dropBelow(Math.floor(p.x) + bx, p.y, Math.floor(p.z) + bz, 6)
+    if (drop >= 0 && drop <= SAFE_DROP) return
+    try { bot.setControlState('back', false) } catch (e2) {}
+    const now = Date.now()
+    if (now - (this._ledgeLogAt || 0) > 3000) {
+      this._ledgeLogAt = now
+      this.log(`[ledge] 正后方 ${drop < 0 ? '探不到底' : drop + ' 格深'}，取消后退（别摔下去）`)
+    }
   }
 
   /**
@@ -7539,7 +7583,9 @@ class Actions {
     // 0. 背包里有能吃的
     //    注意：饱食度满（20）时 bot.consume() 会直接抛 'Food is full'，
     //    所以这里先判断"有没有存货"，有存货且不饿就直接算成功。
-    if (this.hasFood()) {
+    // 【腐肉降档】只认正经食物：只有腐肉时不算"已经有吃的"，
+    // 继续往下找猪/牛/浆果/鱼；实在找不到，第 6 步才吃腐肉。
+    if (this.hasRealFood()) {
       if (this.bot.food < 20) {
         const ate = await this.eat()
         if (ate) return '吃了背包里的 ' + ate
@@ -7644,7 +7690,7 @@ class Actions {
       if (it && edible) return '拿到 ' + rawName + ' x' + it.count
 
       // 生海带没烤成：如果背包里已经有别的可吃的，就报那个
-      if (this.hasFood()) {
+      if (this.hasRealFood()) {
         const f = this.foodList()[0]
         if (f) return '拿到 ' + f.name + ' x' + f.count
       }
@@ -7952,14 +7998,23 @@ class Actions {
     }
 
     // 6. 最后兜底：地上有没有现成的可食物品（别人打怪掉的腐肉等）
-    //    探针里见过 `rotten_flesh x1` 就是僵尸掉落 —— 饿的时候是保命食物。
-    //    _edible() 里腐肉的分数被压得很低，但"有"总比"没有"强。
+    //    _edible() 默认不认腐肉（80% 中饥饿），所以这里分两档：
+    //    先认正经食物；实在没有，再把腐肉当保命粮吃下去，并说清原因。
     if (left() > 3000) {
       try {
         await this.pickupNearby(10)
-        if (this.hasFood()) {
+        if (this.hasRealFood()) {
           const f = this.foodList()[0]
           if (f) return '捡到 ' + f.name + ' x' + f.count
+        }
+        if (this.hasAnyFood()) {
+          const f = this.foodList({ poisonOk: true })[0]
+          const ate = await this.eat()
+          if (ate) {
+            this.log('[food] 正经食物找不到，只剩腐肉了：先垫一口（会中饥饿，别当正经饭）')
+            return '只好吃了 ' + ate + '（腐肉，最后一档）'
+          }
+          if (f) return '只剩 ' + f.name + ' x' + f.count + '（腐肉，最后一档）'
         }
       } catch (e) {}
     }
@@ -8138,10 +8193,17 @@ class Actions {
    * eat 又额外排除 suspicious_stew —— 三处口径不一致，
    * 会出现"hasFood 说没有、foodList 说有一堆、eat 一个都不吃"的死循环。
    */
-  _edible (name) {
+  _edible (name, opts = {}) {
     const f = mcData.foodsByName[name]
     if (!f || !f.foodPoints) return null
     if (/poisonous_potato|pufferfish|spider_eye|suspicious_stew/.test(name)) return null
+    // 【腐肉降档 · 2026-11-14 07:40】1.21 里 rotten_flesh 是 food=4/sat=1.6，
+    // 但有 80% 概率给 30 秒「饥饿」—— 越吃越饿，等于白吃。
+    // 它必须**不算"有吃的"**，否则 findFood 第 0 步直接收工：
+    //   hasFood() -> true -> return '背包里已经有 rotten_flesh'
+    // 主循环就永远不去找正经食物，血也回不来。
+    // 但要保留"最后一档"：0.6 节的兜底会用 { poisonOk: true } 把它当保命粮。
+    if (!opts.poisonOk && /rotten_flesh/.test(name)) return null
     return f
   }
 
@@ -8150,15 +8212,33 @@ class Actions {
     try { return this.bot.inventory.items().some(i => /_pickaxe$/.test(i.name)) } catch (e) { return false }
   }
 
+  /**
+   * 背包里有没有能吃的。
+   *
+   * 口径分两档（2026-11-14）：
+   *   hasFood()      —— 旧口径：腐肉也算（main.js/reflex 的"饿了就吃"靠它，
+   *                     不能改语义，否则它们会在 hunger 18 就不吃了）
+   *   hasRealFood()  —— 只认正经食物：findFood 的"找到吃的"判据用它，
+   *                     别让一块腐肉把搜索提前收工
+   *   hasAnyFood()   —— 同 hasFood()，最后一档保命粮
+   */
   hasFood () {
+    return this.bot.inventory.items().some(i => !!this._edible(i.name, { poisonOk: true }))
+  }
+
+  /** 只认正经食物（腐肉不算）。findFood 第 0 步用它，别被一块腐肉骗住。 */
+  hasRealFood () {
     return this.bot.inventory.items().some(i => !!this._edible(i.name))
   }
 
+  /** 连腐肉都算上 —— 只在"实在没别的"的最后一档用。 */
+  hasAnyFood () { return this.hasFood() }
+
   /** 背包里所有能吃的东西，按好坏排 */
-  foodList () {
+  foodList (opts = {}) {
     const out = []
     for (const it of this.bot.inventory.items()) {
-      const f = this._edible(it.name)
+      const f = this._edible(it.name, opts)
       if (!f) continue
       out.push({
         name: it.name,
@@ -8196,9 +8276,17 @@ class Actions {
     let recovered = false
     let lastPos = this.pos().clone()
 
-    while (Date.now() - t0 < timeoutMs) {
-      this.check()
-      const e = this.nearestEntity(name, 96)
+    // 【摔死修复 · 2026-11-14 07:20】追动物时关 parkour。
+    // 实测追 pig/cow 途中连续出 6.3 / 7.3 / 9.3 格的坠落（supervisor.log 07:12-07:13），
+    // 都是 GoalFollow 选 2~4 格跳跃、落地没踩住掉进沟里。追一只猪不需要跑酷。
+    // 只关这一个函数，finally 还原 —— 其它寻路（挖矿/回家）不受影响。
+    const mv = bot.pathfinder && bot.pathfinder.movements
+    const prevParkour = mv ? mv.allowParkour : null
+    if (mv) mv.allowParkour = false
+    try {
+      while (Date.now() - t0 < timeoutMs) {
+        this.check()
+        const e = this.nearestEntity(name, 96)
       if (!e) return false
       const d = e.position.distanceTo(this.pos())
       if (d <= stopDist) {
@@ -8247,14 +8335,17 @@ class Actions {
         try { bot.pathfinder.setGoal(null) } catch (err) {}
         return false
       }
-      if (stillSince > 18000) {
-        this.log('[chase] 追不上 ' + name + '（18 秒没拉近距离）')
-        try { bot.pathfinder.setGoal(null) } catch (err) {}
-        return false
+        if (stillSince > 18000) {
+          this.log('[chase] 追不上 ' + name + '（18 秒没拉近距离）')
+          try { bot.pathfinder.setGoal(null) } catch (err) {}
+          return false
+        }
       }
+      return false
+    } finally {
+      try { bot.pathfinder.setGoal(null) } catch (err) {}
+      if (mv && prevParkour !== null) mv.allowParkour = prevParkour
     }
-    try { bot.pathfinder.setGoal(null) } catch (err) {}
-    return false
   }
 
   async attack (name, times = 5) {

@@ -355,12 +355,13 @@ async function main () {
     ok(keys.includes('farm'), 'farm 还在')
     ok(keys.includes('explore'), 'explore 还在')
     ok(keys.includes('getup'), 'getup 是新增的')
-    ok(Goals.POOL.length === 7, '一共 7 个方向', Goals.POOL.length)
+    ok(keys.includes('food'), 'food 是新增的生存出口')
+    ok(Goals.POOL.length === 8, '一共 8 个方向（新增 food）', Goals.POOL.length)
 
     // 每个目标都还能正常出分数
     const g = new Goals(tmp(), { ctx: { log }, now: () => Date.now() })
     const cs = g.candidates(st({ inv: { stone_pickaxe: 1 }, y: 68 }))
-    ok(cs.length === 7, '7 个都能算出分', cs.length)
+    ok(cs.length === 8, '8 个都能算出分', cs.length)
     ok(cs.every(c => typeof c.score === 'number' && isFinite(c.score)), '分数都是有效数字')
   }
 

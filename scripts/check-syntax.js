@@ -10,6 +10,7 @@ const files = []
 function walk (dir) {
   for (const name of fs.readdirSync(dir)) {
     if (name === 'node_modules' || name === '.git' || name === 'data') continue
+    if (name.startsWith('.')) continue   // 点开头的是临时文件/编辑中间态，不参与语法检查
     const p = path.join(dir, name)
     const st = fs.statSync(p)
     if (st.isDirectory()) walk(p)

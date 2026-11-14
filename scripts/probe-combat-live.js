@@ -27,6 +27,9 @@ const MINUTES = parseFloat(argOf('minutes', '4')) || 4
 // --inject：注入服务端同款 damage_event 包（不是真怪）。用来确定性验证
 // "解析 + 分档 + 死因"这三段；真实被怪打另有实机跑（见 data/test-results/combat-live-*）。
 const INJECT = argv.includes('--inject')
+// --set-food N：把饱食度按在 N（服务端不发 health 包时生效），用来复现
+// "饿 17 < 18 卡在回血线下面" —— 日志里会标 [probe] 注入。
+const SET_FOOD = argv.indexOf('--set-food') >= 0 ? parseFloat(argv[argv.indexOf('--set-food') + 1]) : null
 const ACCOUNT = argOf('account', 'XJJ_CBT') + Date.now().toString(36).slice(-4)
 const DATA_DIR = process.env.AIFRIEND_DATA || '/tmp/combat-test'
 const OUT_DIR = path.join(ROOT, 'data', 'test-results')
@@ -95,6 +98,9 @@ async function main () {
     const bot = b.bot
     if (!bot || !bot.entity) return
     hookReflex()
+    if (SET_FOOD != null && Math.abs((bot.food || 0) - SET_FOOD) > 0.01) {
+      try { bot.food = SET_FOOD } catch (e) {}
+    }
     const el = Math.round((Date.now() - t0) / 1000)
     const hp = bot.health
     const tod = bot.time && bot.time.timeOfDay
@@ -131,6 +137,17 @@ async function main () {
       type: 'hostile',
       username: undefined,
       position: new Vec3(p.x + 2, p.y, p.z)
+    }
+    // --ledge-debug：把退路判定看的那几格打出来（判定是不是太严）
+    if (argv.includes('--ledge-debug') && b.reflex) {
+      const { Vec3 } = require(path.join(ROOT, 'node_modules', 'vec3'))
+      const bp = bot.entity.position
+      const at = (x, y, z) => { const b = bot.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))); return b ? b.name : '?' }
+      origLog(`[probe] 地形：pos=${bp.x.toFixed(2)},${bp.y.toFixed(2)},${bp.z.toFixed(2)} 脚=${at(bp.x, bp.y, bp.z)} 头=${at(bp.x, bp.y + 1, bp.z)} 下1=${at(bp.x, bp.y - 1, bp.z)} 下2=${at(bp.x, bp.y - 2, bp.z)}`)
+      for (const d of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const bx = bp.x + d[0], bz = bp.z + d[1]
+        origLog(`[probe]   方向 ${d}: 脚=${at(bx, bp.y, bz)} 头=${at(bx, bp.y + 1, bz)} 下1=${at(bx, bp.y - 1, bz)} 下2=${at(bx, bp.y - 2, bz)} 下3=${at(bx, bp.y - 3, bz)} -> safe=${b.reflex.safeToStepBack({ x: d[0], z: d[1] })}`)
+      }
     }
     const send = (hp, type) => {
       origLog(`[probe] 注入（服务端同款包，不是真怪）：sourceTypeId=${type} 血=${hp}`)
